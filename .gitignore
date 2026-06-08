@@ -1,0 +1,5 @@
+# WiFi credentials — never commit this file; copy wifi_config.h.template and fill it in
+aquarium/wifi_config.h
+
+# PlatformIO build output
+.pio/
