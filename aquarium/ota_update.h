@@ -1,7 +1,7 @@
 #pragma once
 // OTA update via GitHub Releases.
-// Included from aquarium.ino after `display` is declared.
-// Requires: WiFi.h, WiFiClientSecure.h, HTTPClient.h, HTTPUpdate.h, ArduinoJson.h
+// Must be #included at the top of the sketch, alongside the other includes.
+// Call otaInit(&display) then checkForOTAUpdate() from setup().
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -9,20 +9,24 @@
 #include <HTTPUpdate.h>
 #include <ArduinoJson.h>
 
+#include "version.h"
+
+// Set by otaInit() — keeps this header free of direct display references
+static lgfx::LGFX_Device* _otaDisp = nullptr;
+
+static void otaInit(lgfx::LGFX_Device* d) { _otaDisp = d; }
+
 // ── Status text helpers ───────────────────────────────────────────────────────
 
-static void _otaClear() {
-    int w = display.width();
-    int h = display.height();
-    display.fillRect(0, h - 42, w, 42, 0x000000UL);
-}
-
 static void _otaStatus(const char* msg, uint32_t col = 0xCCCCCCUL) {
-    _otaClear();
-    display.setTextColor(col);
-    display.setTextSize(2);
-    display.setCursor(10, display.height() - 30);
-    display.print(msg);
+    if (!_otaDisp) return;
+    int w = _otaDisp->width();
+    int h = _otaDisp->height();
+    _otaDisp->fillRect(0, h - 42, w, 42, 0x000000UL);
+    _otaDisp->setTextColor(col);
+    _otaDisp->setTextSize(2);
+    _otaDisp->setCursor(10, h - 30);
+    _otaDisp->print(msg);
 }
 
 // ── Semver comparison ─────────────────────────────────────────────────────────
@@ -40,9 +44,8 @@ static bool _semverNewer(const char* a, const char* b) {
 }
 
 // ── Main OTA entry point ──────────────────────────────────────────────────────
-// Called once from setup(). Connects WiFi, checks GitHub for a newer release,
-// and flashes the binary if one is found. Disconnects WiFi before returning.
-// If anything fails the aquarium boots normally.
+// Connects WiFi, checks GitHub for a newer release, and flashes the binary if
+// one is found. Disconnects WiFi before returning. Boots normally on any error.
 
 static void checkForOTAUpdate() {
     char        buf[96];
@@ -73,7 +76,7 @@ static void checkForOTAUpdate() {
 
     {
         WiFiClientSecure apiClient;
-        apiClient.setInsecure(); // cert pinning is omitted for a home device
+        apiClient.setInsecure();
         apiClient.setTimeout(15);
 
         HTTPClient http;
@@ -105,7 +108,6 @@ static void checkForOTAUpdate() {
                 goto done;
             }
 
-            // Use a filter so we only materialise the fields we need
             StaticJsonDocument<96> filter;
             filter["tag_name"]                          = true;
             filter["assets"][0]["name"]                 = true;
@@ -123,7 +125,6 @@ static void checkForOTAUpdate() {
                 goto done;
             }
 
-            // Strip optional leading 'v' / 'V' from tag (e.g. "v1.2.3" -> "1.2.3")
             const char* tagRaw = doc["tag_name"] | "";
             strncpy(latestVer,
                     (*tagRaw == 'v' || *tagRaw == 'V') ? tagRaw + 1 : tagRaw,
@@ -136,7 +137,6 @@ static void checkForOTAUpdate() {
                 goto done;
             }
 
-            // Find the firmware.bin asset
             for (JsonObject asset : doc["assets"].as<JsonArray>()) {
                 if (String(asset["name"] | "").equals(GITHUB_ASSET_NAME)) {
                     downloadUrl = asset["browser_download_url"].as<String>();
@@ -162,18 +162,16 @@ static void checkForOTAUpdate() {
         httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
         httpUpdate.rebootOnUpdate(true);
 
-        // Show download progress on the status bar
         httpUpdate.onProgress([](int cur, int total) {
-            if (total > 0) {
-                char pb[48];
-                snprintf(pb, sizeof(pb), "OTA: Flashing %d%%", cur * 100 / total);
-                display.fillRect(0, display.height() - 42,
-                                 display.width(), 42, 0x000000UL);
-                display.setTextColor(0x44FF44UL);
-                display.setTextSize(2);
-                display.setCursor(10, display.height() - 30);
-                display.print(pb);
-            }
+            if (!_otaDisp || total <= 0) return;
+            char pb[48];
+            snprintf(pb, sizeof(pb), "OTA: Flashing %d%%", cur * 100 / total);
+            _otaDisp->fillRect(0, _otaDisp->height() - 42,
+                               _otaDisp->width(), 42, 0x000000UL);
+            _otaDisp->setTextColor(0x44FF44UL);
+            _otaDisp->setTextSize(2);
+            _otaDisp->setCursor(10, _otaDisp->height() - 30);
+            _otaDisp->print(pb);
         });
 
         WiFiClientSecure dlClient;
@@ -181,7 +179,6 @@ static void checkForOTAUpdate() {
         dlClient.setTimeout(60);
 
         t_httpUpdate_return ret = httpUpdate.update(dlClient, downloadUrl);
-        // Execution continues here only when the update did NOT trigger a reboot
         switch (ret) {
             case HTTP_UPDATE_FAILED:
                 snprintf(buf, sizeof(buf), "OTA failed: %s",

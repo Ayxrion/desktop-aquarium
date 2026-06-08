@@ -13,6 +13,7 @@
 
 #include "version.h"
 #include "wifi_config.h"
+#include "ota_update.h"
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  LGFX — Elecrow CrowPanel 7.0" (16-bit parallel RGB, GT911 touch)
@@ -118,8 +119,6 @@ public:
 
 static LGFX          display;
 static LGFX_Sprite    canvas(&display);
-
-#include "ota_update.h"
 
 // ─── Screen ──────────────────────────────────────────────────────────────────
 #define SCREEN_W  800
@@ -338,6 +337,7 @@ void setup() {
   display.setRotation(0);
   display.fillScreen(0x000000UL);
 
+  otaInit(&display);
   checkForOTAUpdate();
 
   // Build terrain profile — overlapping sin waves give natural bumps
