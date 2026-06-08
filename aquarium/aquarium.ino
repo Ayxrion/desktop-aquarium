@@ -11,6 +11,9 @@
 #include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
 #include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
 
+#include "version.h"
+#include "wifi_config.h"
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  LGFX — Elecrow CrowPanel 7.0" (16-bit parallel RGB, GT911 touch)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -115,6 +118,8 @@ public:
 
 static LGFX          display;
 static LGFX_Sprite    canvas(&display);
+
+#include "ota_update.h"
 
 // ─── Screen ──────────────────────────────────────────────────────────────────
 #define SCREEN_W  800
@@ -331,6 +336,9 @@ void setup() {
   Serial.printf("display W=%d  H=%d\n", display.width(), display.height());
   display.setBrightness(255);
   display.setRotation(0);
+  display.fillScreen(0x000000UL);
+
+  checkForOTAUpdate();
 
   // Build terrain profile — overlapping sin waves give natural bumps
   for (int x = 0; x < SCREEN_W; x++) {

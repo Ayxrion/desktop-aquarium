@@ -1,0 +1,72 @@
+name: Build and Release Firmware
+
+# Trigger on version tags, e.g.  git tag v1.2.3 && git push origin v1.2.3
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create the GitHub release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      # Stamp the version into version.h so the running firmware knows its own version
+      - name: Set firmware version from tag
+        run: |
+          TAG="${{ github.ref_name }}"
+          VER="${TAG#v}"
+          sed -i "s/#define FIRMWARE_VERSION \"[^\"]*\"/#define FIRMWARE_VERSION \"${VER}\"/" \
+            aquarium/version.h
+
+      # WiFi credentials are stored as GitHub Actions secrets:
+      #   Settings → Secrets and variables → Actions → New repository secret
+      #   Name: WIFI_SSID   Value: <your SSID>
+      #   Name: WIFI_PASSWORD  Value: <your password>
+      - name: Create wifi_config.h from secrets
+        run: |
+          printf '#pragma once\n#define WIFI_SSID "%s"\n#define WIFI_PASSWORD "%s"\n' \
+            "${{ secrets.WIFI_SSID }}" "${{ secrets.WIFI_PASSWORD }}" \
+            > aquarium/wifi_config.h
+
+      - name: Build firmware
+        run: pio run --environment crowpanel_7inch
+
+      - name: Create GitHub Release with firmware binary
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "Aquarium Firmware ${{ github.ref_name }}" \
+            --notes "$(cat <<'NOTES'
+          ## Aquarium Firmware ${{ github.ref_name }}
+
+          ### OTA Update
+          The device will automatically flash this release the next time it reboots while connected to WiFi.
+
+          ### Manual Flash
+          Use esptool.py or the Arduino IDE to flash `firmware.bin` to your Elecrow CrowPanel 7.0".
+          NOTES
+          )" \
+            .pio/build/crowpanel_7inch/firmware.bin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
