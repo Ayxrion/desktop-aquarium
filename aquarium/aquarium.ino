@@ -740,18 +740,17 @@ void drawBackground() {
 
 void drawTankRim() {
   // Drawn after fish/bubbles so it clips anything that reaches the surface.
-  // Dark outer frame strip sitting above the water line
-  canvas.fillRect(0, TANK_TOP - 14, SCREEN_W, 8,  0x1E1E1EUL);
-  // Glass pane: dark base
-  canvas.fillRect(0, TANK_TOP -  6, SCREEN_W, 6,  0x253545UL);
-  // Glass highlight — bright edge at the very top of the glass
-  canvas.fillRect(0, TANK_TOP -  6, SCREEN_W, 1,  0x88BCCDUL);
-  // Softer inner highlight
-  canvas.fillRect(0, TANK_TOP -  4, SCREEN_W, 2,  0x4A7A90UL);
-  // Bright lower lip where glass meets water
-  canvas.fillRect(0, TANK_TOP -  1, SCREEN_W, 1,  0xAADDEEUL);
-  // Thin dark shadow just inside the water
-  canvas.fillRect(0, TANK_TOP,      SCREEN_W, 3,  0x091520UL);
+  // Metal/plastic outer frame
+  canvas.fillRect(0, TANK_TOP - 14, SCREEN_W,  1, 0xA0A0A0UL); // top highlight
+  canvas.fillRect(0, TANK_TOP - 13, SCREEN_W,  7, 0x505050UL); // frame body
+  canvas.fillRect(0, TANK_TOP -  6, SCREEN_W,  1, 0x282828UL); // frame bottom shadow
+  // Glass panel
+  canvas.fillRect(0, TANK_TOP -  5, SCREEN_W,  4, 0x3878A0UL); // blue glass body
+  canvas.fillRect(0, TANK_TOP -  5, SCREEN_W,  1, 0x99DDEDUL); // bright top edge
+  canvas.fillRect(0, TANK_TOP -  2, SCREEN_W,  1, 0x60A8C8UL); // mid highlight
+  canvas.fillRect(0, TANK_TOP -  1, SCREEN_W,  1, 0xCCEEFFUL); // bright lip at waterline
+  // Shadow just inside the water under the glass
+  canvas.fillRect(0, TANK_TOP,      SCREEN_W,  3, 0x091520UL);
 }
 
 void drawBubbles() {
