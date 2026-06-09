@@ -307,7 +307,7 @@ float boundAccel(float val, float lo, float hi, float k = 0.30f) {
 
 void resetBubble(int i, bool scatter) {
   bubbles[i].x   = frandr(5.0f, SCREEN_W - 5.0f);
-  bubbles[i].y   = scatter ? frandr(0.0f, SCREEN_H) : (float)(SCREEN_H + 10);
+  bubbles[i].y   = scatter ? frandr((float)TANK_TOP, (float)SCREEN_H) : (float)(SCREEN_H + 10);
   bubbles[i].spd = frandr(0.8f, 2.5f);
   bubbles[i].r   = (uint8_t)random(3, 9);
 }
@@ -721,8 +721,9 @@ void drawSnail() {
 }
 
 void drawBackground() {
-  // Dark exterior above the tank
-  canvas.fillRect(0, 0, SCREEN_W, TANK_TOP, 0x080808UL);
+  // Exterior above the tank — warm dark brown so it reads as "outside the tank"
+  // and doesn't blend into the black display bezel like pure black would
+  canvas.fillRect(0, 0, SCREEN_W, TANK_TOP, 0x2A1A0AUL);
 
   // Flat uniform water — single colour, no spatial variation (no streaks/rays).
   // The colour pulses very gently over time so the water still feels alive.
@@ -740,17 +741,22 @@ void drawBackground() {
 
 void drawTankRim() {
   // Drawn after fish/bubbles so it clips anything that reaches the surface.
-  // Metal/plastic outer frame
-  canvas.fillRect(0, TANK_TOP - 14, SCREEN_W,  1, 0xA0A0A0UL); // top highlight
-  canvas.fillRect(0, TANK_TOP - 13, SCREEN_W,  7, 0x505050UL); // frame body
-  canvas.fillRect(0, TANK_TOP -  6, SCREEN_W,  1, 0x282828UL); // frame bottom shadow
-  // Glass panel
-  canvas.fillRect(0, TANK_TOP -  5, SCREEN_W,  4, 0x3878A0UL); // blue glass body
-  canvas.fillRect(0, TANK_TOP -  5, SCREEN_W,  1, 0x99DDEDUL); // bright top edge
-  canvas.fillRect(0, TANK_TOP -  2, SCREEN_W,  1, 0x60A8C8UL); // mid highlight
-  canvas.fillRect(0, TANK_TOP -  1, SCREEN_W,  1, 0xCCEEFFUL); // bright lip at waterline
-  // Shadow just inside the water under the glass
-  canvas.fillRect(0, TANK_TOP,      SCREEN_W,  3, 0x091520UL);
+  // Total rim height: 22px, sitting at TANK_TOP-22 .. TANK_TOP+4
+
+  // ── Outer frame (thick dark metal strip) ─────────────────────────────────
+  canvas.fillRect(0, TANK_TOP - 22, SCREEN_W, 12, 0x484848UL); // frame body
+  canvas.fillRect(0, TANK_TOP - 22, SCREEN_W,  1, 0xB0B0B0UL); // top shine
+  canvas.fillRect(0, TANK_TOP - 11, SCREEN_W,  1, 0x202020UL); // bottom shadow
+
+  // ── Glass panel ───────────────────────────────────────────────────────────
+  canvas.fillRect(0, TANK_TOP - 10, SCREEN_W,  9, 0x2E6888UL); // glass body
+  canvas.fillRect(0, TANK_TOP - 10, SCREEN_W,  2, 0xAADDEEUL); // bright top edge
+  canvas.fillRect(0, TANK_TOP -  4, SCREEN_W,  2, 0x5098B8UL); // mid reflection
+  canvas.fillRect(0, TANK_TOP -  2, SCREEN_W,  1, 0x88CCDDUL); // lower highlight
+  canvas.fillRect(0, TANK_TOP -  1, SCREEN_W,  1, 0xDDEEFFUL); // bright waterline lip
+
+  // ── Shadow just inside the water ─────────────────────────────────────────
+  canvas.fillRect(0, TANK_TOP,      SCREEN_W,  4, 0x061018UL);
 }
 
 void drawBubbles() {
