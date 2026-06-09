@@ -81,16 +81,17 @@ static bool _fetchWeather(WeatherCondition& outCondition) {
   HTTPClient http;
   if (http.begin(client, url)) {
     int code = http.GET();
-    snprintf(buf, sizeof(buf), "Weather: HTTP %d", code);
-    _weatherStatus(buf);
-    delay(800);
-
     if (code == HTTP_CODE_OK) {
-      StaticJsonDocument<32> filter;
+      // Read the full body first — stream closes if we delay before parsing.
+      String body = http.getString();
+      StaticJsonDocument<64> filter;
       filter["weather"][0]["id"] = true;
       DynamicJsonDocument doc(512);
-      DeserializationError err = deserializeJson(doc, http.getStream(),
+      DeserializationError err = deserializeJson(doc, body,
                                                  DeserializationOption::Filter(filter));
+      snprintf(buf, sizeof(buf), "Weather: HTTP %d", code);
+      _weatherStatus(buf);
+      delay(800);
       if (!err) {
         int id = doc["weather"][0]["id"] | -1;
         if (id >= 0) {
