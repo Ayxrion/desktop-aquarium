@@ -724,15 +724,14 @@ void drawBackground() {
   // Dark charcoal outside-the-tank area
   canvas.fillRect(0, 0, SCREEN_W, TANK_TOP, 0x1A1A1AUL);
 
-  // Depth gradient: each row is uniform across the full width (no column
-  // variation = no god rays), colour transitions from bright surface blue
-  // to deep dark blue. Gentle time pulse keeps it feeling alive.
-  float pulse = sinf(tick * 0.050f) * 6.0f + sinf(tick * 0.022f) * 4.0f;
+  // Depth gradient: bright cyan-blue at the surface → near-black at depth.
+  // Each row is one solid colour across the full width (no column variation).
+  float pulse = sinf(tick * 0.050f) * 12.0f + sinf(tick * 0.022f) * 7.0f;
   float waterH = (float)(SCREEN_H - TANK_TOP);
   for (int y = TANK_TOP; y < SCREEN_H; y += 3) {
     float t = (y - TANK_TOP) / waterH;          // 0 = surface, 1 = bottom
-    int g = constrain((int)(64.0f - t * 32.0f + pulse * 0.3f), 0, 255);
-    int b = constrain((int)(128.0f - t * 64.0f + pulse),        0, 255);
+    int g = constrain((int)(100.0f - t * 85.0f + pulse * 0.3f), 0, 255);
+    int b = constrain((int)(180.0f - t * 150.0f + pulse),        0, 255);
     canvas.fillRect(0, y, SCREEN_W, 3, ((uint32_t)g << 8) | (uint32_t)b);
   }
 
