@@ -139,38 +139,27 @@ float    tick        = 0;
 #define COL_WEED      0x00AA44UL
 #define COL_WEED_LEAF 0x33DD66UL
 
-// Pair fish — 4 slots max (2 pairs)
-const uint32_t PAIR_COLS[4] = {
-  0x00EE66UL,   // green
-  0xFFDD00UL,   // yellow
-  0xFF6600UL,   // orange
-  0xCC44FFUL,   // violet
+// Pair fish — 8 colour slots (wraps for extra fish)
+const uint32_t PAIR_COLS[8] = {
+  0x00EE66UL, 0xFFDD00UL, 0xFF6600UL, 0xCC44FFUL,
+  0x44DDFFUL, 0xFF44AAUL, 0x88FF44UL, 0xFFAA22UL,
 };
 
-// School 1 — 8 slots max
-const uint32_t SCHOOL_COLS[8] = {
-  0x00FFFFUL,   // cyan
-  0xFF66FFUL,   // pink
-  0xFF8800UL,   // orange
-  0x88FFDDUL,   // aquamarine
-  0xCCFF44UL,   // lime
-  0x22DDBBUL,   // teal
-  0xFFBB55UL,   // amber
-  0xBB88FFUL,   // lavender
+// School 1 — 16 colour slots
+const uint32_t SCHOOL_COLS[16] = {
+  0x00FFFFUL, 0xFF66FFUL, 0xFF8800UL, 0x88FFDDUL,
+  0xCCFF44UL, 0x22DDBBUL, 0xFFBB55UL, 0xBB88FFUL,
+  0x44FFEEUL, 0xFF44CCUL, 0x99FF22UL, 0xFF9966UL,
+  0x6688FFUL, 0xFFEE22UL, 0x22FFAAUL, 0xEE88FFUL,
 };
 
-// School 2 — 10 slots max
-const uint32_t SCHOOL2_COLS[10] = {
-  0xFF4400UL,   // deep orange
-  0xFF9900UL,   // amber
-  0xFFCC00UL,   // gold
-  0xFF6688UL,   // coral pink
-  0xDD2255UL,   // crimson
-  0xFF88BBUL,   // light pink
-  0xFFAAFFUL,   // lavender-pink
-  0xFFFF66UL,   // yellow
-  0x77FFAAUL,   // mint
-  0xCCAA88UL,   // sand
+// School 2 — 20 colour slots
+const uint32_t SCHOOL2_COLS[20] = {
+  0xFF4400UL, 0xFF9900UL, 0xFFCC00UL, 0xFF6688UL,
+  0xDD2255UL, 0xFF88BBUL, 0xFFAAFFUL, 0xFFFF66UL,
+  0x77FFAAUL, 0xCCAA88UL, 0xFF3300UL, 0xFFBB00UL,
+  0xFF55AAUL, 0xEE1144UL, 0xFF99CCUL, 0xFFDD88UL,
+  0x99FF77UL, 0xDDBB99UL, 0xFF6600UL, 0xFFCC55UL,
 };
 
 // Rainbow flake colours
@@ -237,10 +226,10 @@ struct Fish {
 };
 
 // Fixed-slot layout: [0..MAX_PAIR-1] pair, [MAX_PAIR..MAX_PAIR+MAX_SCHOOL-1] school1,
-// [MAX_PAIR+MAX_SCHOOL..MAX_FISH-1] school2
-#define MAX_PAIR    4
-#define MAX_SCHOOL  8
-#define MAX_SCHOOL2 10
+// [MAX_PAIR+MAX_SCHOOL..MAX_FISH-1] school2.  Only the first num* slots are active.
+#define MAX_PAIR    8
+#define MAX_SCHOOL  16
+#define MAX_SCHOOL2 20
 #define MAX_FISH    (MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2)
 
 static int numPair    = 2;
@@ -250,13 +239,11 @@ static int numSchool2 = 7;
 Fish fish[MAX_FISH];
 
 // ─── Menu ─────────────────────────────────────────────────────────────────────
-// Hamburger button — top-right corner
 #define HBTN_X   748
 #define HBTN_Y     5
 #define HBTN_W    47
 #define HBTN_H    38
 
-// Menu panel — right side, below button
 #define MENU_X   510
 #define MENU_Y    48
 #define MENU_W   282
@@ -302,9 +289,9 @@ int fishHW(const Fish& f) {
 }
 
 uint32_t fishColor(int idx) {
-  if (idx < MAX_PAIR)                  return PAIR_COLS[idx];
-  if (idx < MAX_PAIR + MAX_SCHOOL)     return SCHOOL_COLS[idx - MAX_PAIR];
-  return SCHOOL2_COLS[idx - MAX_PAIR - MAX_SCHOOL];
+  if (idx < MAX_PAIR)                  return PAIR_COLS[idx % 8];
+  if (idx < MAX_PAIR + MAX_SCHOOL)     return SCHOOL_COLS[(idx - MAX_PAIR) % 16];
+  return SCHOOL2_COLS[(idx - MAX_PAIR - MAX_SCHOOL) % 20];
 }
 
 float boundAccel(float val, float lo, float hi, float k = 0.30f) {
@@ -376,7 +363,6 @@ void addFish(FishType type) {
 void removeFish(FishType type) {
   if (type == FISH_PAIR && numPair > 0) {
     int idx = numPair - 1;
-    // If removing the second fish of a pair, un-partner the first
     if (idx % 2 == 1) fish[idx - 1].partner = -1;
     numPair--;
   } else if (type == FISH_SCHOOL && numSchool > 0) {
@@ -441,14 +427,14 @@ void setup() {
   initFishEntry(0,  150, 210, 0.20f,  3.0f, FISH_PAIR, 1);
   initFishEntry(1,  330, 240, 0.35f, -2.5f, FISH_PAIR, 0);
 
-  // School 1 — indices MAX_PAIR .. MAX_PAIR+numSchool-1
+  // School 1 — starts at index MAX_PAIR
   for (int i = 0; i < numSchool; i++) {
     initFishEntry(MAX_PAIR + i,
                   frandr(380, 620), frandr(130, 330), frandr(0.40f, 0.75f),
                   frandr(-2.0f, 2.0f), FISH_SCHOOL, -1);
   }
 
-  // School 2 — indices MAX_PAIR+MAX_SCHOOL .. MAX_PAIR+MAX_SCHOOL+numSchool2-1
+  // School 2 — starts at index MAX_PAIR + MAX_SCHOOL
   for (int i = 0; i < numSchool2; i++) {
     initFishEntry(MAX_PAIR + MAX_SCHOOL + i,
                   frandr(150, 400), frandr(150, 350), frandr(0.40f, 0.75f),
@@ -497,7 +483,7 @@ void dropFood(int touchX = -1, int touchY = -1) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Update — snail
+//  Update — snail / bubbles / flakes
 // ═══════════════════════════════════════════════════════════════════════════════
 void updateSnail() {
   float move = snail.facingRight ? snail.spd : -snail.spd;
@@ -515,9 +501,6 @@ void updateBubbles() {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Update — flakes
-// ═══════════════════════════════════════════════════════════════════════════════
 void updateFlakes() {
   for (int i = 0; i < MAX_FLAKES; i++) {
     if (!flakes[i].active) continue;
@@ -623,7 +606,7 @@ void updateFish() {
             f.tz = constrain(partner.z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
           }
         } else if (f.type == FISH_PAIR) {
-          // Solo pair fish — random wander
+          // Solo pair fish — wander freely
           f.tx = frandr(30.0f, (float)(SCREEN_W - 30));
           f.ty = frandr(30.0f, (float)(SCREEN_H - 80));
           f.tz = constrain(f.tz + frandr(-0.12f, 0.12f), 0.05f, 0.72f);
@@ -889,7 +872,6 @@ void drawMenuButton() {
   uint32_t bgCol = menuOpen ? 0x2255AAUL : 0x112244UL;
   canvas.fillRect(HBTN_X, HBTN_Y, HBTN_W, HBTN_H, bgCol);
   canvas.drawRect(HBTN_X, HBTN_Y, HBTN_W, HBTN_H, 0x4488CCUL);
-  // Three hamburger bars
   int bx = HBTN_X + 9;
   int bw = HBTN_W - 18;
   canvas.fillRect(bx, HBTN_Y +  8, bw, 3, 0xCCEEFFUL);
@@ -900,12 +882,10 @@ void drawMenuButton() {
 void drawMenu() {
   if (!menuOpen) return;
 
-  // Panel
   canvas.fillRect(MENU_X,   MENU_Y,   MENU_W,   MENU_H,   0x0A1E3CUL);
   canvas.drawRect(MENU_X,   MENU_Y,   MENU_W,   MENU_H,   0x4488CCUL);
   canvas.drawRect(MENU_X+1, MENU_Y+1, MENU_W-2, MENU_H-2, 0x1A3355UL);
 
-  // Title
   canvas.setTextSize(2);
   canvas.setTextColor(0x88DDFFUL);
   canvas.setCursor(MENU_X + 28, MENU_Y + 10);
@@ -920,7 +900,6 @@ void drawMenu() {
   for (int row = 0; row < 3; row++) {
     int ry = MENU_Y + 45 + row * 58;
 
-    // Row label
     canvas.setTextSize(1);
     canvas.setTextColor(0xAADDFFUL);
     canvas.setCursor(MENU_X + 10, ry + 11);
@@ -928,10 +907,8 @@ void drawMenu() {
 
     // [-] button
     bool canRm = counts[row] > 0;
-    canvas.fillRect(MENU_X + 148, ry, 30, 30,
-                    canRm ? 0x1A3355UL : 0x0C1A2AUL);
-    canvas.drawRect(MENU_X + 148, ry, 30, 30,
-                    canRm ? 0x4488CCUL : 0x223344UL);
+    canvas.fillRect(MENU_X + 148, ry, 30, 30, canRm ? 0x1A3355UL : 0x0C1A2AUL);
+    canvas.drawRect(MENU_X + 148, ry, 30, 30, canRm ? 0x4488CCUL : 0x223344UL);
     canvas.setTextSize(2);
     canvas.setTextColor(canRm ? 0xFFFFFFUL : 0x334455UL);
     canvas.setCursor(MENU_X + 157, ry + 7);
@@ -947,10 +924,8 @@ void drawMenu() {
 
     // [+] button
     bool canAdd = counts[row] < maxes[row];
-    canvas.fillRect(MENU_X + 210, ry, 30, 30,
-                    canAdd ? 0x1A3355UL : 0x0C1A2AUL);
-    canvas.drawRect(MENU_X + 210, ry, 30, 30,
-                    canAdd ? 0x4488CCUL : 0x223344UL);
+    canvas.fillRect(MENU_X + 210, ry, 30, 30, canAdd ? 0x1A3355UL : 0x0C1A2AUL);
+    canvas.drawRect(MENU_X + 210, ry, 30, 30, canAdd ? 0x4488CCUL : 0x223344UL);
     canvas.setTextSize(2);
     canvas.setTextColor(canAdd ? 0xFFFFFFUL : 0x334455UL);
     canvas.setCursor(MENU_X + 217, ry + 7);
@@ -962,7 +937,7 @@ void drawMenu() {
 //  loop
 // ═══════════════════════════════════════════════════════════════════════════════
 void loop() {
-  // Physical button (disabled on this board — GPIO0 is PCLK)
+  // Physical button (disabled — GPIO0 is PCLK on this board)
   bool btnState = (BUTTON_PIN >= 0) ? digitalRead(BUTTON_PIN) : HIGH;
   if (btnState == LOW && lastBtnState == HIGH) {
     uint32_t t = millis();
@@ -977,12 +952,12 @@ void loop() {
   uint16_t tx, ty;
   bool touched = display.getTouch(&tx, &ty);
   if (touched && !lastTouched) {
-    // Hamburger button always toggles menu
     if (tx >= HBTN_X && tx < (uint16_t)(HBTN_X + HBTN_W) &&
         ty >= HBTN_Y && ty < (uint16_t)(HBTN_Y + HBTN_H)) {
+      // Hamburger button — toggle menu
       menuOpen = !menuOpen;
     } else if (menuOpen) {
-      // Route touches to menu [-]/[+] buttons; block food drop while open
+      // Route to [-]/[+] buttons; block food drop while menu open
       const FishType rowType[3] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2 };
       for (int row = 0; row < 3; row++) {
         int ry = MENU_Y + 45 + row * 58;
@@ -998,7 +973,6 @@ void loop() {
         }
       }
     } else {
-      // Menu closed — tap anywhere to drop food
       dropFood((int)tx, (int)ty);
     }
   }
