@@ -30,27 +30,23 @@ public:
       auto cfg = _rgb_bus.config();
       cfg.panel = &_rgb_panel;
 
-      // Blue channel (B0–B4) — from official LGFX_Elecrow_ESP32_Display_WZ8048C070
       cfg.pin_d0  = GPIO_NUM_15; // B0
       cfg.pin_d1  = GPIO_NUM_7;  // B1
       cfg.pin_d2  = GPIO_NUM_6;  // B2
       cfg.pin_d3  = GPIO_NUM_5;  // B3
       cfg.pin_d4  = GPIO_NUM_4;  // B4
-      // Green channel (G0–G5)
       cfg.pin_d5  = GPIO_NUM_9;  // G0
       cfg.pin_d6  = GPIO_NUM_46; // G1
       cfg.pin_d7  = GPIO_NUM_3;  // G2
       cfg.pin_d8  = GPIO_NUM_8;  // G3
       cfg.pin_d9  = GPIO_NUM_16; // G4
       cfg.pin_d10 = GPIO_NUM_1;  // G5
-      // Red channel (R0–R4)
       cfg.pin_d11 = GPIO_NUM_14; // R0
       cfg.pin_d12 = GPIO_NUM_21; // R1
       cfg.pin_d13 = GPIO_NUM_47; // R2
       cfg.pin_d14 = GPIO_NUM_48; // R3
       cfg.pin_d15 = GPIO_NUM_45; // R4
 
-      // Control signals
       cfg.pin_henable = GPIO_NUM_41;
       cfg.pin_vsync   = GPIO_NUM_40;
       cfg.pin_hsync   = GPIO_NUM_39;
@@ -82,7 +78,7 @@ public:
       _rgb_panel.config(cfg);
 
       auto cfg_detail        = _rgb_panel.config_detail();
-      cfg_detail.use_psram   = 2;   // 2 = PSRAM only
+      cfg_detail.use_psram   = 2;
       _rgb_panel.config_detail(cfg_detail);
     }
     { // ── Backlight (GPIO2) ─────────────────────────────────────────────────
@@ -104,7 +100,7 @@ public:
       cfg.pin_rst          = -1;
       cfg.bus_shared       = false;
       cfg.offset_rotation  = 0;
-      cfg.i2c_port         = 1;        // I2C_NUM_1
+      cfg.i2c_port         = 1;
       cfg.i2c_addr         = 0x14;
       cfg.pin_sda          = GPIO_NUM_19;
       cfg.pin_scl          = GPIO_NUM_20;
@@ -123,49 +119,50 @@ static LGFX_Sprite    canvas(&display);
 // ─── Screen ──────────────────────────────────────────────────────────────────
 #define SCREEN_W  800
 #define SCREEN_H  480
+#define TANK_TOP   72   // water surface row; 15% of SCREEN_H is outside the tank
 
-static int16_t terrainY[SCREEN_W];   // ground profile, computed once in setup
+static int16_t terrainY[SCREEN_W];
 
 // ─── Button ──────────────────────────────────────────────────────────────────
-#define BUTTON_PIN   -1   // GPIO0 is used for PCLK on this board; feed button disabled
+#define BUTTON_PIN   -1
 #define DEBOUNCE_MS  300
 
 // ─── Timing ──────────────────────────────────────────────────────────────────
-#define FRAME_MS  50      // 20 fps
+#define FRAME_MS  50
 uint32_t lastFrameMs = 0;
 float    tick        = 0;
 
 // ─── Colours (24-bit RGB) ────────────────────────────────────────────────────
-#define COL_BG      0x003060UL   // ocean blue
-#define COL_SAND    0xC8A050UL   // sandy bottom
-#define COL_BUBBLE  0x55CCFFUL   // light cyan bubble
-#define COL_WEED      0x00AA44UL   // seaweed stem
-#define COL_WEED_LEAF 0x33DD66UL   // leaf highlight
+#define COL_BG      0x003060UL
+#define COL_SAND    0xC8A050UL
+#define COL_BUBBLE  0x55CCFFUL
+#define COL_WEED      0x00AA44UL
+#define COL_WEED_LEAF 0x33DD66UL
 
-// Pair fish: index 0 = green, index 1 = yellow
-const uint32_t PAIR_COLS[2] = { 0x00EE66UL, 0xFFDD00UL };
-
-// School 1 fish: one colour each
-const uint32_t SCHOOL_COLS[5] = {
-  0x00FFFFUL,   // cyan
-  0xFF66FFUL,   // pink
-  0xFF8800UL,   // orange
-  0x88FFDDUL,   // aquamarine
-  0xCCFF44UL,   // lime
+// Pair fish — 8 colour slots (wraps for extra fish)
+const uint32_t PAIR_COLS[8] = {
+  0x00EE66UL, 0xFFDD00UL, 0xFF6600UL, 0xCC44FFUL,
+  0x44DDFFUL, 0xFF44AAUL, 0x88FF44UL, 0xFFAA22UL,
 };
 
-// School 2 fish: warm/sunset palette to distinguish from school 1
-const uint32_t SCHOOL2_COLS[7] = {
-  0xFF4400UL,   // deep orange
-  0xFF9900UL,   // amber
-  0xFFCC00UL,   // gold
-  0xFF6688UL,   // coral pink
-  0xDD2255UL,   // crimson
-  0xFF88BBUL,   // light pink
-  0xFFAAFFUL,   // lavender-pink
+// School 1 — 16 colour slots
+const uint32_t SCHOOL_COLS[16] = {
+  0x00FFFFUL, 0xFF66FFUL, 0xFF8800UL, 0x88FFDDUL,
+  0xCCFF44UL, 0x22DDBBUL, 0xFFBB55UL, 0xBB88FFUL,
+  0x44FFEEUL, 0xFF44CCUL, 0x99FF22UL, 0xFF9966UL,
+  0x6688FFUL, 0xFFEE22UL, 0x22FFAAUL, 0xEE88FFUL,
 };
 
-// Rainbow flake colours (cycles by index)
+// School 2 — 20 colour slots
+const uint32_t SCHOOL2_COLS[20] = {
+  0xFF4400UL, 0xFF9900UL, 0xFFCC00UL, 0xFF6688UL,
+  0xDD2255UL, 0xFF88BBUL, 0xFFAAFFUL, 0xFFFF66UL,
+  0x77FFAAUL, 0xCCAA88UL, 0xFF3300UL, 0xFFBB00UL,
+  0xFF55AAUL, 0xEE1144UL, 0xFF99CCUL, 0xFFDD88UL,
+  0x99FF77UL, 0xDDBB99UL, 0xFF6600UL, 0xFFCC55UL,
+};
+
+// Rainbow flake colours
 const uint32_t FLAKE_COLS[7] = {
   0xFF2020UL, 0xFF8800UL, 0xFFFF00UL, 0x00FF44UL,
   0x00AAFFUL, 0x9944FFUL, 0xFF00CCUL,
@@ -175,21 +172,21 @@ const uint32_t FLAKE_COLS[7] = {
 #define NUM_BUBBLES 20
 struct Bubble {
   float   x, y, spd;
-  uint8_t r;          // radius 3–8 px
+  uint8_t r;
 };
 Bubble bubbles[NUM_BUBBLES];
 
 // ─── Seaweed ─────────────────────────────────────────────────────────────────
 #define NUM_WEEDS     8
-#define WEED_SEG_H   14   // px per segment
-#define BRANCH_SEGS   3   // segments per branch
+#define WEED_SEG_H   14
+#define BRANCH_SEGS   3
 
 struct Seaweed {
   uint16_t baseX;
-  uint8_t  segs;           // 8–14 main segments
-  uint8_t  numBranches;    // 1 or 2
-  uint8_t  branchAt[2];    // main-stem segment index where each branch sprouts
-  int8_t   branchSide[2];  // -1 = left, +1 = right
+  uint8_t  segs;
+  uint8_t  numBranches;
+  uint8_t  branchAt[2];
+  int8_t   branchSide[2];
 };
 Seaweed weeds[NUM_WEEDS];
 
@@ -206,7 +203,7 @@ static Snail snail;
 struct Flake {
   float   x, y, spd;
   bool    active;
-  uint8_t shape;      // 0 = + cross  1 = × cross  2 = dot pair
+  uint8_t shape;
   uint8_t colorIdx;
 };
 Flake flakes[MAX_FLAKES];
@@ -224,21 +221,39 @@ struct Fish {
   int8_t   partner;
   bool     goingForFood;
   int8_t   targetFlake;
-  bool     chasing;      // pair fish: true = chasing partner, false = fleeing
-  float    fullTimer;    // frames remaining before fish will seek food again
+  bool     chasing;
+  float    fullTimer;
 };
 
-#define NUM_PAIR    2
-#define NUM_SCHOOL  5
-#define NUM_SCHOOL2 7
-#define NUM_FISH    (NUM_PAIR + NUM_SCHOOL + NUM_SCHOOL2)
+// Fixed-slot layout: [0..MAX_PAIR-1] pair, [MAX_PAIR..MAX_PAIR+MAX_SCHOOL-1] school1,
+// [MAX_PAIR+MAX_SCHOOL..MAX_FISH-1] school2.  Only the first num* slots are active.
+#define MAX_PAIR    8
+#define MAX_SCHOOL  16
+#define MAX_SCHOOL2 20
+#define MAX_FISH    (MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2)
 
-Fish fish[NUM_FISH];
+static int numPair    = 2;
+static int numSchool  = 5;
+static int numSchool2 = 7;
+
+Fish fish[MAX_FISH];
+
+// ─── Menu ─────────────────────────────────────────────────────────────────────
+#define HBTN_X   748
+#define HBTN_Y     5
+#define HBTN_W    47
+#define HBTN_H    38
+
+#define MENU_X   510
+#define MENU_Y    48
+#define MENU_W   282
+#define MENU_H   230
 
 // ─── Button / touch state ─────────────────────────────────────────────────────
 bool     lastBtnState  = HIGH;
 uint32_t lastBtnMs     = 0;
 bool     lastTouched   = false;
+bool     menuOpen      = false;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Helpers
@@ -246,6 +261,12 @@ bool     lastTouched   = false;
 
 float frand()                    { return random(0, 1000) * 0.001f; }
 float frandr(float lo, float hi) { return lo + frand() * (hi - lo); }
+
+inline bool isFishActive(int i) {
+  if (i < MAX_PAIR)              return i < numPair;
+  if (i < MAX_PAIR + MAX_SCHOOL) return (i - MAX_PAIR) < numSchool;
+  return (i - MAX_PAIR - MAX_SCHOOL) < numSchool2;
+}
 
 int projX(float x, float z) {
   const float cx = SCREEN_W * 0.5f;
@@ -256,24 +277,21 @@ int projY(float y, float z) {
   return (int)(cy + (y - cy) * (1.0f - z * 0.38f));
 }
 
-// textSize scales with depth: pair fish larger, school fish smaller
 int fishTS(const Fish& f) {
   if (f.type == FISH_PAIR) return (f.z < 0.5f) ? 3 : 2;
   return (f.z < 0.6f) ? 2 : 1;
 }
 
-// Half-pixel-width of the fish string at current text size
 int fishHW(const Fish& f) {
   int ts    = fishTS(f);
-  int chars = (f.type == FISH_PAIR) ? 5 : 3;   // "><(o>" or "><>"
+  int chars = (f.type == FISH_PAIR) ? 5 : 3;
   return (chars * 6 * ts) / 2;
 }
 
-// Returns per-fish colour
 uint32_t fishColor(int idx) {
-  if (idx < NUM_PAIR)                    return PAIR_COLS[idx];
-  if (idx < NUM_PAIR + NUM_SCHOOL)       return SCHOOL_COLS[idx - NUM_PAIR];
-  return SCHOOL2_COLS[idx - NUM_PAIR - NUM_SCHOOL];
+  if (idx < MAX_PAIR)                  return PAIR_COLS[idx % 8];
+  if (idx < MAX_PAIR + MAX_SCHOOL)     return SCHOOL_COLS[(idx - MAX_PAIR) % 16];
+  return SCHOOL2_COLS[(idx - MAX_PAIR - MAX_SCHOOL) % 20];
 }
 
 float boundAccel(float val, float lo, float hi, float k = 0.30f) {
@@ -288,7 +306,7 @@ float boundAccel(float val, float lo, float hi, float k = 0.30f) {
 
 void resetBubble(int i, bool scatter) {
   bubbles[i].x   = frandr(5.0f, SCREEN_W - 5.0f);
-  bubbles[i].y   = scatter ? frandr(0.0f, SCREEN_H) : (float)(SCREEN_H + 10);
+  bubbles[i].y   = scatter ? frandr((float)TANK_TOP, (float)SCREEN_H) : (float)(SCREEN_H + 10);
   bubbles[i].spd = frandr(0.8f, 2.5f);
   bubbles[i].r   = (uint8_t)random(3, 9);
 }
@@ -314,6 +332,47 @@ void initFishEntry(int idx,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  Add / remove fish
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void addFish(FishType type) {
+  if (type == FISH_PAIR && numPair < MAX_PAIR) {
+    int idx = numPair;
+    int8_t partner = -1;
+    if (idx % 2 == 1) {
+      partner = idx - 1;
+      fish[idx - 1].partner = idx;
+    }
+    initFishEntry(idx,
+                  frandr(80, 720), frandr(80, 360), frandr(0.15f, 0.55f),
+                  frandr(-3.0f, 3.0f), FISH_PAIR, partner);
+    numPair++;
+  } else if (type == FISH_SCHOOL && numSchool < MAX_SCHOOL) {
+    initFishEntry(MAX_PAIR + numSchool,
+                  frandr(200, 600), frandr(80, 340), frandr(0.30f, 0.70f),
+                  frandr(-2.0f, 2.0f), FISH_SCHOOL, -1);
+    numSchool++;
+  } else if (type == FISH_SCHOOL2 && numSchool2 < MAX_SCHOOL2) {
+    initFishEntry(MAX_PAIR + MAX_SCHOOL + numSchool2,
+                  frandr(150, 650), frandr(100, 360), frandr(0.30f, 0.70f),
+                  frandr(-2.0f, 2.0f), FISH_SCHOOL2, -1);
+    numSchool2++;
+  }
+}
+
+void removeFish(FishType type) {
+  if (type == FISH_PAIR && numPair > 0) {
+    int idx = numPair - 1;
+    if (idx % 2 == 1) fish[idx - 1].partner = -1;
+    numPair--;
+  } else if (type == FISH_SCHOOL && numSchool > 0) {
+    numSchool--;
+  } else if (type == FISH_SCHOOL2 && numSchool2 > 0) {
+    numSchool2--;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  setup
 // ═══════════════════════════════════════════════════════════════════════════════
 void setup() {
@@ -324,7 +383,6 @@ void setup() {
   Serial.printf("Total PSRAM : %u bytes\n", ESP.getPsramSize());
   Serial.printf("Free  PSRAM : %u bytes\n", ESP.getFreePsram());
 
-  // Verify the exact allocation Bus_RGB will attempt
   void* testAlloc = heap_caps_malloc(800 * 480 * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   Serial.printf("768 KB PSRAM alloc test : %s\n", testAlloc ? "OK" : "FAILED");
   if (testAlloc) heap_caps_free(testAlloc);
@@ -340,7 +398,6 @@ void setup() {
   otaInit(&display);
   checkForOTAUpdate();
 
-  // Build terrain profile — overlapping sin waves give natural bumps
   for (int x = 0; x < SCREEN_W; x++) {
     float h = sinf(x * 0.018f) * 4.0f
             + sinf(x * 0.063f) * 2.5f
@@ -355,36 +412,32 @@ void setup() {
     Serial.println("Canvas sprite created OK");
   }
 
-  // Bubbles — scattered at start
   for (int i = 0; i < NUM_BUBBLES; i++) resetBubble(i, true);
 
-  // Seaweed — evenly spaced along bottom
   for (int i = 0; i < NUM_WEEDS; i++) {
     weeds[i].baseX       = (uint16_t)(40 + i * (SCREEN_W / (NUM_WEEDS + 1)));
-    weeds[i].segs        = (uint8_t)(8 + random(0, 7));   // 8-14
-    weeds[i].numBranches = (uint8_t)(1 + random(0, 2));   // 1 or 2
+    weeds[i].segs        = (uint8_t)(8 + random(0, 7));
+    weeds[i].numBranches = (uint8_t)(1 + random(0, 2));
     for (int b = 0; b < 2; b++) {
-      // Branch sprouts somewhere between seg 2 and near the top
       weeds[i].branchAt[b]   = (uint8_t)(2 + random(0, weeds[i].segs - 3));
-      // Branches alternate sides; add randomness so they don't always mirror
       weeds[i].branchSide[b] = (random(0, 2) == 0) ? 1 : -1;
     }
   }
 
-  // Pair fish
-  initFishEntry(0,  150, 210, 0.20f,  3.0f, FISH_PAIR,   1);
-  initFishEntry(1,  330, 240, 0.35f, -2.5f, FISH_PAIR,   0);
+  // Pair fish — indices 0 and 1
+  initFishEntry(0,  150, 210, 0.20f,  3.0f, FISH_PAIR, 1);
+  initFishEntry(1,  330, 240, 0.35f, -2.5f, FISH_PAIR, 0);
 
-  // School 1 — loose cluster, centre-right
-  for (int i = 0; i < NUM_SCHOOL; i++) {
-    initFishEntry(NUM_PAIR + i,
+  // School 1 — starts at index MAX_PAIR
+  for (int i = 0; i < numSchool; i++) {
+    initFishEntry(MAX_PAIR + i,
                   frandr(380, 620), frandr(130, 330), frandr(0.40f, 0.75f),
                   frandr(-2.0f, 2.0f), FISH_SCHOOL, -1);
   }
 
-  // School 2 — loose cluster, centre-left
-  for (int i = 0; i < NUM_SCHOOL2; i++) {
-    initFishEntry(NUM_PAIR + NUM_SCHOOL + i,
+  // School 2 — starts at index MAX_PAIR + MAX_SCHOOL
+  for (int i = 0; i < numSchool2; i++) {
+    initFishEntry(MAX_PAIR + MAX_SCHOOL + i,
                   frandr(150, 400), frandr(150, 350), frandr(0.40f, 0.75f),
                   frandr(-2.0f, 2.0f), FISH_SCHOOL2, -1);
   }
@@ -409,10 +462,10 @@ void dropFood(int touchX = -1, int touchY = -1) {
     if (!flakes[i].active) {
       if (hasTouch) {
         flakes[i].x = constrain(touchX + frandr(-60, 60), 20.0f, (float)(SCREEN_W - 20));
-        flakes[i].y = constrain((float)touchY, 10.0f, (float)(SCREEN_H - 80));
+        flakes[i].y = constrain((float)touchY, (float)(TANK_TOP + 5), (float)(SCREEN_H - 80));
       } else {
         flakes[i].x = frandr(40, SCREEN_W - 40);
-        flakes[i].y = 5;
+        flakes[i].y = (float)(TANK_TOP + 5);
       }
       flakes[i].spd      = frandr(0.4f, 1.0f);
       flakes[i].active   = true;
@@ -421,7 +474,8 @@ void dropFood(int touchX = -1, int touchY = -1) {
       spawned++;
     }
   }
-  for (int i = 0; i < NUM_FISH; i++) {
+  for (int i = 0; i < MAX_FISH; i++) {
+    if (!isFishActive(i)) continue;
     if (fish[i].fullTimer <= 0) {
       fish[i].goingForFood = true;
       fish[i].targetFlake  = -1;
@@ -430,7 +484,7 @@ void dropFood(int touchX = -1, int touchY = -1) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Update — bubbles
+//  Update — snail / bubbles / flakes
 // ═══════════════════════════════════════════════════════════════════════════════
 void updateSnail() {
   float move = snail.facingRight ? snail.spd : -snail.spd;
@@ -444,13 +498,10 @@ void updateBubbles() {
     bubbles[i].y -= bubbles[i].spd;
     bubbles[i].x += sinf(tick * 0.06f + i * 1.57f) * 0.8f;
     bubbles[i].x  = constrain(bubbles[i].x, 2.0f, (float)(SCREEN_W - 2));
-    if (bubbles[i].y < -10) resetBubble(i, false);
+    if (bubbles[i].y < TANK_TOP) resetBubble(i, false);
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Update — flakes
-// ═══════════════════════════════════════════════════════════════════════════════
 void updateFlakes() {
   for (int i = 0; i < MAX_FLAKES; i++) {
     if (!flakes[i].active) continue;
@@ -484,19 +535,24 @@ int nearestFlake(const Fish& f) {
 void updateFish() {
   // School 1 centroid
   float scx = 0, scy = 0, scz = 0;
-  for (int i = NUM_PAIR; i < NUM_PAIR + NUM_SCHOOL; i++) {
-    scx += fish[i].x; scy += fish[i].y; scz += fish[i].z;
+  if (numSchool > 0) {
+    for (int i = MAX_PAIR; i < MAX_PAIR + numSchool; i++) {
+      scx += fish[i].x; scy += fish[i].y; scz += fish[i].z;
+    }
+    scx /= numSchool; scy /= numSchool; scz /= numSchool;
   }
-  scx /= NUM_SCHOOL; scy /= NUM_SCHOOL; scz /= NUM_SCHOOL;
 
   // School 2 centroid
   float sc2x = 0, sc2y = 0, sc2z = 0;
-  for (int i = NUM_PAIR + NUM_SCHOOL; i < NUM_FISH; i++) {
-    sc2x += fish[i].x; sc2y += fish[i].y; sc2z += fish[i].z;
+  if (numSchool2 > 0) {
+    for (int i = MAX_PAIR + MAX_SCHOOL; i < MAX_PAIR + MAX_SCHOOL + numSchool2; i++) {
+      sc2x += fish[i].x; sc2y += fish[i].y; sc2z += fish[i].z;
+    }
+    sc2x /= numSchool2; sc2y /= numSchool2; sc2z /= numSchool2;
   }
-  sc2x /= NUM_SCHOOL2; sc2y /= NUM_SCHOOL2; sc2z /= NUM_SCHOOL2;
 
-  for (int i = 0; i < NUM_FISH; i++) {
+  for (int i = 0; i < MAX_FISH; i++) {
+    if (!isFishActive(i)) continue;
     Fish& f = fish[i];
     float ax = 0, ay = 0, az = 0;
 
@@ -517,7 +573,7 @@ void updateFish() {
 
         if (f.targetFlake >= 0) {
           if (f.z > 0.25f) {
-            az += (0.15f - f.z) * 0.06f;  // come forward first
+            az += (0.15f - f.z) * 0.06f;
           } else {
             ax += (flakes[f.targetFlake].x - f.x) * 0.05f;
             ay += (flakes[f.targetFlake].y - f.y) * 0.05f;
@@ -531,40 +587,41 @@ void updateFish() {
       f.wanderCD -= 1.0f;
       if (f.wanderCD <= 0.0f) {
         if (f.type == FISH_PAIR) {
-          // Toggle chase/flee each cycle; chases last shorter so prey gets away
           f.chasing  = !f.chasing;
           f.wanderCD = f.chasing ? frandr(30, 70) : frandr(40, 90);
         } else {
           f.wanderCD = frandr(15, 50);
         }
 
-        if (f.type == FISH_PAIR) {
+        if (f.type == FISH_PAIR && f.partner >= 0 && isFishActive(f.partner)) {
           Fish& partner = fish[f.partner];
           if (f.chasing) {
-            // Target directly at partner — full tank crossing allowed
             f.tx = constrain(partner.x + frandr(-40, 40), 30.0f, (float)(SCREEN_W - 30));
-            f.ty = constrain(partner.y + frandr(-30, 30), 30.0f, (float)(SCREEN_H - 80));
+            f.ty = constrain(partner.y + frandr(-30, 30), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
             f.tz = constrain(partner.z + frandr(-0.10f, 0.10f), 0.05f, 0.72f);
           } else {
-            // Flee: target on the opposite side of the tank from partner
             float fleeX = f.x + (f.x - partner.x) * 1.5f;
             float fleeY = f.y + (f.y - partner.y) * 1.2f;
             f.tx = constrain(fleeX + frandr(-60, 60), 30.0f, (float)(SCREEN_W - 30));
-            f.ty = constrain(fleeY + frandr(-40, 40), 30.0f, (float)(SCREEN_H - 80));
+            f.ty = constrain(fleeY + frandr(-40, 40), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
             f.tz = constrain(partner.z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
           }
+        } else if (f.type == FISH_PAIR) {
+          // Solo pair fish — wander freely
+          f.tx = frandr(30.0f, (float)(SCREEN_W - 30));
+          f.ty = frandr((float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+          f.tz = constrain(f.tz + frandr(-0.12f, 0.12f), 0.05f, 0.72f);
         } else if (f.type == FISH_SCHOOL) {
           f.tx = constrain(scx + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
-          f.ty = constrain(scy + frandr(-90,   90), 30.0f, (float)(SCREEN_H - 80));
+          f.ty = constrain(scy + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
           f.tz = constrain(scz + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
         } else {
           f.tx = constrain(sc2x + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
-          f.ty = constrain(sc2y + frandr(-90,   90), 30.0f, (float)(SCREEN_H - 80));
+          f.ty = constrain(sc2y + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
           f.tz = constrain(sc2z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
         }
       }
 
-      // Chasing pair fish gets a stronger seek pull
       float seekStr = (f.type == FISH_PAIR && f.chasing) ? 0.018f : 0.012f;
       ax += (f.tx - f.x) * seekStr;
       ay += (f.ty - f.y) * seekStr;
@@ -574,15 +631,16 @@ void updateFish() {
         float cx = (f.type == FISH_SCHOOL) ? scx  : sc2x;
         float cy = (f.type == FISH_SCHOOL) ? scy  : sc2y;
         float cz = (f.type == FISH_SCHOOL) ? scz  : sc2z;
-        int   js = (f.type == FISH_SCHOOL) ? NUM_PAIR : (NUM_PAIR + NUM_SCHOOL);
-        int   je = (f.type == FISH_SCHOOL) ? (NUM_PAIR + NUM_SCHOOL) : NUM_FISH;
+        int   js = (f.type == FISH_SCHOOL) ? MAX_PAIR : (MAX_PAIR + MAX_SCHOOL);
+        int   je = (f.type == FISH_SCHOOL) ? (MAX_PAIR + numSchool)
+                                           : (MAX_PAIR + MAX_SCHOOL + numSchool2);
 
         ax += (cx - f.x) * 0.010f;
         ay += (cy - f.y) * 0.007f;
         az += (cz - f.z) * 0.007f;
 
         for (int j = js; j < je; j++) {
-          if (j == i) continue;
+          if (j == i || !isFishActive(j)) continue;
           float dx = f.x - fish[j].x, dy = f.y - fish[j].y;
           float d2 = dx * dx + dy * dy;
           if (d2 < 80.0f * 80.0f && d2 > 0.01f) {
@@ -593,9 +651,8 @@ void updateFish() {
       }
     }
 
-    // Boundary repulsion
-    ax += boundAccel(f.x,  30,       SCREEN_W - 30);
-    ay += boundAccel(f.y,  30,       SCREEN_H - 80);
+    ax += boundAccel(f.x,  30,                SCREEN_W - 30);
+    ay += boundAccel(f.y,  TANK_TOP + 20,    SCREEN_H - 80);
     az += boundAccel(f.z,  0.0f,     0.75f, 0.08f);
 
     float maxV  = f.goingForFood ? 8.0f
@@ -609,8 +666,8 @@ void updateFish() {
     f.vx *= 0.85f; f.vy *= 0.85f; f.vz *= 0.88f;
 
     f.x += f.vx; f.y += f.vy; f.z += f.vz;
-    f.x = constrain(f.x, 5.0f, (float)(SCREEN_W - 5));
-    f.y = constrain(f.y, 5.0f, (float)(SCREEN_H - 60));
+    f.x = constrain(f.x, 5.0f,               (float)(SCREEN_W - 5));
+    f.y = constrain(f.y, (float)(TANK_TOP + 5), (float)(SCREEN_H - 60));
     f.z = constrain(f.z, 0.0f, 0.78f);
 
     if (fabsf(f.vx) > 0.4f) f.facingRight = (f.vx > 0);
@@ -630,7 +687,7 @@ void updateFish() {
         flakes[f.targetFlake].active = false;
         f.goingForFood = false;
         f.targetFlake  = -1;
-        f.fullTimer    = 30 * 20;  // 30 seconds × 20 fps
+        f.fullTimer    = 30 * 20;
       }
     }
   }
@@ -649,35 +706,60 @@ void drawSnail() {
   const uint32_t SHELL = 0x7A2E0AUL;
   const uint32_t SWIRL = 0xB05020UL;
 
-  // Shell — sits on the rear half of the body
   canvas.fillCircle(bx - d * 4, by - 8, 8, SHELL);
-  // Spiral hint: two concentric arcs
   canvas.drawCircle(bx - d * 3, by - 8, 5, SWIRL);
   canvas.drawCircle(bx - d * 2, by - 8, 2, SWIRL);
   canvas.drawPixel (bx - d * 2, by - 8,    BODY);
-
-  // Foot / body (flat ellipse along the ground)
   canvas.fillEllipse(bx, by - 3, 12, 3, BODY);
-
-  // Head
   canvas.fillCircle(bx + d * 10, by - 5, 5, BODY);
-
-  // Antennae (two stalks with dot tips)
   canvas.drawLine(bx + d * 8,  by - 9,  bx + d * 6,  by - 15, BODY);
   canvas.drawLine(bx + d * 12, by - 9,  bx + d * 14, by - 15, BODY);
   canvas.fillCircle(bx + d * 6,  by - 15, 2, BODY);
   canvas.fillCircle(bx + d * 14, by - 15, 2, BODY);
-
-  // Eyes (dark dots on antenna tips)
   canvas.fillCircle(bx + d * 6,  by - 15, 1, 0x111111UL);
   canvas.fillCircle(bx + d * 14, by - 15, 1, 0x111111UL);
 }
 
 void drawBackground() {
-  canvas.fillScreen(COL_BG);
+  // Dark charcoal outside-the-tank area
+  canvas.fillRect(0, 0, SCREEN_W, TANK_TOP, 0x1A1A1AUL);
+
+  // Animated horizontal bands — two counter-traveling sine waves produce a
+  // shimmering, wavy look. Each row is uniform across the full width so
+  // there are no vertical column streaks.
+  for (int y = TANK_TOP; y < SCREEN_H; y += 3) {
+    float fy = (float)(y - TANK_TOP);
+    float w  = sinf(fy * 0.040f + tick * 0.10f)  * 14.0f
+             + sinf(fy * 0.016f - tick * 0.034f) *  8.0f;
+    int g = constrain(0x30 + (int)(w * 0.4f), 0, 255);
+    int b = constrain(0x60 + (int)w,          0, 255);
+    canvas.fillRect(0, y, SCREEN_W, 3, ((uint32_t)g << 8) | (uint32_t)b);
+  }
+
+  // Sand floor
   for (int x = 0; x < SCREEN_W; x++) {
     canvas.drawFastVLine(x, terrainY[x], SCREEN_H - terrainY[x], COL_SAND);
   }
+}
+
+void drawTankRim() {
+  // Drawn after fish/bubbles so it clips anything that reaches the surface.
+  // Total rim height: 22px, sitting at TANK_TOP-22 .. TANK_TOP+4
+
+  // ── Outer frame (thick dark metal strip) ─────────────────────────────────
+  canvas.fillRect(0, TANK_TOP - 22, SCREEN_W, 12, 0x484848UL); // frame body
+  canvas.fillRect(0, TANK_TOP - 22, SCREEN_W,  1, 0xB0B0B0UL); // top shine
+  canvas.fillRect(0, TANK_TOP - 11, SCREEN_W,  1, 0x202020UL); // bottom shadow
+
+  // ── Glass panel ───────────────────────────────────────────────────────────
+  canvas.fillRect(0, TANK_TOP - 10, SCREEN_W,  9, 0x2E6888UL); // glass body
+  canvas.fillRect(0, TANK_TOP - 10, SCREEN_W,  2, 0xAADDEEUL); // bright top edge
+  canvas.fillRect(0, TANK_TOP -  4, SCREEN_W,  2, 0x5098B8UL); // mid reflection
+  canvas.fillRect(0, TANK_TOP -  2, SCREEN_W,  1, 0x88CCDDUL); // lower highlight
+  canvas.fillRect(0, TANK_TOP -  1, SCREEN_W,  1, 0xDDEEFFUL); // bright waterline lip
+
+  // ── Shadow just inside the water ─────────────────────────────────────────
+  canvas.fillRect(0, TANK_TOP,      SCREEN_W,  4, 0x061018UL);
 }
 
 void drawBubbles() {
@@ -688,11 +770,9 @@ void drawBubbles() {
   }
 }
 
-// Draw a leaf: small filled ellipse offset sideways from (cx,cy), alternating side.
 static void drawLeaf(int cx, int cy, int side, int rx, int ry) {
   int lx = cx + side * (rx + 2);
   canvas.fillEllipse(lx, cy, rx, ry, COL_WEED_LEAF);
-  // darker outline one pixel toward the stem for depth
   canvas.drawLine(cx, cy, lx, cy, COL_WEED);
 }
 
@@ -700,7 +780,6 @@ void drawSeaweed() {
   for (int i = 0; i < NUM_WEEDS; i++) {
     Seaweed& w = weeds[i];
 
-    // Build main-stem point array
     int sx[15], sy[15];
     sx[0] = w.baseX;
     sy[0] = SCREEN_H - 20;
@@ -710,22 +789,19 @@ void drawSeaweed() {
       sy[s] = SCREEN_H - 20 - s * WEED_SEG_H;
     }
 
-    // Draw main stem (two pixels wide for visibility)
     for (int s = 0; s < w.segs; s++) {
       canvas.drawLine(sx[s],     sy[s], sx[s+1],     sy[s+1], COL_WEED);
       canvas.drawLine(sx[s] + 1, sy[s], sx[s+1] + 1, sy[s+1], COL_WEED);
     }
 
-    // Leaves along main stem — alternate sides, skip base segment
     for (int s = 1; s < w.segs; s++) {
       int lx = (sx[s-1] + sx[s]) / 2;
       int ly = (sy[s-1] + sy[s]) / 2 - 2;
       int side = (s % 2 == 0) ? 1 : -1;
-      int rx = 5 + (s % 3);   // slight size variation: 5, 6, or 7 px
+      int rx = 5 + (s % 3);
       drawLeaf(lx, ly, side, rx, 3);
     }
 
-    // Draw branches with their own leaves
     for (int b = 0; b < w.numBranches; b++) {
       int bs = w.branchAt[b];
       if (bs >= w.segs) continue;
@@ -738,7 +814,6 @@ void drawSeaweed() {
         canvas.drawLine(bx, by, nx, ny, COL_WEED);
         canvas.drawLine(bx + 1, by, nx + 1, ny, COL_WEED);
 
-        // One leaf per branch segment, on the outer side
         int lx = (bx + nx) / 2;
         int ly = (by + ny) / 2 - 1;
         drawLeaf(lx, ly, w.branchSide[b], 4, 2);
@@ -776,7 +851,8 @@ void drawFlakes() {
 }
 
 void drawFishShadows() {
-  for (int i = 0; i < NUM_FISH; i++) {
+  for (int i = 0; i < MAX_FISH; i++) {
+    if (!isFishActive(i)) continue;
     const Fish& f = fish[i];
     if ((f.type == FISH_SCHOOL || f.type == FISH_SCHOOL2) && f.z > 0.78f) continue;
 
@@ -788,7 +864,6 @@ void drawFishShadows() {
     int dist = gnd - fy;
     if (dist <= 0) continue;
 
-    // Shadow shrinks as fish rises away from the sand
     float scale = 1.0f - (float)dist / 300.0f;
     if (scale < 0.12f) scale = 0.12f;
 
@@ -802,7 +877,8 @@ void drawFishShadows() {
 }
 
 void drawFish() {
-  for (int i = 0; i < NUM_FISH; i++) {
+  for (int i = 0; i < MAX_FISH; i++) {
+    if (!isFishActive(i)) continue;
     Fish& f = fish[i];
     if ((f.type == FISH_SCHOOL || f.type == FISH_SCHOOL2) && f.z > 0.78f) continue;
 
@@ -825,10 +901,79 @@ void drawFish() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  Menu UI
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void drawMenuButton() {
+  uint32_t bgCol = menuOpen ? 0x2255AAUL : 0x112244UL;
+  canvas.fillRect(HBTN_X, HBTN_Y, HBTN_W, HBTN_H, bgCol);
+  canvas.drawRect(HBTN_X, HBTN_Y, HBTN_W, HBTN_H, 0x4488CCUL);
+  int bx = HBTN_X + 9;
+  int bw = HBTN_W - 18;
+  canvas.fillRect(bx, HBTN_Y +  8, bw, 3, 0xCCEEFFUL);
+  canvas.fillRect(bx, HBTN_Y + 17, bw, 3, 0xCCEEFFUL);
+  canvas.fillRect(bx, HBTN_Y + 26, bw, 3, 0xCCEEFFUL);
+}
+
+void drawMenu() {
+  if (!menuOpen) return;
+
+  canvas.fillRect(MENU_X,   MENU_Y,   MENU_W,   MENU_H,   0x0A1E3CUL);
+  canvas.drawRect(MENU_X,   MENU_Y,   MENU_W,   MENU_H,   0x4488CCUL);
+  canvas.drawRect(MENU_X+1, MENU_Y+1, MENU_W-2, MENU_H-2, 0x1A3355UL);
+
+  canvas.setTextSize(2);
+  canvas.setTextColor(0x88DDFFUL);
+  canvas.setCursor(MENU_X + 28, MENU_Y + 10);
+  canvas.print("AQUARIUM MENU");
+
+  canvas.drawFastHLine(MENU_X + 8, MENU_Y + 32, MENU_W - 16, 0x2244AAUL);
+
+  const char* labels[3] = { "LARGE FISH", "SCHOOL FISH", "DEEP FISH" };
+  int counts[3]         = { numPair, numSchool, numSchool2 };
+  int maxes[3]          = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2 };
+
+  for (int row = 0; row < 3; row++) {
+    int ry = MENU_Y + 45 + row * 58;
+
+    canvas.setTextSize(1);
+    canvas.setTextColor(0xAADDFFUL);
+    canvas.setCursor(MENU_X + 10, ry + 11);
+    canvas.print(labels[row]);
+
+    // [-] button
+    bool canRm = counts[row] > 0;
+    canvas.fillRect(MENU_X + 148, ry, 30, 30, canRm ? 0x1A3355UL : 0x0C1A2AUL);
+    canvas.drawRect(MENU_X + 148, ry, 30, 30, canRm ? 0x4488CCUL : 0x223344UL);
+    canvas.setTextSize(2);
+    canvas.setTextColor(canRm ? 0xFFFFFFUL : 0x334455UL);
+    canvas.setCursor(MENU_X + 157, ry + 7);
+    canvas.print("-");
+
+    // Count
+    char buf[4];
+    snprintf(buf, sizeof(buf), "%d", counts[row]);
+    canvas.setTextSize(2);
+    canvas.setTextColor(0xFFEE88UL);
+    canvas.setCursor(MENU_X + 184, ry + 7);
+    canvas.print(buf);
+
+    // [+] button
+    bool canAdd = counts[row] < maxes[row];
+    canvas.fillRect(MENU_X + 210, ry, 30, 30, canAdd ? 0x1A3355UL : 0x0C1A2AUL);
+    canvas.drawRect(MENU_X + 210, ry, 30, 30, canAdd ? 0x4488CCUL : 0x223344UL);
+    canvas.setTextSize(2);
+    canvas.setTextColor(canAdd ? 0xFFFFFFUL : 0x334455UL);
+    canvas.setCursor(MENU_X + 217, ry + 7);
+    canvas.print("+");
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  loop
 // ═══════════════════════════════════════════════════════════════════════════════
 void loop() {
-  // Physical button (disabled on this board — GPIO0 is PCLK)
+  // Physical button (disabled — GPIO0 is PCLK on this board)
   bool btnState = (BUTTON_PIN >= 0) ? digitalRead(BUTTON_PIN) : HIGH;
   if (btnState == LOW && lastBtnState == HIGH) {
     uint32_t t = millis();
@@ -839,11 +984,33 @@ void loop() {
   }
   lastBtnState = btnState;
 
-  // Touch — tap anywhere to drop food at that spot
+  // Touch handling
   uint16_t tx, ty;
   bool touched = display.getTouch(&tx, &ty);
   if (touched && !lastTouched) {
-    dropFood((int)tx, (int)ty);
+    if (tx >= HBTN_X && tx < (uint16_t)(HBTN_X + HBTN_W) &&
+        ty >= HBTN_Y && ty < (uint16_t)(HBTN_Y + HBTN_H)) {
+      // Hamburger button — toggle menu
+      menuOpen = !menuOpen;
+    } else if (menuOpen) {
+      // Route to [-]/[+] buttons; block food drop while menu open
+      const FishType rowType[3] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2 };
+      for (int row = 0; row < 3; row++) {
+        int ry = MENU_Y + 45 + row * 58;
+        if (tx >= (uint16_t)(MENU_X + 148) && tx < (uint16_t)(MENU_X + 178) &&
+            ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
+          removeFish(rowType[row]);
+          break;
+        }
+        if (tx >= (uint16_t)(MENU_X + 210) && tx < (uint16_t)(MENU_X + 240) &&
+            ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
+          addFish(rowType[row]);
+          break;
+        }
+      }
+    } else {
+      dropFood((int)tx, (int)ty);
+    }
   }
   lastTouched = touched;
 
@@ -864,5 +1031,8 @@ void loop() {
   drawBubbles();
   drawFlakes();
   drawFish();
+  drawTankRim();
+  drawMenuButton();
+  drawMenu();
   canvas.pushSprite(0, 0);
 }
