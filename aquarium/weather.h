@@ -22,18 +22,25 @@ enum WeatherCondition : uint8_t {
 
 static WeatherCondition currentWeather     = WEATHER_SUNNY;
 static uint32_t         _lastWeatherMs     = 0;
-static const uint32_t   _WEATHER_INTERVAL  = 5UL * 60UL * 1000UL;    // 5 min
+static bool             _lastFetchOk       = false;
 
-static WeatherCondition _fetchWeather() {
+static const uint32_t   _WEATHER_INTERVAL       = 5UL * 60UL * 1000UL;   // 5 min on success
+static const uint32_t   _WEATHER_RETRY_INTERVAL = 60UL * 1000UL;          // 1 min on failure
+
+// Returns true on success and updates outCondition.
+static bool _fetchWeather(WeatherCondition& outCondition) {
+  // Brief pause so WiFi hardware fully powers up after any prior mode change.
+  delay(300);
+
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - t0 > 12000UL) {
+    if (millis() - t0 > 15000UL) {
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
-      return currentWeather;   // keep last known state on timeout
+      return false;
     }
     delay(200);
   }
@@ -48,7 +55,7 @@ static WeatherCondition _fetchWeather() {
     "?lat=%s&lon=%s&appid=%s",
     WEATHER_LAT, WEATHER_LON, WEATHER_API_KEY);
 
-  WeatherCondition result = currentWeather;
+  bool success = false;
   HTTPClient http;
   if (http.begin(client, url)) {
     int code = http.GET();
@@ -58,16 +65,19 @@ static WeatherCondition _fetchWeather() {
       DynamicJsonDocument doc(512);
       if (!deserializeJson(doc, http.getStream(),
                            DeserializationOption::Filter(filter))) {
-        int id = doc["weather"][0]["id"] | 800;
-        if      (id == 800)              result = WEATHER_SUNNY;
-        else if (id == 801)              result = WEATHER_PARTLY_CLOUDY;
-        else if (id >= 802 && id <= 804) result = WEATHER_CLOUDY;
-        else if (id >= 500 && id <= 531) result = WEATHER_RAINY;
-        else if (id >= 200 && id <= 232) result = WEATHER_STORMY;
-        else if (id >= 600 && id <= 622) result = WEATHER_SNOWY;
-        else if (id >= 300 && id <= 321) result = WEATHER_RAINY;   // drizzle → rainy
-        else if (id >= 700 && id <= 781) result = WEATHER_FOGGY;
-        else                             result = WEATHER_CLOUDY;
+        int id = doc["weather"][0]["id"] | -1;
+        if (id >= 0) {
+          if      (id == 800)              outCondition = WEATHER_SUNNY;
+          else if (id == 801)              outCondition = WEATHER_PARTLY_CLOUDY;
+          else if (id >= 802 && id <= 804) outCondition = WEATHER_CLOUDY;
+          else if (id >= 500 && id <= 531) outCondition = WEATHER_RAINY;
+          else if (id >= 200 && id <= 232) outCondition = WEATHER_STORMY;
+          else if (id >= 600 && id <= 622) outCondition = WEATHER_SNOWY;
+          else if (id >= 300 && id <= 321) outCondition = WEATHER_RAINY;
+          else if (id >= 700 && id <= 781) outCondition = WEATHER_FOGGY;
+          else                             outCondition = WEATHER_CLOUDY;
+          success = true;
+        }
       }
     }
     http.end();
@@ -75,17 +85,22 @@ static WeatherCondition _fetchWeather() {
 
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
-  return result;
+  return success;
 }
 
 static void initWeather() {
-  currentWeather = _fetchWeather();
+  WeatherCondition w = currentWeather;
+  _lastFetchOk   = _fetchWeather(w);
+  currentWeather = _lastFetchOk ? w : WEATHER_SUNNY;
   _lastWeatherMs = millis();
 }
 
 static void updateWeather() {
-  if (millis() - _lastWeatherMs >= _WEATHER_INTERVAL) {
-    currentWeather = _fetchWeather();
+  uint32_t interval = _lastFetchOk ? _WEATHER_INTERVAL : _WEATHER_RETRY_INTERVAL;
+  if (millis() - _lastWeatherMs >= interval) {
+    WeatherCondition w = currentWeather;
+    _lastFetchOk = _fetchWeather(w);
+    if (_lastFetchOk) currentWeather = w;
     _lastWeatherMs = millis();
   }
 }
