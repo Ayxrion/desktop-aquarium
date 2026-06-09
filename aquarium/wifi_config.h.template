@@ -1,5 +1,14 @@
 #pragma once
-// Copy this file to wifi_config.h and fill in your network credentials.
+// Copy this file to wifi_config.h and fill in your credentials.
 // wifi_config.h is listed in .gitignore and will never be committed.
-#define WIFI_SSID     "Pixel_1856"
-#define WIFI_PASSWORD "routeradmin"
+
+// ── WiFi ──────────────────────────────────────────────────────────────────────
+#define WIFI_SSID     "your_ssid"
+#define WIFI_PASSWORD "your_password"
+
+// ── OpenWeatherMap (https://openweathermap.org/api — free tier is sufficient) ─
+// Get a free API key at https://home.openweathermap.org/users/sign_up
+// LAT/LON as decimal strings, e.g. "51.5074" / "-0.1278" for London.
+#define WEATHER_API_KEY "your_openweathermap_api_key"
+#define WEATHER_LAT     "51.5074"
+#define WEATHER_LON     "-0.1278"
