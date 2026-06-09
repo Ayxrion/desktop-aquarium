@@ -775,6 +775,32 @@ void drawFlakes() {
   }
 }
 
+void drawFishShadows() {
+  for (int i = 0; i < NUM_FISH; i++) {
+    const Fish& f = fish[i];
+    if ((f.type == FISH_SCHOOL || f.type == FISH_SCHOOL2) && f.z > 0.78f) continue;
+
+    int sx  = projX(f.x, f.z);
+    int fy  = projY(f.y, f.z);
+    int tx  = sx < 0 ? 0 : (sx >= SCREEN_W ? SCREEN_W - 1 : sx);
+    int gnd = terrainY[tx];
+
+    int dist = gnd - fy;
+    if (dist <= 0) continue;
+
+    // Shadow shrinks as fish rises away from the sand
+    float scale = 1.0f - (float)dist / 300.0f;
+    if (scale < 0.12f) scale = 0.12f;
+
+    int rx = (int)(fishHW(f) * scale);
+    int ry = (int)(3 * fishTS(f) * scale);
+    if (rx < 1) rx = 1;
+    if (ry < 1) ry = 1;
+
+    canvas.fillEllipse(sx, gnd - 1, rx, ry, 0x4A3010UL);
+  }
+}
+
 void drawFish() {
   for (int i = 0; i < NUM_FISH; i++) {
     Fish& f = fish[i];
@@ -832,6 +858,7 @@ void loop() {
   updateFish();
 
   drawBackground();
+  drawFishShadows();
   drawSnail();
   drawSeaweed();
   drawBubbles();
