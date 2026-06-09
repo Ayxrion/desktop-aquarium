@@ -50,12 +50,12 @@ jobs:
             "${{ secrets.WIFI_SSID }}" "${{ secrets.WIFI_PASSWORD }}" \
             > aquarium/wifi_config.h
 
-      # PlatformIO looks in src/ by default; copy the sketch there with
-      # Arduino.h prepended.  The aquarium/ headers are on the include
-      # path via -I ${PROJECT_DIR}/aquarium in platformio.ini.
+      # PlatformIO's LDF only scans src/ — copy all headers there so it
+      # can follow transitive includes (WiFi.h, HTTPClient.h, etc.).
       - name: Prepare sketch for PlatformIO
         run: |
           mkdir -p src
+          cp aquarium/*.h src/
           (echo '#include <Arduino.h>'; cat aquarium/aquarium.ino) > src/main.cpp
 
       - name: Build firmware
