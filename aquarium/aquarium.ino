@@ -14,6 +14,7 @@
 #include "version.h"
 #include "wifi_config.h"
 #include "ota_update.h"
+#include "weather.h"
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  LGFX — Elecrow CrowPanel 7.0" (16-bit parallel RGB, GT911 touch)
@@ -129,6 +130,11 @@ static int16_t terrainY[SCREEN_W];
 
 // ─── Timing ──────────────────────────────────────────────────────────────────
 #define FRAME_MS  50
+
+// ─── Weather sky strip ────────────────────────────────────────────────────────
+// Tied to TANK_TOP so the sky always fills the above-tank area exactly.
+#define WEATHER_SKY_H  TANK_TOP
+
 uint32_t lastFrameMs = 0;
 float    tick        = 0;
 
@@ -255,6 +261,31 @@ uint32_t lastBtnMs     = 0;
 bool     lastTouched   = false;
 bool     menuOpen      = false;
 
+// ─── Weather visual — clouds ─────────────────────────────────────────────────
+#define MAX_CLOUDS 5
+struct Cloud {
+  float x, y;   // centre (x) and base (y) within sky strip
+  float w, h;   // width and puff height
+  float spd;    // horizontal drift px/frame
+};
+static Cloud  clouds[MAX_CLOUDS];
+static int    numClouds = 0;
+
+// ─── Weather visual — rain ────────────────────────────────────────────────────
+#define MAX_RAINDROPS 120
+struct RainDrop { float x, y, spd; };
+static RainDrop rainDrops[MAX_RAINDROPS];
+
+// ─── Weather visual — snow ────────────────────────────────────────────────────
+#define MAX_SNOWFLAKES 60
+struct SnowFlake { float x, y, spd, sway; };
+static SnowFlake snowFlakes[MAX_SNOWFLAKES];
+
+// ─── Weather visual — lightning ───────────────────────────────────────────────
+static float    _lightningTimer = 0;
+static uint8_t  _lightningFlash = 0;
+static float    _lightBoltX     = 400;
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Helpers
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -373,6 +404,184 @@ void removeFish(FishType type) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  Weather visual effects
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void initWeatherEffects() {
+  switch (currentWeather) {
+    case WEATHER_PARTLY_CLOUDY: numClouds = 2; break;
+    case WEATHER_CLOUDY:        numClouds = 4; break;
+    case WEATHER_FOGGY:         numClouds = 5; break;
+    case WEATHER_RAINY:         numClouds = 3; break;
+    case WEATHER_STORMY:        numClouds = 4; break;
+    default:                    numClouds = 0; break;
+  }
+  for (int i = 0; i < numClouds; i++) {
+    clouds[i].x   = frandr(80, SCREEN_W - 80);
+    clouds[i].y   = frandr(15, WEATHER_SKY_H - 25);
+    clouds[i].w   = frandr(90, 160);
+    clouds[i].h   = frandr(14, 26);
+    clouds[i].spd = frandr(0.06f, 0.22f) * (random(0, 2) ? 1.0f : -1.0f);
+  }
+  for (int i = 0; i < MAX_RAINDROPS; i++) {
+    rainDrops[i].x   = frandr(0, SCREEN_W);
+    rainDrops[i].y   = frandr(0, WEATHER_SKY_H);
+    rainDrops[i].spd = frandr(7.0f, 13.0f);
+  }
+  for (int i = 0; i < MAX_SNOWFLAKES; i++) {
+    snowFlakes[i].x    = frandr(0, SCREEN_W);
+    snowFlakes[i].y    = frandr(0, WEATHER_SKY_H);
+    snowFlakes[i].spd  = frandr(0.4f, 1.6f);
+    snowFlakes[i].sway = frandr(0, 6.28f);
+  }
+  _lightningTimer = frandr(120, 300);
+  _lightningFlash = 0;
+}
+
+void updateWeatherEffects() {
+  for (int i = 0; i < numClouds; i++) {
+    clouds[i].x += clouds[i].spd;
+    if (clouds[i].x >  SCREEN_W + 120) clouds[i].x = -120;
+    if (clouds[i].x < -120)            clouds[i].x =  SCREEN_W + 120;
+  }
+
+  if (currentWeather == WEATHER_RAINY || currentWeather == WEATHER_STORMY) {
+    for (int i = 0; i < MAX_RAINDROPS; i++) {
+      rainDrops[i].x += 1.8f;
+      rainDrops[i].y += rainDrops[i].spd;
+      if (rainDrops[i].y >= WEATHER_SKY_H || rainDrops[i].x >= SCREEN_W) {
+        rainDrops[i].x   = frandr(-20, SCREEN_W);
+        rainDrops[i].y   = frandr(-12, 0);
+        rainDrops[i].spd = frandr(7.0f, 13.0f);
+      }
+    }
+  }
+
+  if (currentWeather == WEATHER_SNOWY) {
+    for (int i = 0; i < MAX_SNOWFLAKES; i++) {
+      snowFlakes[i].sway += 0.04f;
+      snowFlakes[i].x    += sinf(snowFlakes[i].sway) * 0.5f;
+      snowFlakes[i].y    += snowFlakes[i].spd;
+      if (snowFlakes[i].y >= WEATHER_SKY_H) {
+        snowFlakes[i].x   = frandr(0, SCREEN_W);
+        snowFlakes[i].y   = frandr(-5, 0);
+      }
+    }
+  }
+
+  if (currentWeather == WEATHER_STORMY) {
+    if (_lightningFlash > 0) {
+      _lightningFlash--;
+    } else {
+      _lightningTimer -= 1.0f;
+      if (_lightningTimer <= 0) {
+        _lightningFlash = 3;
+        _lightBoltX     = frandr(80, SCREEN_W - 80);
+        _lightningTimer = frandr(80, 260);
+      }
+    }
+  }
+}
+
+// Draws a puffy cloud centred at (cx, cy) with given width/height.
+static void drawCloud(float cx, float cy, float cw, float ch, uint32_t col) {
+  int x = (int)cx, y = (int)cy, w = (int)cw, h = (int)ch;
+  int hw = w / 2;
+  canvas.fillRect(x - hw, y - h / 4, w, h / 2, col);
+  canvas.fillCircle(x,          y - h / 4, h / 2,     col);
+  canvas.fillCircle(x - hw / 2, y - h / 8, h * 2 / 5, col);
+  canvas.fillCircle(x + hw / 2, y - h / 8, h * 2 / 5, col);
+  if (w > 120) {
+    canvas.fillCircle(x - hw + h / 3, y,     h / 4, col);
+    canvas.fillCircle(x + hw - h / 3, y,     h / 4, col);
+  }
+}
+
+void drawWeatherSky() {
+  uint32_t skyTop, skyBot, cloudCol;
+  switch (currentWeather) {
+    case WEATHER_SUNNY:
+      skyTop = 0x1A78C8; skyBot = 0x64B5E8; cloudCol = 0xFFFFFF; break;
+    case WEATHER_PARTLY_CLOUDY:
+      skyTop = 0x2288CC; skyBot = 0x77AEDD; cloudCol = 0xEEEEFF; break;
+    case WEATHER_CLOUDY:
+      skyTop = 0x556677; skyBot = 0x8899AA; cloudCol = 0xBBBBCC; break;
+    case WEATHER_RAINY:
+      skyTop = 0x334455; skyBot = 0x556677; cloudCol = 0x5A6A7A; break;
+    case WEATHER_STORMY:
+      skyTop = 0x111827; skyBot = 0x1A2233; cloudCol = 0x2A3344; break;
+    case WEATHER_SNOWY:
+      skyTop = 0x8899AA; skyBot = 0xAABBCC; cloudCol = 0xCCDDEE; break;
+    case WEATHER_FOGGY:
+      skyTop = 0x7788AA; skyBot = 0xAABBCC; cloudCol = 0xBBCCDD; break;
+    default:
+      skyTop = 0x1A78C8; skyBot = 0x64B5E8; cloudCol = 0xFFFFFF; break;
+  }
+
+  // 8-band vertical gradient
+  for (int band = 0; band < 8; band++) {
+    int   y0 = band       * WEATHER_SKY_H / 8;
+    int   y1 = (band + 1) * WEATHER_SKY_H / 8;
+    float t  = (float)band / 7.0f;
+    uint8_t r = (uint8_t)(((skyTop >> 16 & 0xFF) * (1.0f - t)) + ((skyBot >> 16 & 0xFF) * t));
+    uint8_t g = (uint8_t)(((skyTop >>  8 & 0xFF) * (1.0f - t)) + ((skyBot >>  8 & 0xFF) * t));
+    uint8_t b = (uint8_t)(((skyTop       & 0xFF) * (1.0f - t)) + ((skyBot       & 0xFF) * t));
+    canvas.fillRect(0, y0, SCREEN_W, y1 - y0 + 1, (uint32_t)((r << 16) | (g << 8) | b));
+  }
+
+  // Lightning flash
+  if (_lightningFlash > 0) {
+    canvas.fillRect(0, 0, SCREEN_W, WEATHER_SKY_H, 0xCCDDFFUL);
+    int bx = (int)_lightBoltX, by = 4;
+    while (by < WEATHER_SKY_H) {
+      int nx = bx + (int)random(-14, 14);
+      int ny = by + (int)random(10, 22);
+      if (ny > WEATHER_SKY_H) ny = WEATHER_SKY_H;
+      canvas.drawLine(bx,     by, nx,     ny, 0xFFFFAAUL);
+      canvas.drawLine(bx + 1, by, nx + 1, ny, 0xFFFF66UL);
+      bx = nx; by = ny;
+    }
+  }
+
+  // Clouds
+  for (int i = 0; i < numClouds; i++) {
+    drawCloud(clouds[i].x, clouds[i].y, clouds[i].w, clouds[i].h, cloudCol);
+  }
+
+  // Rain streaks
+  if (currentWeather == WEATHER_RAINY || currentWeather == WEATHER_STORMY) {
+    uint32_t rainCol = (currentWeather == WEATHER_STORMY) ? 0x7799BBUL : 0x88AACCUL;
+    for (int i = 0; i < MAX_RAINDROPS; i++) {
+      int rx = (int)rainDrops[i].x;
+      int ry = (int)rainDrops[i].y;
+      if (ry < 0) continue;
+      int ey = ry + 5;
+      if (ey >= WEATHER_SKY_H) ey = WEATHER_SKY_H - 1;
+      canvas.drawLine(rx, ry, rx + 2, ey, rainCol);
+    }
+  }
+
+  // Snowflakes
+  if (currentWeather == WEATHER_SNOWY) {
+    for (int i = 0; i < MAX_SNOWFLAKES; i++) {
+      int sx = (int)snowFlakes[i].x;
+      int sy = (int)snowFlakes[i].y;
+      if (sy >= 0 && sy < WEATHER_SKY_H) {
+        canvas.fillRect(sx, sy, 2, 2, 0xEEEEFFUL);
+      }
+    }
+  }
+
+  // Foggy haze overlay
+  if (currentWeather == WEATHER_FOGGY) {
+    for (int y = 0; y < WEATHER_SKY_H; y += 12) {
+      canvas.fillRect(0, y, SCREEN_W, 5, 0xAABBCCUL);
+    }
+  }
+  // Note: drawTankRim() is called after this and covers the bottom of the sky.
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  setup
 // ═══════════════════════════════════════════════════════════════════════════════
 void setup() {
@@ -397,6 +606,7 @@ void setup() {
 
   otaInit(&display);
   checkForOTAUpdate();
+  initWeather();          // fetch current conditions from OpenWeatherMap
 
   for (int x = 0; x < SCREEN_W; x++) {
     float h = sinf(x * 0.018f) * 4.0f
@@ -443,6 +653,8 @@ void setup() {
   }
 
   for (int i = 0; i < MAX_FLAKES; i++) flakes[i].active = false;
+
+  initWeatherEffects();   // set up clouds / rain / snow based on fetched weather
 
   snail.x           = frandr(80, SCREEN_W - 80);
   snail.spd         = frandr(0.12f, 0.25f);
@@ -651,8 +863,8 @@ void updateFish() {
       }
     }
 
-    ax += boundAccel(f.x,  30,                SCREEN_W - 30);
-    ay += boundAccel(f.y,  TANK_TOP + 20,    SCREEN_H - 80);
+    ax += boundAccel(f.x,  30,             SCREEN_W - 30);
+    ay += boundAccel(f.y,  TANK_TOP + 20,  SCREEN_H - 80);
     az += boundAccel(f.z,  0.0f,     0.75f, 0.08f);
 
     float maxV  = f.goingForFood ? 8.0f
@@ -666,7 +878,7 @@ void updateFish() {
     f.vx *= 0.85f; f.vy *= 0.85f; f.vz *= 0.88f;
 
     f.x += f.vx; f.y += f.vy; f.z += f.vz;
-    f.x = constrain(f.x, 5.0f,               (float)(SCREEN_W - 5));
+    f.x = constrain(f.x, 5.0f,                (float)(SCREEN_W - 5));
     f.y = constrain(f.y, (float)(TANK_TOP + 5), (float)(SCREEN_H - 60));
     f.z = constrain(f.z, 0.0f, 0.78f);
 
@@ -721,7 +933,7 @@ void drawSnail() {
 }
 
 void drawBackground() {
-  // Dark charcoal outside-the-tank area
+  // Dark charcoal outside-the-tank area (overwritten below by drawWeatherSky)
   canvas.fillRect(0, 0, SCREEN_W, TANK_TOP, 0x1A1A1AUL);
 
   // Animated horizontal bands — two counter-traveling sine waves produce a
@@ -765,6 +977,7 @@ void drawTankRim() {
 void drawBubbles() {
   for (int i = 0; i < NUM_BUBBLES; i++) {
     int bx = (int)bubbles[i].x, by = (int)bubbles[i].y;
+    if (by - (int)bubbles[i].r < TANK_TOP) continue;  // clip to water zone
     canvas.drawCircle(bx, by, bubbles[i].r,     COL_BUBBLE);
     canvas.drawCircle(bx, by, bubbles[i].r - 1, COL_BUBBLE);
   }
@@ -1008,7 +1221,8 @@ void loop() {
           break;
         }
       }
-    } else {
+    } else if ((int)ty > TANK_TOP) {
+      // Only drop food in the water zone, not the sky
       dropFood((int)tx, (int)ty);
     }
   }
@@ -1019,19 +1233,28 @@ void loop() {
   lastFrameMs = now;
   tick += 1.0f;
 
+  // Weather: re-check API every 5 min; re-init visuals when conditions change
+  {
+    WeatherCondition prevW = currentWeather;
+    updateWeather();
+    if (currentWeather != prevW) initWeatherEffects();
+  }
+  updateWeatherEffects();
+
   updateSnail();
   updateBubbles();
   updateFlakes();
   updateFish();
 
   drawBackground();
+  drawWeatherSky();   // overwrites the top TANK_TOP px with sky + weather effects
   drawFishShadows();
   drawSnail();
   drawSeaweed();
   drawBubbles();
   drawFlakes();
   drawFish();
-  drawTankRim();
+  drawTankRim();      // draws over the bottom of the sky, giving a clean rim
   drawMenuButton();
   drawMenu();
   canvas.pushSprite(0, 0);
