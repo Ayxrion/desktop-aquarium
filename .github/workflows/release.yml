@@ -40,14 +40,17 @@ jobs:
           sed -i "s/#define FIRMWARE_VERSION.*/#define FIRMWARE_VERSION \"${VER}\"/" \
             aquarium/version.h
 
-      # WiFi credentials are stored as GitHub Actions secrets:
-      #   Settings → Secrets and variables → Actions → New repository secret
-      #   Name: WIFI_SSID   Value: <your SSID>
-      #   Name: WIFI_PASSWORD  Value: <your password>
+      # Secrets required (Settings → Secrets and variables → Actions):
+      #   WIFI_SSID, WIFI_PASSWORD
+      #   WEATHER_API_KEY  — free key from openweathermap.org
+      #   WEATHER_LAT      — decimal latitude,  e.g. "51.5074"
+      #   WEATHER_LON      — decimal longitude, e.g. "-0.1278"
       - name: Create wifi_config.h from secrets
         run: |
-          printf '#pragma once\n#define WIFI_SSID "%s"\n#define WIFI_PASSWORD "%s"\n' \
+          printf '#pragma once\n#define WIFI_SSID "%s"\n#define WIFI_PASSWORD "%s"\n#define WEATHER_API_KEY "%s"\n#define WEATHER_LAT "%s"\n#define WEATHER_LON "%s"\n' \
             "${{ secrets.WIFI_SSID }}" "${{ secrets.WIFI_PASSWORD }}" \
+            "${{ secrets.WEATHER_API_KEY }}" \
+            "${{ secrets.WEATHER_LAT }}" "${{ secrets.WEATHER_LON }}" \
             > aquarium/wifi_config.h
 
       # PlatformIO's LDF only scans src/ — copy all headers there so it
