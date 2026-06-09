@@ -120,6 +120,7 @@ static LGFX_Sprite    canvas(&display);
 // ─── Screen ──────────────────────────────────────────────────────────────────
 #define SCREEN_W  800
 #define SCREEN_H  480
+#define TANK_TOP   72   // water surface row; 15% of SCREEN_H is outside the tank
 
 static int16_t terrainY[SCREEN_W];
 
@@ -461,10 +462,10 @@ void dropFood(int touchX = -1, int touchY = -1) {
     if (!flakes[i].active) {
       if (hasTouch) {
         flakes[i].x = constrain(touchX + frandr(-60, 60), 20.0f, (float)(SCREEN_W - 20));
-        flakes[i].y = constrain((float)touchY, 10.0f, (float)(SCREEN_H - 80));
+        flakes[i].y = constrain((float)touchY, (float)(TANK_TOP + 5), (float)(SCREEN_H - 80));
       } else {
         flakes[i].x = frandr(40, SCREEN_W - 40);
-        flakes[i].y = 5;
+        flakes[i].y = (float)(TANK_TOP + 5);
       }
       flakes[i].spd      = frandr(0.4f, 1.0f);
       flakes[i].active   = true;
@@ -497,7 +498,7 @@ void updateBubbles() {
     bubbles[i].y -= bubbles[i].spd;
     bubbles[i].x += sinf(tick * 0.06f + i * 1.57f) * 0.8f;
     bubbles[i].x  = constrain(bubbles[i].x, 2.0f, (float)(SCREEN_W - 2));
-    if (bubbles[i].y < -10) resetBubble(i, false);
+    if (bubbles[i].y < TANK_TOP) resetBubble(i, false);
   }
 }
 
@@ -596,27 +597,27 @@ void updateFish() {
           Fish& partner = fish[f.partner];
           if (f.chasing) {
             f.tx = constrain(partner.x + frandr(-40, 40), 30.0f, (float)(SCREEN_W - 30));
-            f.ty = constrain(partner.y + frandr(-30, 30), 30.0f, (float)(SCREEN_H - 80));
+            f.ty = constrain(partner.y + frandr(-30, 30), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
             f.tz = constrain(partner.z + frandr(-0.10f, 0.10f), 0.05f, 0.72f);
           } else {
             float fleeX = f.x + (f.x - partner.x) * 1.5f;
             float fleeY = f.y + (f.y - partner.y) * 1.2f;
             f.tx = constrain(fleeX + frandr(-60, 60), 30.0f, (float)(SCREEN_W - 30));
-            f.ty = constrain(fleeY + frandr(-40, 40), 30.0f, (float)(SCREEN_H - 80));
+            f.ty = constrain(fleeY + frandr(-40, 40), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
             f.tz = constrain(partner.z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
           }
         } else if (f.type == FISH_PAIR) {
           // Solo pair fish — wander freely
           f.tx = frandr(30.0f, (float)(SCREEN_W - 30));
-          f.ty = frandr(30.0f, (float)(SCREEN_H - 80));
+          f.ty = frandr((float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
           f.tz = constrain(f.tz + frandr(-0.12f, 0.12f), 0.05f, 0.72f);
         } else if (f.type == FISH_SCHOOL) {
           f.tx = constrain(scx + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
-          f.ty = constrain(scy + frandr(-90,   90), 30.0f, (float)(SCREEN_H - 80));
+          f.ty = constrain(scy + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
           f.tz = constrain(scz + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
         } else {
           f.tx = constrain(sc2x + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
-          f.ty = constrain(sc2y + frandr(-90,   90), 30.0f, (float)(SCREEN_H - 80));
+          f.ty = constrain(sc2y + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
           f.tz = constrain(sc2z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
         }
       }
@@ -650,8 +651,8 @@ void updateFish() {
       }
     }
 
-    ax += boundAccel(f.x,  30,       SCREEN_W - 30);
-    ay += boundAccel(f.y,  30,       SCREEN_H - 80);
+    ax += boundAccel(f.x,  30,                SCREEN_W - 30);
+    ay += boundAccel(f.y,  TANK_TOP + 20,    SCREEN_H - 80);
     az += boundAccel(f.z,  0.0f,     0.75f, 0.08f);
 
     float maxV  = f.goingForFood ? 8.0f
@@ -665,8 +666,8 @@ void updateFish() {
     f.vx *= 0.85f; f.vy *= 0.85f; f.vz *= 0.88f;
 
     f.x += f.vx; f.y += f.vy; f.z += f.vz;
-    f.x = constrain(f.x, 5.0f, (float)(SCREEN_W - 5));
-    f.y = constrain(f.y, 5.0f, (float)(SCREEN_H - 60));
+    f.x = constrain(f.x, 5.0f,               (float)(SCREEN_W - 5));
+    f.y = constrain(f.y, (float)(TANK_TOP + 5), (float)(SCREEN_H - 60));
     f.z = constrain(f.z, 0.0f, 0.78f);
 
     if (fabsf(f.vx) > 0.4f) f.facingRight = (f.vx > 0);
@@ -720,20 +721,38 @@ void drawSnail() {
 }
 
 void drawBackground() {
-  // Vertical stripes varying by X — uniform colour top-to-bottom (no vertical
-  // gradient), but shimmer drifts left/right over time.
+  // Dark exterior above the tank
+  canvas.fillRect(0, 0, SCREEN_W, TANK_TOP, 0x080808UL);
+
+  // Water — vertical shimmer stripes, no top-to-bottom colour variation
   for (int x = 0; x < SCREEN_W; x += 3) {
     float w = sinf((float)x * 0.025f + tick * 0.07f) * 14.0f
             + sinf((float)x * 0.010f - tick * 0.028f) * 8.0f;
     int g = constrain(0x30 + (int)(w * 0.4f), 0, 255);
     int b = constrain(0x60 + (int)w,          0, 255);
-    canvas.fillRect(x, 0, 3, SCREEN_H, ((uint32_t)g << 8) | (uint32_t)b);
+    canvas.fillRect(x, TANK_TOP, 3, SCREEN_H - TANK_TOP, ((uint32_t)g << 8) | (uint32_t)b);
   }
 
-  // Sand floor overwrites the water at the bottom
+  // Sand floor
   for (int x = 0; x < SCREEN_W; x++) {
     canvas.drawFastVLine(x, terrainY[x], SCREEN_H - terrainY[x], COL_SAND);
   }
+}
+
+void drawTankRim() {
+  // Drawn after fish/bubbles so it clips anything that reaches the surface.
+  // Dark outer frame strip sitting above the water line
+  canvas.fillRect(0, TANK_TOP - 14, SCREEN_W, 8,  0x1E1E1EUL);
+  // Glass pane: dark base
+  canvas.fillRect(0, TANK_TOP -  6, SCREEN_W, 6,  0x253545UL);
+  // Glass highlight — bright edge at the very top of the glass
+  canvas.fillRect(0, TANK_TOP -  6, SCREEN_W, 1,  0x88BCCDUL);
+  // Softer inner highlight
+  canvas.fillRect(0, TANK_TOP -  4, SCREEN_W, 2,  0x4A7A90UL);
+  // Bright lower lip where glass meets water
+  canvas.fillRect(0, TANK_TOP -  1, SCREEN_W, 1,  0xAADDEEUL);
+  // Thin dark shadow just inside the water
+  canvas.fillRect(0, TANK_TOP,      SCREEN_W, 3,  0x091520UL);
 }
 
 void drawBubbles() {
@@ -1005,6 +1024,7 @@ void loop() {
   drawBubbles();
   drawFlakes();
   drawFish();
+  drawTankRim();
   drawMenuButton();
   drawMenu();
   canvas.pushSprite(0, 0);
