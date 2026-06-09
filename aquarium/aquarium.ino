@@ -720,13 +720,14 @@ void drawSnail() {
 }
 
 void drawBackground() {
-  // Flat base colour with two counter-traveling horizontal shimmer waves.
-  for (int y = 0; y < SCREEN_H; y += 3) {
-    float w = sinf((float)y * 0.040f + tick * 0.10f) * 14.0f
-            + sinf((float)y * 0.016f - tick * 0.034f) * 8.0f;
+  // Vertical stripes varying by X — uniform colour top-to-bottom (no vertical
+  // gradient), but shimmer drifts left/right over time.
+  for (int x = 0; x < SCREEN_W; x += 3) {
+    float w = sinf((float)x * 0.025f + tick * 0.07f) * 14.0f
+            + sinf((float)x * 0.010f - tick * 0.028f) * 8.0f;
     int g = constrain(0x30 + (int)(w * 0.4f), 0, 255);
     int b = constrain(0x60 + (int)w,          0, 255);
-    canvas.fillRect(0, y, SCREEN_W, 3, ((uint32_t)g << 8) | (uint32_t)b);
+    canvas.fillRect(x, 0, 3, SCREEN_H, ((uint32_t)g << 8) | (uint32_t)b);
   }
 
   // Sand floor overwrites the water at the bottom
