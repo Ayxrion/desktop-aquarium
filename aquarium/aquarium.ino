@@ -721,13 +721,8 @@ void drawSnail() {
 }
 
 void drawBackground() {
-  // Bright orange outside area + version label — diagnostic to confirm firmware
-  // version and that TANK_TOP is active. Will be styled once confirmed working.
-  canvas.fillRect(0, 0, SCREEN_W, TANK_TOP, 0xFF6600UL);
-  canvas.setTextColor(0xFFFFFFUL);
-  canvas.setTextSize(2);
-  canvas.setCursor(6, (TANK_TOP - 16) / 2);
-  canvas.print("v" FIRMWARE_VERSION);
+  // Dark charcoal outside-the-tank area
+  canvas.fillRect(0, 0, SCREEN_W, TANK_TOP, 0x1A1A1AUL);
 
   // Flat uniform water — single colour, no spatial variation (no streaks/rays).
   // The colour pulses very gently over time so the water still feels alive.
