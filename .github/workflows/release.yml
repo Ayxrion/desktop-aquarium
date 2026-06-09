@@ -37,7 +37,7 @@ jobs:
         run: |
           TAG="${{ github.ref_name }}"
           VER="${TAG#v}"
-          sed -i "s/#define FIRMWARE_VERSION \"[^\"]*\"/#define FIRMWARE_VERSION \"${VER}\"/" \
+          sed -i "s/#define FIRMWARE_VERSION.*/#define FIRMWARE_VERSION \"${VER}\"/" \
             aquarium/version.h
 
       # WiFi credentials are stored as GitHub Actions secrets:

@@ -720,26 +720,43 @@ void drawSnail() {
 }
 
 void drawBackground() {
-  // Draw water as animated horizontal bands: vertical gradient + two counter-
-  // traveling sine waves give a "light shimmering through moving water" effect.
-  for (int y = 0; y < SCREEN_H; y += 4) {
-    float depth = (float)y * (1.0f / SCREEN_H);  // 0 = surface, 1 = deep
+  // Depth gradient: bright cyan-teal at surface → midnight blue at bottom.
+  // Two counter-traveling sine waves ripple through the colour bands.
+  for (int y = 0; y < SCREEN_H; y += 3) {
+    float depth = (float)y * (1.0f / SCREEN_H);
 
-    // Surface is bright cyan-blue; deeper rows become darker
-    int g = (int)(82.0f - depth * 60.0f);    // green  82 → 22
-    int b = (int)(175.0f - depth * 112.0f);  // blue  175 → 63
+    int g = (int)(105.0f - depth * 88.0f);   // 105 → 17
+    int b = (int)(210.0f - depth * 148.0f);  // 210 → 62
 
-    // Two counter-traveling wave crests create a shimmering caustic pattern
-    float w = sinf((float)y * 0.038f + tick * 0.07f) * 9.0f
-            + sinf((float)y * 0.013f - tick * 0.027f) * 5.0f;
+    float w = sinf((float)y * 0.040f + tick * 0.10f) * 14.0f
+            + sinf((float)y * 0.016f - tick * 0.034f) * 8.0f;
 
     g = constrain(g + (int)(w * 0.4f), 0, 255);
     b = constrain(b + (int)w,          0, 255);
 
-    canvas.fillRect(0, y, SCREEN_W, 4, ((uint32_t)g << 8) | (uint32_t)b);
+    canvas.fillRect(0, y, SCREEN_W, 3, ((uint32_t)g << 8) | (uint32_t)b);
   }
 
-  // Sand floor overwrites the gradient in the bottom zone
+  // Animated god rays — 4 bright columns that drift slowly like sunlight
+  // filtering down through the water surface.
+  for (int ray = 0; ray < 4; ray++) {
+    float cx = SCREEN_W * 0.5f
+             + sinf(tick * 0.005f + ray * 1.571f) * SCREEN_W * 0.40f;
+    int rw = 26 + (int)(sinf(tick * 0.009f + ray * 1.1f) * 12.0f);
+    int x0 = constrain((int)cx - rw / 2, 0, SCREEN_W - 1);
+    int wc = constrain(rw, 2, SCREEN_W - x0);
+
+    for (int y = 0; y < SCREEN_H - 24; y += 3) {
+      float depth = (float)y * (1.0f / SCREEN_H);
+      float fade  = (1.0f - depth) * (1.0f - depth);  // dims quickly with depth
+      int   boost = (int)(38.0f * fade);
+      int   rg    = constrain((int)(105.0f - depth * 88.0f)  + boost / 2, 0, 255);
+      int   rb    = constrain((int)(210.0f - depth * 148.0f) + boost,     0, 255);
+      canvas.fillRect(x0, y, wc, 3, ((uint32_t)rg << 8) | (uint32_t)rb);
+    }
+  }
+
+  // Sand floor overwrites the gradient at the bottom
   for (int x = 0; x < SCREEN_W; x++) {
     canvas.drawFastVLine(x, terrainY[x], SCREEN_H - terrainY[x], COL_SAND);
   }
