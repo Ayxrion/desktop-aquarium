@@ -50,6 +50,13 @@ jobs:
             "${{ secrets.WIFI_SSID }}" "${{ secrets.WIFI_PASSWORD }}" \
             > aquarium/wifi_config.h
 
+      # PlatformIO doesn't reliably process .ino files — rename to .cpp
+      # and prepend Arduino.h so it compiles as plain C++.
+      - name: Prepare sketch for PlatformIO
+        run: |
+          (echo '#include <Arduino.h>'; cat aquarium/aquarium.ino) > aquarium/aquarium.cpp
+          rm aquarium/aquarium.ino
+
       - name: Build firmware
         run: pio run --environment crowpanel_7inch
 
