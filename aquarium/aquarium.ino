@@ -720,7 +720,26 @@ void drawSnail() {
 }
 
 void drawBackground() {
-  canvas.fillScreen(COL_BG);
+  // Draw water as animated horizontal bands: vertical gradient + two counter-
+  // traveling sine waves give a "light shimmering through moving water" effect.
+  for (int y = 0; y < SCREEN_H; y += 4) {
+    float depth = (float)y * (1.0f / SCREEN_H);  // 0 = surface, 1 = deep
+
+    // Surface is bright cyan-blue; deeper rows become darker
+    int g = (int)(82.0f - depth * 60.0f);    // green  82 → 22
+    int b = (int)(175.0f - depth * 112.0f);  // blue  175 → 63
+
+    // Two counter-traveling wave crests create a shimmering caustic pattern
+    float w = sinf((float)y * 0.038f + tick * 0.07f) * 9.0f
+            + sinf((float)y * 0.013f - tick * 0.027f) * 5.0f;
+
+    g = constrain(g + (int)(w * 0.4f), 0, 255);
+    b = constrain(b + (int)w,          0, 255);
+
+    canvas.fillRect(0, y, SCREEN_W, 4, ((uint32_t)g << 8) | (uint32_t)b);
+  }
+
+  // Sand floor overwrites the gradient in the bottom zone
   for (int x = 0; x < SCREEN_W; x++) {
     canvas.drawFastVLine(x, terrainY[x], SCREEN_H - terrainY[x], COL_SAND);
   }
