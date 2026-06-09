@@ -724,14 +724,13 @@ void drawBackground() {
   // Dark exterior above the tank
   canvas.fillRect(0, 0, SCREEN_W, TANK_TOP, 0x080808UL);
 
-  // Water — vertical shimmer stripes, no top-to-bottom colour variation
-  for (int x = 0; x < SCREEN_W; x += 3) {
-    float w = sinf((float)x * 0.025f + tick * 0.07f) * 14.0f
-            + sinf((float)x * 0.010f - tick * 0.028f) * 8.0f;
-    int g = constrain(0x30 + (int)(w * 0.4f), 0, 255);
-    int b = constrain(0x60 + (int)w,          0, 255);
-    canvas.fillRect(x, TANK_TOP, 3, SCREEN_H - TANK_TOP, ((uint32_t)g << 8) | (uint32_t)b);
-  }
+  // Flat uniform water — single colour, no spatial variation (no streaks/rays).
+  // The colour pulses very gently over time so the water still feels alive.
+  float w = sinf(tick * 0.050f) * 9.0f + sinf(tick * 0.022f) * 5.0f;
+  int g = constrain(0x30 + (int)(w * 0.35f), 0, 255);
+  int b = constrain(0x60 + (int)w,            0, 255);
+  canvas.fillRect(0, TANK_TOP, SCREEN_W, SCREEN_H - TANK_TOP,
+                  ((uint32_t)g << 8) | (uint32_t)b);
 
   // Sand floor
   for (int x = 0; x < SCREEN_W; x++) {
