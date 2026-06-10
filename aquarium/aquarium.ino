@@ -606,7 +606,6 @@ void setup() {
 
   otaInit(&display);
   checkForOTAUpdate();
-  weatherInit(&display);  // enable on-screen status messages during weather fetch
   initWeather();          // fetch current conditions from OpenWeatherMap
 
   for (int x = 0; x < SCREEN_W; x++) {
