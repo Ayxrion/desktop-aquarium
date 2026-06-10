@@ -1182,8 +1182,8 @@ void drawFish() {
       // Three-line angelfish:  ,  /  <><  /  `
       canvas.setCursor(sx - hw + 6 * ts, sy - 12 * ts);  // top fin ','
       canvas.print(",");
-      canvas.setCursor(sx - hw,          sy - 4  * ts);  // body '<><'
-      canvas.print("<><");
+      canvas.setCursor(sx - hw,          sy - 4  * ts);  // body — flips with direction
+      canvas.print(f.facingRight ? "><>" : "<><");
       canvas.setCursor(sx - hw + 6 * ts, sy + 4  * ts);  // bottom fin '`'
       canvas.print("`");
     } else {
