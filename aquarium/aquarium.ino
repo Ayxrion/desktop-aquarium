@@ -142,8 +142,10 @@ float    tick        = 0;
 #define COL_BG      0x003060UL
 #define COL_SAND    0xC8A050UL
 #define COL_BUBBLE  0x55CCFFUL
-#define COL_WEED      0x00AA44UL
-#define COL_WEED_LEAF 0x33DD66UL
+#define COL_WEED        0x00AA44UL
+#define COL_WEED_LEAF   0x33DD66UL
+#define COL_BG_PLANT    0x0D3318UL   // deep background stem
+#define COL_BG_LEAF     0x163D20UL   // deep background leaf
 
 // Pair fish — 8 colour slots (wraps for extra fish)
 const uint32_t PAIR_COLS[8] = {
@@ -188,6 +190,16 @@ struct Bubble {
   uint8_t r;
 };
 Bubble bubbles[NUM_BUBBLES];
+
+// ─── Background plants ────────────────────────────────────────────────────────
+#define NUM_BG_PLANTS   12
+#define BG_PLANT_SEG_H  15
+
+struct BgPlant {
+  uint16_t baseX;
+  uint8_t  segs;
+};
+BgPlant bgPlants[NUM_BG_PLANTS];
 
 // ─── Seaweed ─────────────────────────────────────────────────────────────────
 #define NUM_WEEDS     8
@@ -660,6 +672,11 @@ void setup() {
 
   for (int i = 0; i < NUM_BUBBLES; i++) resetBubble(i, true);
 
+  for (int i = 0; i < NUM_BG_PLANTS; i++) {
+    bgPlants[i].baseX = (uint16_t)(15 + i * (SCREEN_W / NUM_BG_PLANTS) + random(0, 25));
+    bgPlants[i].segs  = (uint8_t)(5 + random(0, 7));
+  }
+
   for (int i = 0; i < NUM_WEEDS; i++) {
     weeds[i].baseX       = (uint16_t)(40 + i * (SCREEN_W / (NUM_WEEDS + 1)));
     weeds[i].segs        = (uint8_t)(8 + random(0, 7));
@@ -1109,6 +1126,35 @@ static void drawLeaf(int cx, int cy, int side, int rx, int ry) {
   canvas.drawLine(cx, cy, lx, cy, COL_WEED);
 }
 
+void drawBgPlants() {
+  for (int i = 0; i < NUM_BG_PLANTS; i++) {
+    BgPlant& p = bgPlants[i];
+
+    int sx[14], sy[14];
+    sx[0] = p.baseX;
+    sy[0] = SCREEN_H - 20;
+    for (int s = 1; s <= p.segs; s++) {
+      // Slower, smaller sway — plants are far away
+      float sway = sinf(tick * 0.035f + i * 1.60f + s * 0.42f) * s * 1.1f;
+      sx[s] = p.baseX + (int)sway;
+      sy[s] = SCREEN_H - 20 - s * BG_PLANT_SEG_H;
+    }
+
+    // Single-pixel stems (thinner than foreground)
+    for (int s = 0; s < p.segs; s++)
+      canvas.drawLine(sx[s], sy[s], sx[s+1], sy[s+1], COL_BG_PLANT);
+
+    // Small alternating leaves
+    for (int s = 1; s < p.segs; s++) {
+      int lx   = (sx[s-1] + sx[s]) / 2;
+      int ly   = (sy[s-1] + sy[s]) / 2 - 2;
+      int side = (s % 2 == 0) ? 1 : -1;
+      int rx   = 4 + (s % 2);
+      canvas.fillEllipse(lx + side * rx, ly, rx, 2, COL_BG_LEAF);
+    }
+  }
+}
+
 void drawSeaweed() {
   for (int i = 0; i < NUM_WEEDS; i++) {
     Seaweed& w = weeds[i];
@@ -1452,6 +1498,7 @@ void loop() {
 
   drawBackground();
   drawWeatherSky();   // overwrites the top TANK_TOP px with sky + weather effects
+  drawBgPlants();     // behind everything — dark far-away silhouettes
   drawFishShadows();
   drawSnail();
   drawStarfish();
