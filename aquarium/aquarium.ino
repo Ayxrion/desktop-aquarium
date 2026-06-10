@@ -490,33 +490,30 @@ void updateWeatherEffects() {
 // The cloud is divided into a grid of CELL×CELL blocks with 1-px gaps,
 // giving a chunky 8-bit appearance. Three overlapping ellipses define the
 // puffy top; the bottom half is always solid.
+// Draws a smooth organic cloud using overlapping filled circles/ellipses.
+// cx/cy = centre-x / base-y of the cloud, cw = total width, ch = total height.
 static void drawCloud(float cx, float cy, float cw, float ch, uint32_t col) {
-  const int CELL = 5;
-  int cols = max(6,  (int)(cw / CELL));
-  int rows = max(4,  (int)(ch / CELL));
-  int x0   = (int)cx - (cols * CELL) / 2;
-  int y0   = (int)cy - rows * CELL;
+  int icx = (int)cx;
+  int icy = (int)cy;
 
-  for (int r = 0; r < rows; r++) {
-    float ny = (r + 0.5f) / rows;          // 0 = top, 1 = bottom
-    for (int c = 0; c < cols; c++) {
-      float nx = (c + 0.5f) / cols - 0.5f; // -0.5 = left, +0.5 = right
+  // Wide, squat body ellipse — gives the flat bottom
+  canvas.fillEllipse(icx, icy - (int)(ch * 0.28f),
+                     (int)(cw * 0.50f), (int)(ch * 0.32f), col);
 
-      bool filled = (ny > 0.5f);            // bottom half always solid
-      if (!filled) {
-        // Three ellipses: one centred, two flanking — create the puffy top
-        float d0 = (nx * nx)              / 0.090f + ((ny - 0.20f) * (ny - 0.20f)) / 0.040f;
-        float d1 = ((nx + 0.26f) * (nx + 0.26f)) / 0.065f + ((ny - 0.32f) * (ny - 0.32f)) / 0.036f;
-        float d2 = ((nx - 0.26f) * (nx - 0.26f)) / 0.065f + ((ny - 0.32f) * (ny - 0.32f)) / 0.036f;
-        filled = (d0 < 1.0f || d1 < 1.0f || d2 < 1.0f);
-      }
+  // Left shoulder puff
+  canvas.fillCircle(icx - (int)(cw * 0.20f),
+                    icy - (int)(ch * 0.52f),
+                    (int)(ch * 0.30f), col);
 
-      if (filled) {
-        // CELL-1 leaves a 1-px gap between blocks for the pixelated look
-        canvas.fillRect(x0 + c * CELL, y0 + r * CELL, CELL - 1, CELL - 1, col);
-      }
-    }
-  }
+  // Centre dome — the tallest bump (matches the .-~~~-. peak in the sketch)
+  canvas.fillCircle(icx + (int)(cw * 0.04f),
+                    icy - (int)(ch * 0.65f),
+                    (int)(ch * 0.40f), col);
+
+  // Right trailing puff — smaller, sits lower for the asymmetric tail
+  canvas.fillCircle(icx + (int)(cw * 0.30f),
+                    icy - (int)(ch * 0.40f),
+                    (int)(ch * 0.22f), col);
 }
 
 void drawWeatherSky() {
