@@ -1182,13 +1182,13 @@ void drawFish() {
       // Fins drawn at size 1 (half body size at close range), body at normal ts
       canvas.setTextSize(1);
       canvas.setCursor(sx - 3, sy - 4 * ts - 8);         // top fin — small, centred
-      canvas.print(f.facingRight ? "/" : "\\");
+      canvas.print(f.facingRight ? "\\" : "/");
       canvas.setTextSize(ts);
       canvas.setCursor(sx - hw, sy - 4 * ts);             // body — flips with direction
       canvas.print(f.facingRight ? "><>" : "<><");
       canvas.setTextSize(1);
       canvas.setCursor(sx - 3, sy + 4 * ts);              // bottom fin — small, centred
-      canvas.print(f.facingRight ? "\\" : "/");
+      canvas.print(f.facingRight ? "/" : "\\");
     } else {
       canvas.setCursor(sx - hw, sy - 4 * ts);
       canvas.print(f.facingRight ? "><>" : "<><");
