@@ -490,30 +490,21 @@ void updateWeatherEffects() {
 // The cloud is divided into a grid of CELL×CELL blocks with 1-px gaps,
 // giving a chunky 8-bit appearance. Three overlapping ellipses define the
 // puffy top; the bottom half is always solid.
-// Draws a smooth organic cloud using overlapping filled circles/ellipses.
+// Draws a smooth organic cloud: one rounded dome on the upper-left rising above
+// a wide, gently-curved body that trails off to the right — classic cumulus shape.
 // cx/cy = centre-x / base-y of the cloud, cw = total width, ch = total height.
 static void drawCloud(float cx, float cy, float cw, float ch, uint32_t col) {
-  int icx = (int)cx;
-  int icy = (int)cy;
+  // Wide, shallow body ellipse — the long curved underside
+  canvas.fillEllipse((int)cx,
+                     (int)(cy - ch * 0.28f),
+                     (int)(cw * 0.50f),
+                     (int)(ch * 0.32f), col);
 
-  // Wide, squat body ellipse — gives the flat bottom
-  canvas.fillEllipse(icx, icy - (int)(ch * 0.28f),
-                     (int)(cw * 0.50f), (int)(ch * 0.32f), col);
-
-  // Left shoulder puff
-  canvas.fillCircle(icx - (int)(cw * 0.20f),
-                    icy - (int)(ch * 0.52f),
-                    (int)(ch * 0.30f), col);
-
-  // Centre dome — the tallest bump (matches the .-~~~-. peak in the sketch)
-  canvas.fillCircle(icx + (int)(cw * 0.04f),
-                    icy - (int)(ch * 0.65f),
-                    (int)(ch * 0.40f), col);
-
-  // Right trailing puff — smaller, sits lower for the asymmetric tail
-  canvas.fillCircle(icx + (int)(cw * 0.30f),
-                    icy - (int)(ch * 0.40f),
-                    (int)(ch * 0.22f), col);
+  // Single prominent dome, slightly left of centre
+  canvas.fillEllipse((int)(cx - cw * 0.08f),
+                     (int)(cy - ch * 0.62f),
+                     (int)(cw * 0.26f),
+                     (int)(ch * 0.42f), col);
 }
 
 void drawWeatherSky() {
