@@ -1,6 +1,7 @@
 #pragma once
 // Fetches current weather from OpenWeatherMap and exposes a WeatherCondition enum.
-// Call initWeather() from setup() after OTA, updateWeather() each loop() iteration.
+// Call weatherInit(&display) then initWeather() from setup() after OTA.
+// Call updateWeather() each loop() iteration.
 // Requires WEATHER_API_KEY, WEATHER_LAT, WEATHER_LON in wifi_config.h.
 
 #include <WiFi.h>
@@ -27,23 +28,46 @@ static bool             _lastFetchOk        = false;
 static const uint32_t _WEATHER_INTERVAL       = 5UL * 60UL * 1000UL;  // 5 min on success
 static const uint32_t _WEATHER_RETRY_INTERVAL = 60UL * 1000UL;         // 1 min on failure
 
+// Set by weatherInit() — keeps this header free of direct display references.
+static lgfx::LGFX_Device* _weatherDisp = nullptr;
+
+static void weatherInit(lgfx::LGFX_Device* d) { _weatherDisp = d; }
+
+static void _weatherStatus(const char* msg, uint32_t col = 0xCCCCCCUL) {
+  if (!_weatherDisp) return;
+  int w = _weatherDisp->width();
+  int h = _weatherDisp->height();
+  _weatherDisp->fillRect(0, h - 42, w, 42, 0x000000UL);
+  _weatherDisp->setTextColor(col);
+  _weatherDisp->setTextSize(2);
+  _weatherDisp->setCursor(10, h - 30);
+  _weatherDisp->print(msg);
+}
+
 // Returns true on success and updates outCondition.
 static bool _fetchWeather(WeatherCondition& outCondition) {
+  char buf[96];
+
   // Brief pause so WiFi hardware fully powers up after any prior mode change.
   delay(500);
 
+  _weatherStatus("Weather: connecting to WiFi...");
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED) {
     if (millis() - t0 > 15000UL) {
+      _weatherStatus("Weather: WiFi timeout", 0xFF4444UL);
+      delay(2000);
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
       return false;
     }
     delay(200);
   }
+
+  _weatherStatus("Weather: fetching conditions...");
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -59,13 +83,19 @@ static bool _fetchWeather(WeatherCondition& outCondition) {
   HTTPClient http;
   if (http.begin(client, url)) {
     int code = http.GET();
+
+    snprintf(buf, sizeof(buf), "Weather: HTTP %d", code);
+    _weatherStatus(buf);
+    delay(800);
+
     if (code == HTTP_CODE_OK) {
       // Read the full body before parsing — stream closes if we delay first.
       String body = http.getString();
       StaticJsonDocument<64> filter;
       filter["weather"][0]["id"] = true;
       DynamicJsonDocument doc(512);
-      if (!deserializeJson(doc, body, DeserializationOption::Filter(filter))) {
+      DeserializationError err = deserializeJson(doc, body, DeserializationOption::Filter(filter));
+      if (!err) {
         int id = doc["weather"][0]["id"] | -1;
         if (id >= 0) {
           if      (id == 800)              outCondition = WEATHER_SUNNY;
@@ -77,11 +107,35 @@ static bool _fetchWeather(WeatherCondition& outCondition) {
           else if (id >= 300 && id <= 321) outCondition = WEATHER_RAINY;
           else if (id >= 700 && id <= 781) outCondition = WEATHER_FOGGY;
           else                             outCondition = WEATHER_CLOUDY;
+
+          static const char* names[] = {
+            "SUNNY","PARTLY CLOUDY","CLOUDY","RAINY","STORMY","SNOWY","FOGGY"
+          };
+          snprintf(buf, sizeof(buf), "Weather: %s (id %d)", names[(int)outCondition], id);
+          _weatherStatus(buf, 0x44FF44UL);
+          delay(2000);
           success = true;
+        } else {
+          _weatherStatus("Weather: bad JSON (no id)", 0xFF4444UL);
+          delay(2000);
         }
+      } else {
+        snprintf(buf, sizeof(buf), "Weather: JSON err %d", (int)err.code());
+        _weatherStatus(buf, 0xFF4444UL);
+        delay(2000);
       }
+    } else if (code == 401) {
+      _weatherStatus("Weather: bad API key (401)", 0xFF4444UL);
+      delay(2000);
+    } else {
+      snprintf(buf, sizeof(buf), "Weather: API error %d", code);
+      _weatherStatus(buf, 0xFF4444UL);
+      delay(2000);
     }
     http.end();
+  } else {
+    _weatherStatus("Weather: HTTP init failed", 0xFF4444UL);
+    delay(2000);
   }
 
   WiFi.disconnect(true);
