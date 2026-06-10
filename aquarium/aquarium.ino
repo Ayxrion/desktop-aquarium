@@ -198,6 +198,7 @@ Bubble bubbles[NUM_BUBBLES];
 struct BgPlant {
   uint16_t baseX;
   uint8_t  segs;
+  uint8_t  type;   // 0 = leaf-stem, 1 = feathery hornwort
 };
 BgPlant bgPlants[NUM_BG_PLANTS];
 
@@ -675,6 +676,7 @@ void setup() {
   for (int i = 0; i < NUM_BG_PLANTS; i++) {
     bgPlants[i].baseX = (uint16_t)(15 + i * (SCREEN_W / NUM_BG_PLANTS) + random(0, 25));
     bgPlants[i].segs  = (uint8_t)(5 + random(0, 7));
+    bgPlants[i].type  = (uint8_t)(i % 2);  // alternate types across the tank
   }
 
   for (int i = 0; i < NUM_WEEDS; i++) {
@@ -1130,27 +1132,53 @@ void drawBgPlants() {
   for (int i = 0; i < NUM_BG_PLANTS; i++) {
     BgPlant& p = bgPlants[i];
 
-    int sx[14], sy[14];
-    sx[0] = p.baseX;
-    sy[0] = SCREEN_H - 20;
-    for (int s = 1; s <= p.segs; s++) {
-      // Slower, smaller sway — plants are far away
-      float sway = sinf(tick * 0.035f + i * 1.60f + s * 0.42f) * s * 1.1f;
-      sx[s] = p.baseX + (int)sway;
-      sy[s] = SCREEN_H - 20 - s * BG_PLANT_SEG_H;
-    }
+    if (p.type == 0) {
+      // ── Type 0: swaying stem with alternating leaf ellipses ────────────────
+      int sx[14], sy[14];
+      sx[0] = p.baseX;
+      sy[0] = SCREEN_H - 20;
+      for (int s = 1; s <= p.segs; s++) {
+        float sway = sinf(tick * 0.035f + i * 1.60f + s * 0.42f) * s * 1.1f;
+        sx[s] = p.baseX + (int)sway;
+        sy[s] = SCREEN_H - 20 - s * BG_PLANT_SEG_H;
+      }
+      for (int s = 0; s < p.segs; s++)
+        canvas.drawLine(sx[s], sy[s], sx[s+1], sy[s+1], COL_BG_PLANT);
+      for (int s = 1; s < p.segs; s++) {
+        int lx   = (sx[s-1] + sx[s]) / 2;
+        int ly   = (sy[s-1] + sy[s]) / 2 - 2;
+        int side = (s % 2 == 0) ? 1 : -1;
+        int rx   = 4 + (s % 2);
+        canvas.fillEllipse(lx + side * rx, ly, rx, 2, COL_BG_LEAF);
+      }
 
-    // Single-pixel stems (thinner than foreground)
-    for (int s = 0; s < p.segs; s++)
-      canvas.drawLine(sx[s], sy[s], sx[s+1], sy[s+1], COL_BG_PLANT);
+    } else {
+      // ── Type 1: feathery hornwort — central stem, tapering needle pairs ────
+      int baseY = SCREEN_H - 20;
+      int topY  = baseY - p.segs * BG_PLANT_SEG_H;
+      // Whole plant sways gently at the tip
+      float tipSway = sinf(tick * 0.028f + i * 1.85f) * 3.0f;
 
-    // Small alternating leaves
-    for (int s = 1; s < p.segs; s++) {
-      int lx   = (sx[s-1] + sx[s]) / 2;
-      int ly   = (sy[s-1] + sy[s]) / 2 - 2;
-      int side = (s % 2 == 0) ? 1 : -1;
-      int rx   = 4 + (s % 2);
-      canvas.fillEllipse(lx + side * rx, ly, rx, 2, COL_BG_LEAF);
+      for (int s = 0; s <= p.segs; s++) {
+        float t  = (float)s / p.segs;            // 0 = base, 1 = tip
+        int   cx = p.baseX + (int)(tipSway * t);
+        int   cy = baseY - s * BG_PLANT_SEG_H;
+
+        // Stem pixel
+        if (s < p.segs) {
+          float tn = (float)(s + 1) / p.segs;
+          int   nx = p.baseX + (int)(tipSway * tn);
+          int   ny = cy - BG_PLANT_SEG_H;
+          canvas.drawLine(cx, cy, nx, ny, COL_BG_PLANT);
+        }
+
+        // Needle pairs — longer at base, shorter at tip
+        int needleLen = (int)((1.0f - t * 0.65f) * 9.0f);
+        if (needleLen > 1) {
+          canvas.drawLine(cx, cy, cx - needleLen, cy - 1, COL_BG_LEAF);
+          canvas.drawLine(cx, cy, cx + needleLen, cy - 1, COL_BG_LEAF);
+        }
+      }
     }
   }
 }
