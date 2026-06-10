@@ -1024,25 +1024,32 @@ void drawSnail() {
 
 void drawStarfish() {
   const uint32_t ORANGE = 0xFF6600UL;
-  const uint32_t LIGHT  = 0xFF9933UL;
 
   int bx = (int)starfish.x;
-  int by = terrainY[constrain(bx, 0, SCREEN_W - 1)] - 9;
+  int by = terrainY[constrain(bx, 0, SCREEN_W - 1)] - 10;
 
-  // Gentle rocking oscillation — rotates the whole star slightly over time
+  // Gentle rocking oscillation
   float rot = sinf(tick * 0.018f) * 0.18f;
 
-  const int ARM = 8;
-  for (int i = 0; i < 5; i++) {
-    float a  = rot - 1.5708f + i * 1.2566f;   // -π/2 + i×72° + rock offset
-    int   ex = bx + (int)(ARM * cosf(a));
-    int   ey = by + (int)(ARM * sinf(a));
-    // 2-px thick arm lines
-    canvas.drawLine(bx,     by, ex,     ey, ORANGE);
-    canvas.drawLine(bx + 1, by, ex + 1, ey, ORANGE);
-    canvas.fillCircle(ex, ey, 2, ORANGE);      // rounded arm tip
+  // 10 alternating outer (tip) / inner (indent) points — classic ★ geometry
+  const float R = 9.0f;   // outer radius
+  const float r = 4.0f;   // inner radius (~0.38× outer for a regular star)
+  float px[10], py[10];
+  for (int i = 0; i < 10; i++) {
+    float a   = rot - 1.5708f + i * 0.6283f;  // -π/2 + i×36°
+    float rad = (i % 2 == 0) ? R : r;
+    px[i] = bx + rad * cosf(a);
+    py[i] = by + rad * sinf(a);
   }
-  canvas.fillCircle(bx, by, 3, LIGHT);         // lighter centre disc
+
+  // Fill with 10 triangles fanned from the centre — solid, no gaps
+  for (int i = 0; i < 10; i++) {
+    int j = (i + 1) % 10;
+    canvas.fillTriangle(bx, by,
+                        (int)px[i], (int)py[i],
+                        (int)px[j], (int)py[j],
+                        ORANGE);
+  }
 }
 
 void drawBackground() {
