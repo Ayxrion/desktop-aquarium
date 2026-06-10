@@ -420,7 +420,7 @@ void initWeatherEffects() {
     clouds[i].x   = frandr(80, SCREEN_W - 80);
     clouds[i].y   = frandr(15, WEATHER_SKY_H - 25);
     clouds[i].w   = frandr(90, 160);
-    clouds[i].h   = frandr(14, 26);
+    clouds[i].h   = frandr(20, 30);   // min 20 ensures at least 4 pixel rows
     clouds[i].spd = frandr(0.06f, 0.22f) * (random(0, 2) ? 1.0f : -1.0f);
   }
   for (int i = 0; i < MAX_RAINDROPS; i++) {
@@ -483,17 +483,36 @@ void updateWeatherEffects() {
   }
 }
 
-// Draws a puffy cloud centred at (cx, cy) with given width/height.
+// Draws a pixelated cloud centred at (cx, cy).
+// The cloud is divided into a grid of CELL×CELL blocks with 1-px gaps,
+// giving a chunky 8-bit appearance. Three overlapping ellipses define the
+// puffy top; the bottom half is always solid.
 static void drawCloud(float cx, float cy, float cw, float ch, uint32_t col) {
-  int x = (int)cx, y = (int)cy, w = (int)cw, h = (int)ch;
-  int hw = w / 2;
-  canvas.fillRect(x - hw, y - h / 4, w, h / 2, col);
-  canvas.fillCircle(x,          y - h / 4, h / 2,     col);
-  canvas.fillCircle(x - hw / 2, y - h / 8, h * 2 / 5, col);
-  canvas.fillCircle(x + hw / 2, y - h / 8, h * 2 / 5, col);
-  if (w > 120) {
-    canvas.fillCircle(x - hw + h / 3, y,     h / 4, col);
-    canvas.fillCircle(x + hw - h / 3, y,     h / 4, col);
+  const int CELL = 5;
+  int cols = max(6,  (int)(cw / CELL));
+  int rows = max(4,  (int)(ch / CELL));
+  int x0   = (int)cx - (cols * CELL) / 2;
+  int y0   = (int)cy - rows * CELL;
+
+  for (int r = 0; r < rows; r++) {
+    float ny = (r + 0.5f) / rows;          // 0 = top, 1 = bottom
+    for (int c = 0; c < cols; c++) {
+      float nx = (c + 0.5f) / cols - 0.5f; // -0.5 = left, +0.5 = right
+
+      bool filled = (ny > 0.5f);            // bottom half always solid
+      if (!filled) {
+        // Three ellipses: one centred, two flanking — create the puffy top
+        float d0 = (nx * nx)              / 0.090f + ((ny - 0.20f) * (ny - 0.20f)) / 0.040f;
+        float d1 = ((nx + 0.26f) * (nx + 0.26f)) / 0.065f + ((ny - 0.32f) * (ny - 0.32f)) / 0.036f;
+        float d2 = ((nx - 0.26f) * (nx - 0.26f)) / 0.065f + ((ny - 0.32f) * (ny - 0.32f)) / 0.036f;
+        filled = (d0 < 1.0f || d1 < 1.0f || d2 < 1.0f);
+      }
+
+      if (filled) {
+        // CELL-1 leaves a 1-px gap between blocks for the pixelated look
+        canvas.fillRect(x0 + c * CELL, y0 + r * CELL, CELL - 1, CELL - 1, col);
+      }
+    }
   }
 }
 
