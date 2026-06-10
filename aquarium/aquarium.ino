@@ -1179,13 +1179,16 @@ void drawFish() {
       canvas.setCursor(sx - hw, sy - 4 * ts);
       canvas.print(f.facingRight ? "><(o>" : "<o(><");
     } else if (f.type == FISH_ANGEL) {
-      // Three-line angelfish:  ,  /  <><  /  `
-      canvas.setCursor(sx - hw + 6 * ts, sy - 12 * ts);  // top fin ','
-      canvas.print(",");
-      canvas.setCursor(sx - hw,          sy - 4  * ts);  // body — flips with direction
+      // Fins drawn at size 1 (half body size at close range), body at normal ts
+      canvas.setTextSize(1);
+      canvas.setCursor(sx - 3, sy - 4 * ts - 8);         // top fin — small, centred
+      canvas.print(f.facingRight ? "/" : "\\");
+      canvas.setTextSize(ts);
+      canvas.setCursor(sx - hw, sy - 4 * ts);             // body — flips with direction
       canvas.print(f.facingRight ? "><>" : "<><");
-      canvas.setCursor(sx - hw + 6 * ts, sy + 4  * ts);  // bottom fin '`'
-      canvas.print("`");
+      canvas.setTextSize(1);
+      canvas.setCursor(sx - 3, sy + 4 * ts);              // bottom fin — small, centred
+      canvas.print(f.facingRight ? "\\" : "/");
     } else {
       canvas.setCursor(sx - hw, sy - 4 * ts);
       canvas.print(f.facingRight ? "><>" : "<><");
