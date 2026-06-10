@@ -211,6 +211,14 @@ struct Snail {
 };
 static Snail snail;
 
+// ─── Starfish ────────────────────────────────────────────────────────────────
+struct Starfish {
+  float x;
+  float spd;
+  bool  facingRight;
+};
+static Starfish starfish;
+
 // ─── Food flakes ─────────────────────────────────────────────────────────────
 #define MAX_FLAKES 10
 struct Flake {
@@ -695,6 +703,10 @@ void setup() {
   snail.spd         = frandr(0.12f, 0.25f);
   snail.facingRight = (random(0, 2) == 0);
 
+  starfish.x           = frandr(80, SCREEN_W - 80);
+  starfish.spd         = frandr(0.10f, 0.20f);
+  starfish.facingRight = (random(0, 2) == 0);
+
   lastFrameMs = millis();
 }
 
@@ -738,6 +750,13 @@ void updateSnail() {
   snail.x += move;
   if (snail.x > SCREEN_W - 55) { snail.x = SCREEN_W - 55; snail.facingRight = false; }
   if (snail.x < 55)             { snail.x = 55;             snail.facingRight = true;  }
+}
+
+void updateStarfish() {
+  float move = starfish.facingRight ? starfish.spd : -starfish.spd;
+  starfish.x += move;
+  if (starfish.x > SCREEN_W - 40) { starfish.x = SCREEN_W - 40; starfish.facingRight = false; }
+  if (starfish.x < 40)             { starfish.x = 40;             starfish.facingRight = true;  }
 }
 
 void updateBubbles() {
@@ -1001,6 +1020,29 @@ void drawSnail() {
   canvas.fillCircle(bx + d * 14, by - 15, 2, BODY);
   canvas.fillCircle(bx + d * 6,  by - 15, 1, 0x111111UL);
   canvas.fillCircle(bx + d * 14, by - 15, 1, 0x111111UL);
+}
+
+void drawStarfish() {
+  const uint32_t ORANGE = 0xFF6600UL;
+  const uint32_t LIGHT  = 0xFF9933UL;
+
+  int bx = (int)starfish.x;
+  int by = terrainY[constrain(bx, 0, SCREEN_W - 1)] - 9;
+
+  // Gentle rocking oscillation — rotates the whole star slightly over time
+  float rot = sinf(tick * 0.018f) * 0.18f;
+
+  const int ARM = 8;
+  for (int i = 0; i < 5; i++) {
+    float a  = rot - 1.5708f + i * 1.2566f;   // -π/2 + i×72° + rock offset
+    int   ex = bx + (int)(ARM * cosf(a));
+    int   ey = by + (int)(ARM * sinf(a));
+    // 2-px thick arm lines
+    canvas.drawLine(bx,     by, ex,     ey, ORANGE);
+    canvas.drawLine(bx + 1, by, ex + 1, ey, ORANGE);
+    canvas.fillCircle(ex, ey, 2, ORANGE);      // rounded arm tip
+  }
+  canvas.fillCircle(bx, by, 3, LIGHT);         // lighter centre disc
 }
 
 void drawBackground() {
@@ -1396,6 +1438,7 @@ void loop() {
   updateWeatherEffects();
 
   updateSnail();
+  updateStarfish();
   updateBubbles();
   updateFlakes();
   updateFish();
@@ -1404,6 +1447,7 @@ void loop() {
   drawWeatherSky();   // overwrites the top TANK_TOP px with sky + weather effects
   drawFishShadows();
   drawSnail();
+  drawStarfish();
   drawSeaweed();
   drawBubbles();
   drawFlakes();
