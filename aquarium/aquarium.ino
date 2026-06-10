@@ -202,6 +202,15 @@ struct BgPlant {
 };
 BgPlant bgPlants[NUM_BG_PLANTS];
 
+// ─── Foreground hornwort ──────────────────────────────────────────────────────
+#define NUM_FG_HORNWORT  5
+
+struct FgHornwort {
+  uint16_t baseX;
+  uint8_t  segs;
+};
+FgHornwort fgHornworts[NUM_FG_HORNWORT];
+
 // ─── Seaweed ─────────────────────────────────────────────────────────────────
 #define NUM_WEEDS     8
 #define WEED_SEG_H   14
@@ -687,6 +696,12 @@ void setup() {
       weeds[i].branchAt[b]   = (uint8_t)(2 + random(0, weeds[i].segs - 3));
       weeds[i].branchSide[b] = (random(0, 2) == 0) ? 1 : -1;
     }
+  }
+
+  // Foreground hornwort — spread across tank, offset from seaweed positions
+  for (int i = 0; i < NUM_FG_HORNWORT; i++) {
+    fgHornworts[i].baseX = (uint16_t)(80 + i * (SCREEN_W / NUM_FG_HORNWORT) + random(0, 40));
+    fgHornworts[i].segs  = (uint8_t)(6 + random(0, 6));
   }
 
   // Pair fish — indices 0 and 1
@@ -1183,6 +1198,38 @@ void drawBgPlants() {
   }
 }
 
+void drawFgHornwort() {
+  for (int i = 0; i < NUM_FG_HORNWORT; i++) {
+    FgHornwort& h = fgHornworts[i];
+    int baseY = SCREEN_H - 20;
+
+    // More pronounced sway than background version
+    float tipSway = sinf(tick * 0.05f + i * 1.30f) * 5.0f;
+
+    for (int s = 0; s <= h.segs; s++) {
+      float t  = (float)s / h.segs;
+      int   cx = h.baseX + (int)(tipSway * t);
+      int   cy = baseY - s * WEED_SEG_H;
+
+      // 2-px stem, matching foreground seaweed thickness
+      if (s < h.segs) {
+        float tn = (float)(s + 1) / h.segs;
+        int   nx = h.baseX + (int)(tipSway * tn);
+        int   ny = cy - WEED_SEG_H;
+        canvas.drawLine(cx,     cy, nx,     ny, COL_WEED);
+        canvas.drawLine(cx + 1, cy, nx + 1, ny, COL_WEED);
+      }
+
+      // Needle pairs — longer and brighter than background version
+      int needleLen = (int)((1.0f - t * 0.60f) * 13.0f);
+      if (needleLen > 1) {
+        canvas.drawLine(cx, cy, cx - needleLen, cy - 2, COL_WEED_LEAF);
+        canvas.drawLine(cx, cy, cx + needleLen, cy - 2, COL_WEED_LEAF);
+      }
+    }
+  }
+}
+
 void drawSeaweed() {
   for (int i = 0; i < NUM_WEEDS; i++) {
     Seaweed& w = weeds[i];
@@ -1531,6 +1578,7 @@ void loop() {
   drawSnail();
   drawStarfish();
   drawSeaweed();
+  drawFgHornwort();
   drawBubbles();
   drawFlakes();
   drawFish();
