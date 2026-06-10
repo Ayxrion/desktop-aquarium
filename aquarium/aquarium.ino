@@ -168,6 +168,13 @@ const uint32_t SCHOOL2_COLS[20] = {
   0x99FF77UL, 0xDDBB99UL, 0xFF6600UL, 0xFFCC55UL,
 };
 
+// Angelfish — 12 colour slots (silver/white/gold tones with accent fins)
+const uint32_t ANGEL_COLS[12] = {
+  0xEEEEEEUL, 0xFFFFFFUL, 0xDDCCAAUL, 0xFFDD88UL,
+  0xFFCC44UL, 0xBBDDFFUL, 0x99CCFFUL, 0xFFBBABUL,
+  0xCCFFDDUL, 0xFFEECCUL, 0xAADDCCUL, 0xFFCCFFUL,
+};
+
 // Rainbow flake colours
 const uint32_t FLAKE_COLS[7] = {
   0xFF2020UL, 0xFF8800UL, 0xFFFF00UL, 0x00FF44UL,
@@ -215,7 +222,7 @@ struct Flake {
 Flake flakes[MAX_FLAKES];
 
 // ─── Fish ────────────────────────────────────────────────────────────────────
-enum FishType : uint8_t { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2 };
+enum FishType : uint8_t { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
 
 struct Fish {
   float    x, y, z;
@@ -236,11 +243,13 @@ struct Fish {
 #define MAX_PAIR    8
 #define MAX_SCHOOL  16
 #define MAX_SCHOOL2 20
-#define MAX_FISH    (MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2)
+#define MAX_ANGEL   12
+#define MAX_FISH    (MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + MAX_ANGEL)
 
 static int numPair    = 2;
 static int numSchool  = 5;
 static int numSchool2 = 7;
+static int numAngel   = 3;
 
 Fish fish[MAX_FISH];
 
@@ -253,7 +262,7 @@ Fish fish[MAX_FISH];
 #define MENU_X   510
 #define MENU_Y    48
 #define MENU_W   282
-#define MENU_H   290
+#define MENU_H   350
 
 // ─── Button / touch state ─────────────────────────────────────────────────────
 bool     lastBtnState  = HIGH;
@@ -297,9 +306,10 @@ float frand()                    { return random(0, 1000) * 0.001f; }
 float frandr(float lo, float hi) { return lo + frand() * (hi - lo); }
 
 inline bool isFishActive(int i) {
-  if (i < MAX_PAIR)              return i < numPair;
-  if (i < MAX_PAIR + MAX_SCHOOL) return (i - MAX_PAIR) < numSchool;
-  return (i - MAX_PAIR - MAX_SCHOOL) < numSchool2;
+  if (i < MAX_PAIR)                                      return i < numPair;
+  if (i < MAX_PAIR + MAX_SCHOOL)                         return (i - MAX_PAIR) < numSchool;
+  if (i < MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2)           return (i - MAX_PAIR - MAX_SCHOOL) < numSchool2;
+  return (i - MAX_PAIR - MAX_SCHOOL - MAX_SCHOOL2) < numAngel;
 }
 
 int projX(float x, float z) {
@@ -323,9 +333,10 @@ int fishHW(const Fish& f) {
 }
 
 uint32_t fishColor(int idx) {
-  if (idx < MAX_PAIR)                  return PAIR_COLS[idx % 8];
-  if (idx < MAX_PAIR + MAX_SCHOOL)     return SCHOOL_COLS[(idx - MAX_PAIR) % 16];
-  return SCHOOL2_COLS[(idx - MAX_PAIR - MAX_SCHOOL) % 20];
+  if (idx < MAX_PAIR)                                return PAIR_COLS[idx % 8];
+  if (idx < MAX_PAIR + MAX_SCHOOL)                   return SCHOOL_COLS[(idx - MAX_PAIR) % 16];
+  if (idx < MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2)     return SCHOOL2_COLS[(idx - MAX_PAIR - MAX_SCHOOL) % 20];
+  return ANGEL_COLS[(idx - MAX_PAIR - MAX_SCHOOL - MAX_SCHOOL2) % MAX_ANGEL];
 }
 
 float boundAccel(float val, float lo, float hi, float k = 0.30f) {
@@ -391,6 +402,11 @@ void addFish(FishType type) {
                   frandr(150, 650), frandr(100, 360), frandr(0.30f, 0.70f),
                   frandr(-2.0f, 2.0f), FISH_SCHOOL2, -1);
     numSchool2++;
+  } else if (type == FISH_ANGEL && numAngel < MAX_ANGEL) {
+    initFishEntry(MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + numAngel,
+                  frandr(200, 600), frandr(90, 320), frandr(0.25f, 0.65f),
+                  frandr(-3.0f, 3.0f), FISH_ANGEL, -1);
+    numAngel++;
   }
 }
 
@@ -403,6 +419,8 @@ void removeFish(FishType type) {
     numSchool--;
   } else if (type == FISH_SCHOOL2 && numSchool2 > 0) {
     numSchool2--;
+  } else if (type == FISH_ANGEL && numAngel > 0) {
+    numAngel--;
   }
 }
 
@@ -662,6 +680,13 @@ void setup() {
                   frandr(-2.0f, 2.0f), FISH_SCHOOL2, -1);
   }
 
+  // Angelfish — starts at index MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2
+  for (int i = 0; i < numAngel; i++) {
+    initFishEntry(MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + i,
+                  frandr(200, 600), frandr(90, 320), frandr(0.25f, 0.65f),
+                  frandr(-3.0f, 3.0f), FISH_ANGEL, -1);
+  }
+
   for (int i = 0; i < MAX_FLAKES; i++) flakes[i].active = false;
 
   initWeatherEffects();   // set up clouds / rain / snow based on fetched weather
@@ -773,6 +798,16 @@ void updateFish() {
     sc2x /= numSchool2; sc2y /= numSchool2; sc2z /= numSchool2;
   }
 
+  // Angelfish centroid
+  float sacx = 0, sacy = 0, sacz = 0;
+  if (numAngel > 0) {
+    int base = MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2;
+    for (int i = base; i < base + numAngel; i++) {
+      sacx += fish[i].x; sacy += fish[i].y; sacz += fish[i].z;
+    }
+    sacx /= numAngel; sacy /= numAngel; sacz /= numAngel;
+  }
+
   for (int i = 0; i < MAX_FISH; i++) {
     if (!isFishActive(i)) continue;
     Fish& f = fish[i];
@@ -811,6 +846,8 @@ void updateFish() {
         if (f.type == FISH_PAIR) {
           f.chasing  = !f.chasing;
           f.wanderCD = f.chasing ? frandr(30, 70) : frandr(40, 90);
+        } else if (f.type == FISH_ANGEL) {
+          f.wanderCD = frandr(8, 28);   // more frequent — snappier movement
         } else {
           f.wanderCD = frandr(15, 50);
         }
@@ -837,14 +874,21 @@ void updateFish() {
           f.tx = constrain(scx + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
           f.ty = constrain(scy + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
           f.tz = constrain(scz + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
-        } else {
+        } else if (f.type == FISH_SCHOOL2) {
           f.tx = constrain(sc2x + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
           f.ty = constrain(sc2y + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
           f.tz = constrain(sc2z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
+        } else {
+          // Angelfish — tighter spread, more vertical range
+          f.tx = constrain(sacx + frandr(-120, 120), 30.0f, (float)(SCREEN_W - 30));
+          f.ty = constrain(sacy + frandr(-110, 110), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+          f.tz = constrain(sacz + frandr(-0.18f, 0.18f), 0.05f, 0.72f);
         }
       }
 
-      float seekStr = (f.type == FISH_PAIR && f.chasing) ? 0.018f : 0.012f;
+      float seekStr = (f.type == FISH_PAIR && f.chasing) ? 0.018f
+                    : (f.type == FISH_ANGEL)             ? 0.020f
+                    :                                      0.012f;
       ax += (f.tx - f.x) * seekStr;
       ay += (f.ty - f.y) * seekStr;
       az += (f.tz - f.z) * 0.010f;
@@ -870,6 +914,22 @@ void updateFish() {
             ax += dx * inv; ay += dy * inv;
           }
         }
+      } else if (f.type == FISH_ANGEL) {
+        // Loose schooling — cohesion toward group centre, mild separation
+        ax += (sacx - f.x) * 0.012f;
+        ay += (sacy - f.y) * 0.010f;
+        az += (sacz - f.z) * 0.008f;
+
+        int base = MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2;
+        for (int j = base; j < base + numAngel; j++) {
+          if (j == i || !isFishActive(j)) continue;
+          float dx = f.x - fish[j].x, dy = f.y - fish[j].y;
+          float d2 = dx * dx + dy * dy;
+          if (d2 < 60.0f * 60.0f && d2 > 0.01f) {
+            float inv = 7.0f / d2;
+            ax += dx * inv; ay += dy * inv;
+          }
+        }
       }
     }
 
@@ -879,6 +939,7 @@ void updateFish() {
 
     float maxV  = f.goingForFood ? 8.0f
                 : (f.type == FISH_PAIR && f.chasing) ? 7.0f
+                : (f.type == FISH_ANGEL)             ? 7.0f
                 : 5.5f;
     float maxVz = 0.015f;
     f.vx = constrain(f.vx + ax, -maxV,       maxV);
@@ -1077,7 +1138,7 @@ void drawFishShadows() {
   for (int i = 0; i < MAX_FISH; i++) {
     if (!isFishActive(i)) continue;
     const Fish& f = fish[i];
-    if ((f.type == FISH_SCHOOL || f.type == FISH_SCHOOL2) && f.z > 0.78f) continue;
+    if ((f.type == FISH_SCHOOL || f.type == FISH_SCHOOL2 || f.type == FISH_ANGEL) && f.z > 0.78f) continue;
 
     int sx  = projX(f.x, f.z);
     int fy  = projY(f.y, f.z);
@@ -1103,7 +1164,7 @@ void drawFish() {
   for (int i = 0; i < MAX_FISH; i++) {
     if (!isFishActive(i)) continue;
     Fish& f = fish[i];
-    if ((f.type == FISH_SCHOOL || f.type == FISH_SCHOOL2) && f.z > 0.78f) continue;
+    if ((f.type == FISH_SCHOOL || f.type == FISH_SCHOOL2 || f.type == FISH_ANGEL) && f.z > 0.78f) continue;
 
     int      ts  = fishTS(f);
     int      sx  = projX(f.x, f.z);
@@ -1113,12 +1174,21 @@ void drawFish() {
 
     canvas.setTextSize(ts);
     canvas.setTextColor(col);
-    canvas.setCursor(sx - hw, sy - 4 * ts);
 
     if (f.type == FISH_PAIR) {
+      canvas.setCursor(sx - hw, sy - 4 * ts);
       canvas.print(f.facingRight ? "><(o>" : "<o(><");
+    } else if (f.type == FISH_ANGEL) {
+      // Three-line angelfish:  ,  /  <><  /  `
+      canvas.setCursor(sx - hw + 6 * ts, sy - 12 * ts);  // top fin ','
+      canvas.print(",");
+      canvas.setCursor(sx - hw,          sy - 4  * ts);  // body '<><'
+      canvas.print("<><");
+      canvas.setCursor(sx - hw + 6 * ts, sy + 4  * ts);  // bottom fin '`'
+      canvas.print("`");
     } else {
-      canvas.print(f.facingRight ? "><>"   : "<><");
+      canvas.setCursor(sx - hw, sy - 4 * ts);
+      canvas.print(f.facingRight ? "><>" : "<><");
     }
   }
 }
@@ -1152,11 +1222,11 @@ void drawMenu() {
 
   canvas.drawFastHLine(MENU_X + 8, MENU_Y + 32, MENU_W - 16, 0x2244AAUL);
 
-  const char* labels[3] = { "LARGE FISH", "SCHOOL FISH", "DEEP FISH" };
-  int counts[3]         = { numPair, numSchool, numSchool2 };
-  int maxes[3]          = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2 };
+  const char* labels[4] = { "LARGE FISH", "SCHOOL FISH", "DEEP FISH", "ANGELFISH" };
+  int counts[4]         = { numPair, numSchool, numSchool2, numAngel };
+  int maxes[4]          = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
 
-  for (int row = 0; row < 3; row++) {
+  for (int row = 0; row < 4; row++) {
     int ry = MENU_Y + 45 + row * 58;
 
     canvas.setTextSize(1);
@@ -1193,7 +1263,7 @@ void drawMenu() {
 
   // ── Weather override row ────────────────────────────────────────────────────
   {
-    int ry4 = MENU_Y + 45 + 3 * 58;  // 4th row, below the three fish rows
+    int ry4 = MENU_Y + 45 + 4 * 58;  // 5th row, below the four fish rows
 
     canvas.setTextSize(1);
     canvas.setTextColor(0xAADDFFUL);
@@ -1260,8 +1330,8 @@ void loop() {
       menuOpen = !menuOpen;
     } else if (menuOpen) {
       // Route to [-]/[+] buttons; block food drop while menu open
-      const FishType rowType[3] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2 };
-      for (int row = 0; row < 3; row++) {
+      const FishType rowType[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
+      for (int row = 0; row < 4; row++) {
         int ry = MENU_Y + 45 + row * 58;
         if (tx >= (uint16_t)(MENU_X + 148) && tx < (uint16_t)(MENU_X + 178) &&
             ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
@@ -1276,7 +1346,7 @@ void loop() {
       }
       // Weather override row [<] / [>]
       {
-        int ry4 = MENU_Y + 45 + 3 * 58;
+        int ry4 = MENU_Y + 45 + 4 * 58;
         if (tx >= (uint16_t)(MENU_X + 110) && tx < (uint16_t)(MENU_X + 140) &&
             ty >= (uint16_t)ry4             && ty < (uint16_t)(ry4 + 30)) {
           // Cycle left: FOGGY(6) → ... → SUNNY(0) → AUTO(-1) → FOGGY(6)
