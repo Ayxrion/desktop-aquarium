@@ -253,13 +253,16 @@ Fish fish[MAX_FISH];
 #define MENU_X   510
 #define MENU_Y    48
 #define MENU_W   282
-#define MENU_H   230
+#define MENU_H   290
 
 // ─── Button / touch state ─────────────────────────────────────────────────────
 bool     lastBtnState  = HIGH;
 uint32_t lastBtnMs     = 0;
 bool     lastTouched   = false;
 bool     menuOpen      = false;
+
+// ─── Weather override (-1 = AUTO/live, 0-6 = forced WeatherCondition) ─────────
+int8_t   weatherOverrideIdx = -1;
 
 // ─── Weather visual — clouds ─────────────────────────────────────────────────
 #define MAX_CLOUDS 5
@@ -1199,6 +1202,49 @@ void drawMenu() {
     canvas.setCursor(MENU_X + 217, ry + 7);
     canvas.print("+");
   }
+
+  // ── Weather override row ────────────────────────────────────────────────────
+  {
+    int ry4 = MENU_Y + 45 + 3 * 58;  // 4th row, below the three fish rows
+
+    canvas.setTextSize(1);
+    canvas.setTextColor(0xAADDFFUL);
+    canvas.setCursor(MENU_X + 10, ry4 + 11);
+    canvas.print("WEATHER");
+
+    // [<] button
+    canvas.fillRect(MENU_X + 110, ry4, 30, 30, 0x1A3355UL);
+    canvas.drawRect(MENU_X + 110, ry4, 30, 30, 0x4488CCUL);
+    canvas.setTextSize(2);
+    canvas.setTextColor(0xFFFFFFUL);
+    canvas.setCursor(MENU_X + 116, ry4 + 7);
+    canvas.print("<");
+
+    // Condition name — green "AUTO" when live, yellow when overriding
+    static const char* wNames[] = {
+      "AUTO", "SUNNY", "PARTLY CLD", "CLOUDY",
+      "RAINY", "STORMY", "SNOWY", "FOGGY"
+    };
+    int wIdx = (weatherOverrideIdx < 0) ? 0 : (weatherOverrideIdx + 1);
+    const char* wName = wNames[wIdx];
+    uint32_t wCol = (weatherOverrideIdx < 0) ? 0x44FF44UL : 0xFFEE88UL;
+
+    canvas.setTextSize(1);
+    canvas.setTextColor(wCol);
+    // Centre text in the 78px gap between end of [<] and start of [>]
+    int nameW = (int)strlen(wName) * 6;
+    int nameX = MENU_X + 140 + (78 - nameW) / 2;
+    canvas.setCursor(nameX, ry4 + 11);
+    canvas.print(wName);
+
+    // [>] button
+    canvas.fillRect(MENU_X + 218, ry4, 30, 30, 0x1A3355UL);
+    canvas.drawRect(MENU_X + 218, ry4, 30, 30, 0x4488CCUL);
+    canvas.setTextSize(2);
+    canvas.setTextColor(0xFFFFFFUL);
+    canvas.setCursor(MENU_X + 224, ry4 + 7);
+    canvas.print(">");
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1240,6 +1286,34 @@ void loop() {
           break;
         }
       }
+      // Weather override row [<] / [>]
+      {
+        int ry4 = MENU_Y + 45 + 3 * 58;
+        if (tx >= (uint16_t)(MENU_X + 110) && tx < (uint16_t)(MENU_X + 140) &&
+            ty >= (uint16_t)ry4             && ty < (uint16_t)(ry4 + 30)) {
+          // Cycle left: FOGGY(6) → ... → SUNNY(0) → AUTO(-1) → FOGGY(6)
+          weatherOverrideIdx--;
+          if (weatherOverrideIdx < -1) weatherOverrideIdx = 6;
+          if (weatherOverrideIdx >= 0) {
+            currentWeather = (WeatherCondition)weatherOverrideIdx;
+            initWeatherEffects();
+          } else {
+            forceWeatherRefetch();
+          }
+        }
+        if (tx >= (uint16_t)(MENU_X + 218) && tx < (uint16_t)(MENU_X + 248) &&
+            ty >= (uint16_t)ry4             && ty < (uint16_t)(ry4 + 30)) {
+          // Cycle right: AUTO(-1) → SUNNY(0) → ... → FOGGY(6) → AUTO(-1)
+          weatherOverrideIdx++;
+          if (weatherOverrideIdx > 6) weatherOverrideIdx = -1;
+          if (weatherOverrideIdx >= 0) {
+            currentWeather = (WeatherCondition)weatherOverrideIdx;
+            initWeatherEffects();
+          } else {
+            forceWeatherRefetch();
+          }
+        }
+      }
     } else if ((int)ty > TANK_TOP) {
       // Only drop food in the water zone, not the sky
       dropFood((int)tx, (int)ty);
@@ -1252,8 +1326,8 @@ void loop() {
   lastFrameMs = now;
   tick += 1.0f;
 
-  // Weather: re-check API every 5 min; re-init visuals when conditions change
-  {
+  // Weather: re-check API every 5 min (skipped when manually overriding)
+  if (weatherOverrideIdx < 0) {
     WeatherCondition prevW = currentWeather;
     updateWeather();
     if (currentWeather != prevW) initWeatherEffects();

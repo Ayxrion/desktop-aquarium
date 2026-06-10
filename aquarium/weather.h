@@ -96,6 +96,13 @@ static void initWeather() {
   _lastWeatherMs = millis();
 }
 
+// Reset timer so the next updateWeather() call fires immediately.
+// Call this when returning from manual override back to AUTO mode.
+static void forceWeatherRefetch() {
+  _lastFetchOk   = false;
+  _lastWeatherMs = 0;
+}
+
 static void updateWeather() {
   uint32_t interval = _lastFetchOk ? _WEATHER_INTERVAL : _WEATHER_RETRY_INTERVAL;
   if (millis() - _lastWeatherMs >= interval) {
