@@ -12,3 +12,7 @@
 #define WEATHER_API_KEY "your_openweathermap_api_key"
 #define WEATHER_LAT     "51.5074"
 #define WEATHER_LON     "-0.1278"
+
+// ── Day/night cycle timezone ──────────────────────────────────────────────────
+// Integer hours offset from UTC, e.g. -5 for EST, 0 for UTC, 1 for CET.
+#define TIMEZONE_OFFSET_HOURS 0

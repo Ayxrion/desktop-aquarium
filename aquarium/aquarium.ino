@@ -15,6 +15,7 @@
 #include "wifi_config.h"
 #include "ota_update.h"
 #include "weather.h"
+#include "daynight.h"
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  LGFX — Elecrow CrowPanel 7.0" (16-bit parallel RGB, GT911 touch)
@@ -292,7 +293,7 @@ Fish fish[MAX_FISH];
 #define MENU_X   510
 #define MENU_Y    48
 #define MENU_W   282
-#define MENU_H   350
+#define MENU_H   410
 
 // ─── Button / touch state ─────────────────────────────────────────────────────
 bool     lastBtnState  = HIGH;
@@ -327,6 +328,11 @@ static SnowFlake snowFlakes[MAX_SNOWFLAKES];
 static float    _lightningTimer = 0;
 static uint8_t  _lightningFlash = 0;
 static float    _lightBoltX     = 400;
+
+// ─── Day / night — stars ─────────────────────────────────────────────────────
+#define NUM_STARS 50
+struct Star { uint16_t x; uint8_t y; uint8_t phase; };
+static Star skyStars[NUM_STARS];
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Helpers
@@ -555,28 +561,75 @@ static void drawCloud(float cx, float cy, float cw, float ch, uint32_t col) {
                      (int)(ch * 0.42f), col);
 }
 
+// Linear interpolation between two 24-bit RGB colours
+static uint32_t colorLerp(uint32_t a, uint32_t b, float t) {
+  if (t <= 0.0f) return a;
+  if (t >= 1.0f) return b;
+  int ar = (a >> 16) & 0xFF, ag = (a >> 8) & 0xFF, ab = a & 0xFF;
+  int br = (b >> 16) & 0xFF, bg = (b >> 8) & 0xFF, bb = b & 0xFF;
+  return ((uint32_t)(ar + (int)((br - ar) * t + 0.5f)) << 16) |
+         ((uint32_t)(ag + (int)((bg - ag) * t + 0.5f)) <<  8) |
+          (uint32_t)(ab + (int)((bb - ab) * t + 0.5f));
+}
+
+static void initStars() {
+  for (int i = 0; i < NUM_STARS; i++) {
+    skyStars[i].x     = (uint16_t)random(0, SCREEN_W);
+    skyStars[i].y     = (uint8_t) random(2, WEATHER_SKY_H - 4);
+    skyStars[i].phase = (uint8_t) random(0, 100);
+  }
+}
+
 void drawWeatherSky() {
-  uint32_t skyTop, skyBot, cloudCol;
+  // ── Weather-based day colours ──────────────────────────────────────────────
+  uint32_t weatherTop, weatherBot, cloudCol;
   switch (currentWeather) {
     case WEATHER_SUNNY:
-      skyTop = 0x1A78C8; skyBot = 0x64B5E8; cloudCol = 0xFFFFFF; break;
+      weatherTop = 0x1A78C8; weatherBot = 0x64B5E8; cloudCol = 0xFFFFFF; break;
     case WEATHER_PARTLY_CLOUDY:
-      skyTop = 0x2288CC; skyBot = 0x77AEDD; cloudCol = 0xEEEEFF; break;
+      weatherTop = 0x2288CC; weatherBot = 0x77AEDD; cloudCol = 0xEEEEFF; break;
     case WEATHER_CLOUDY:
-      skyTop = 0x556677; skyBot = 0x8899AA; cloudCol = 0xBBBBCC; break;
+      weatherTop = 0x556677; weatherBot = 0x8899AA; cloudCol = 0xBBBBCC; break;
     case WEATHER_RAINY:
-      skyTop = 0x334455; skyBot = 0x556677; cloudCol = 0x5A6A7A; break;
+      weatherTop = 0x334455; weatherBot = 0x556677; cloudCol = 0x5A6A7A; break;
     case WEATHER_STORMY:
-      skyTop = 0x111827; skyBot = 0x1A2233; cloudCol = 0x2A3344; break;
+      weatherTop = 0x111827; weatherBot = 0x1A2233; cloudCol = 0x2A3344; break;
     case WEATHER_SNOWY:
-      skyTop = 0x8899AA; skyBot = 0xAABBCC; cloudCol = 0xCCDDEE; break;
+      weatherTop = 0x8899AA; weatherBot = 0xAABBCC; cloudCol = 0xCCDDEE; break;
     case WEATHER_FOGGY:
-      skyTop = 0x7788AA; skyBot = 0xAABBCC; cloudCol = 0xBBCCDD; break;
+      weatherTop = 0x7788AA; weatherBot = 0xAABBCC; cloudCol = 0xBBCCDD; break;
     default:
-      skyTop = 0x1A78C8; skyBot = 0x64B5E8; cloudCol = 0xFFFFFF; break;
+      weatherTop = 0x1A78C8; weatherBot = 0x64B5E8; cloudCol = 0xFFFFFF; break;
   }
 
-  // 8-band vertical gradient
+  // ── Day/night blending ─────────────────────────────────────────────────────
+  // dayFactor: 0 = full night, 1 = full day; smooth 0.10-wide transitions
+  float dp = getDayProgress();
+  float dayFactor;
+  if      (dp < 0.18f) dayFactor = 0.0f;
+  else if (dp < 0.28f) dayFactor = (dp - 0.18f) * 10.0f;   // dawn  0→1
+  else if (dp < 0.72f) dayFactor = 1.0f;
+  else if (dp < 0.82f) dayFactor = 1.0f - (dp - 0.72f) * 10.0f;  // dusk 1→0
+  else                 dayFactor = 0.0f;
+
+  const uint32_t NIGHT_TOP = 0x000510UL;
+  const uint32_t NIGHT_BOT = 0x001530UL;
+  const uint32_t DAWN_TOP  = 0xBB4410UL;
+  const uint32_t DAWN_BOT  = 0xFF8840UL;
+
+  uint32_t skyTop, skyBot;
+  if (dayFactor < 0.5f) {
+    float t = dayFactor * 2.0f;
+    skyTop = colorLerp(NIGHT_TOP, DAWN_TOP, t);
+    skyBot = colorLerp(NIGHT_BOT, DAWN_BOT, t);
+  } else {
+    float t = (dayFactor - 0.5f) * 2.0f;
+    skyTop = colorLerp(DAWN_TOP, weatherTop, t);
+    skyBot = colorLerp(DAWN_BOT, weatherBot, t);
+  }
+  cloudCol = colorLerp(0x223344UL, cloudCol, dayFactor);
+
+  // ── 8-band vertical gradient ───────────────────────────────────────────────
   for (int band = 0; band < 8; band++) {
     int   y0 = band       * WEATHER_SKY_H / 8;
     int   y1 = (band + 1) * WEATHER_SKY_H / 8;
@@ -587,7 +640,61 @@ void drawWeatherSky() {
     canvas.fillRect(0, y0, SCREEN_W, y1 - y0 + 1, (uint32_t)((r << 16) | (g << 8) | b));
   }
 
-  // Lightning flash
+  // ── Stars (night / dusk / dawn) ────────────────────────────────────────────
+  if (dayFactor < 0.9f) {
+    float starAlpha = 1.0f - dayFactor / 0.9f;
+    for (int i = 0; i < NUM_STARS; i++) {
+      float twinkle = 0.55f + 0.45f * sinf(tick * 0.07f + skyStars[i].phase * 0.13f);
+      uint8_t br = (uint8_t)(starAlpha * twinkle * 210);
+      if (br < 15) continue;
+      // Slightly blue-white colour
+      uint32_t sc = ((uint32_t)br << 16) | ((uint32_t)br << 8) |
+                     (uint32_t)min(br + 35, 255);
+      canvas.drawPixel(skyStars[i].x, skyStars[i].y, sc);
+      // Brighter stars get a tiny cross
+      if (skyStars[i].phase % 5 == 0 && br > 150) {
+        uint32_t dim = sc >> 1 & 0x7F7F7FUL;
+        canvas.drawPixel(skyStars[i].x - 1, skyStars[i].y,     dim);
+        canvas.drawPixel(skyStars[i].x + 1, skyStars[i].y,     dim);
+        canvas.drawPixel(skyStars[i].x,     skyStars[i].y - 1, dim);
+        canvas.drawPixel(skyStars[i].x,     skyStars[i].y + 1, dim);
+      }
+    }
+  }
+
+  // ── Sun (6 am – 6 pm) ─────────────────────────────────────────────────────
+  if (dp >= 0.25f && dp <= 0.75f && dayFactor > 0.05f) {
+    float sunProg = (dp - 0.25f) / 0.50f;          // 0=sunrise, 0.5=noon, 1=sunset
+    int   sunX    = (int)(sunProg * SCREEN_W);
+    int   sunY    = (WEATHER_SKY_H - 8) -
+                    (int)(sinf(M_PI * sunProg) * (WEATHER_SKY_H - 14));
+    float nearH   = 1.0f - sinf(M_PI * sunProg);   // 1 at horizon, 0 at noon
+    uint32_t core = colorLerp(0xFFFFAAUL, 0xFF8800UL, nearH);
+    uint32_t glow = colorLerp(0xFFDD44UL, 0xFF4400UL, nearH);
+    // Fade in/out with dayFactor
+    core = colorLerp(skyTop, core, dayFactor);
+    glow = colorLerp(skyTop, glow, dayFactor);
+    canvas.fillCircle(sunX, sunY, 13, colorLerp(skyTop, glow, 0.45f));  // outer halo
+    canvas.fillCircle(sunX, sunY,  9, glow);
+    canvas.fillCircle(sunX, sunY,  5, core);
+  }
+
+  // ── Moon (6 pm – 6 am) ────────────────────────────────────────────────────
+  if ((dp > 0.75f || dp < 0.25f) && dayFactor < 0.9f) {
+    float nightLen  = 0.50f;
+    float moonProg  = (dp > 0.75f) ? (dp - 0.75f) / nightLen
+                                   : (dp + 0.25f) / nightLen;
+    int   moonX = (int)(moonProg * SCREEN_W);
+    int   moonY = (WEATHER_SKY_H - 8) -
+                  (int)(sinf(M_PI * moonProg) * (WEATHER_SKY_H - 14));
+    float moonVis = 1.0f - dayFactor / 0.9f;
+    uint32_t moonCol   = colorLerp(skyTop, 0xDDDDE8UL, moonVis);
+    uint32_t shadowCol = colorLerp(moonCol, skyTop, 0.85f);  // crescent shadow
+    canvas.fillCircle(moonX,     moonY,     7, moonCol);
+    canvas.fillCircle(moonX + 3, moonY - 2, 6, shadowCol);   // crescent cutout
+  }
+
+  // ── Lightning flash ────────────────────────────────────────────────────────
   if (_lightningFlash > 0) {
     canvas.fillRect(0, 0, SCREEN_W, WEATHER_SKY_H, 0xCCDDFFUL);
     int bx = (int)_lightBoltX, by = 4;
@@ -601,42 +708,35 @@ void drawWeatherSky() {
     }
   }
 
-  // Clouds
-  for (int i = 0; i < numClouds; i++) {
+  // ── Clouds ─────────────────────────────────────────────────────────────────
+  for (int i = 0; i < numClouds; i++)
     drawCloud(clouds[i].x, clouds[i].y, clouds[i].w, clouds[i].h, cloudCol);
-  }
 
-  // Rain streaks
+  // ── Rain streaks ───────────────────────────────────────────────────────────
   if (currentWeather == WEATHER_RAINY || currentWeather == WEATHER_STORMY) {
     uint32_t rainCol = (currentWeather == WEATHER_STORMY) ? 0x7799BBUL : 0x88AACCUL;
     for (int i = 0; i < MAX_RAINDROPS; i++) {
-      int rx = (int)rainDrops[i].x;
-      int ry = (int)rainDrops[i].y;
+      int rx = (int)rainDrops[i].x, ry = (int)rainDrops[i].y;
       if (ry < 0) continue;
-      int ey = ry + 5;
-      if (ey >= WEATHER_SKY_H) ey = WEATHER_SKY_H - 1;
+      int ey = ry + 5; if (ey >= WEATHER_SKY_H) ey = WEATHER_SKY_H - 1;
       canvas.drawLine(rx, ry, rx + 2, ey, rainCol);
     }
   }
 
-  // Snowflakes
+  // ── Snowflakes ─────────────────────────────────────────────────────────────
   if (currentWeather == WEATHER_SNOWY) {
     for (int i = 0; i < MAX_SNOWFLAKES; i++) {
-      int sx = (int)snowFlakes[i].x;
-      int sy = (int)snowFlakes[i].y;
-      if (sy >= 0 && sy < WEATHER_SKY_H) {
+      int sx = (int)snowFlakes[i].x, sy = (int)snowFlakes[i].y;
+      if (sy >= 0 && sy < WEATHER_SKY_H)
         canvas.fillRect(sx, sy, 2, 2, 0xEEEEFFUL);
-      }
     }
   }
 
-  // Foggy haze overlay
+  // ── Fog haze ───────────────────────────────────────────────────────────────
   if (currentWeather == WEATHER_FOGGY) {
-    for (int y = 0; y < WEATHER_SKY_H; y += 12) {
+    for (int y = 0; y < WEATHER_SKY_H; y += 12)
       canvas.fillRect(0, y, SCREEN_W, 5, 0xAABBCCUL);
-    }
   }
-  // Note: drawTankRim() is called after this and covers the bottom of the sky.
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -664,8 +764,8 @@ void setup() {
 
   otaInit(&display);
   checkForOTAUpdate();
-  weatherInit(&display);
   initWeather();          // fetch current conditions from OpenWeatherMap
+  initDayNight();         // NTP time sync (WiFi already on from initWeather)
 
   for (int x = 0; x < SCREEN_W; x++) {
     float h = sinf(x * 0.018f) * 4.0f
@@ -733,6 +833,7 @@ void setup() {
   for (int i = 0; i < MAX_FLAKES; i++) flakes[i].active = false;
 
   initWeatherEffects();   // set up clouds / rain / snow based on fetched weather
+  initStars();            // random star positions for the night sky
 
   snail.x           = frandr(80, SCREEN_W - 80);
   snail.spd         = frandr(0.12f, 0.25f);
@@ -1435,6 +1536,35 @@ void drawMenu() {
     canvas.print("+");
   }
 
+  // ── Time mode row ───────────────────────────────────────────────────────────
+  {
+    int ry5 = MENU_Y + 45 + 5 * 58;
+
+    canvas.setTextSize(1);
+    canvas.setTextColor(0xAADDFFUL);
+    canvas.setCursor(MENU_X + 10, ry5 + 11);
+    canvas.print("TIME");
+
+    canvas.fillRect(MENU_X + 110, ry5, 30, 30, 0x1A3355UL);
+    canvas.drawRect(MENU_X + 110, ry5, 30, 30, 0x4488CCUL);
+    canvas.setTextSize(2); canvas.setTextColor(0xFFFFFFUL);
+    canvas.setCursor(MENU_X + 116, ry5 + 7);
+    canvas.print("<");
+
+    const char* tName = (currentTimeMode == TIME_REAL) ? "REAL" : "FAST";
+    uint32_t    tCol  = (currentTimeMode == TIME_REAL) ? 0x44FF44UL : 0xFFEE88UL;
+    canvas.setTextSize(1); canvas.setTextColor(tCol);
+    int tW = (int)strlen(tName) * 6;
+    canvas.setCursor(MENU_X + 140 + (78 - tW) / 2, ry5 + 11);
+    canvas.print(tName);
+
+    canvas.fillRect(MENU_X + 218, ry5, 30, 30, 0x1A3355UL);
+    canvas.drawRect(MENU_X + 218, ry5, 30, 30, 0x4488CCUL);
+    canvas.setTextSize(2); canvas.setTextColor(0xFFFFFFUL);
+    canvas.setCursor(MENU_X + 224, ry5 + 7);
+    canvas.print(">");
+  }
+
   // ── Weather override row ────────────────────────────────────────────────────
   {
     int ry4 = MENU_Y + 45 + 4 * 58;  // 5th row, below the four fish rows
@@ -1516,6 +1646,18 @@ void loop() {
             ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
           addFish(rowType[row]);
           break;
+        }
+      }
+      // Time mode row [<] / [>] — toggles REAL ↔ FAST
+      {
+        int ry5 = MENU_Y + 45 + 5 * 58;
+        if (tx >= (uint16_t)(MENU_X + 110) && tx < (uint16_t)(MENU_X + 140) &&
+            ty >= (uint16_t)ry5             && ty < (uint16_t)(ry5 + 30)) {
+          currentTimeMode = (currentTimeMode == TIME_REAL) ? TIME_FAST : TIME_REAL;
+        }
+        if (tx >= (uint16_t)(MENU_X + 218) && tx < (uint16_t)(MENU_X + 248) &&
+            ty >= (uint16_t)ry5             && ty < (uint16_t)(ry5 + 30)) {
+          currentTimeMode = (currentTimeMode == TIME_REAL) ? TIME_FAST : TIME_REAL;
         }
       }
       // Weather override row [<] / [>]
