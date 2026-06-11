@@ -77,6 +77,7 @@ static void checkForOTAUpdate() {
     {
         WiFiClientSecure apiClient;
         apiClient.setInsecure();
+        apiClient.setBufferSizes(4096, 1024);  // GitHub TLS needs a larger RX buffer
         apiClient.setTimeout(15);
 
         HTTPClient http;
