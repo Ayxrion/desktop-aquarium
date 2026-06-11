@@ -242,6 +242,17 @@ struct Starfish {
 };
 static Starfish starfish;
 
+// ─── Boat ────────────────────────────────────────────────────────────────────
+#define BOAT_W          76      // hull width in pixels
+#define BOAT_LAUNCH_MS  60000UL // one pass per minute
+
+struct Boat {
+  float    x;
+  bool     active;
+  uint32_t lastLaunchMs;
+};
+static Boat boat = { (float)(SCREEN_W + BOAT_W), false, 0UL };
+
 // ─── Food flakes ─────────────────────────────────────────────────────────────
 #define MAX_FLAKES 10
 struct Flake {
@@ -1188,6 +1199,86 @@ void drawStarfish() {
   }
 }
 
+// ─── Boat ────────────────────────────────────────────────────────────────────
+
+void updateBoat() {
+  uint32_t now = millis();
+  if (!boat.active) {
+    if (now - boat.lastLaunchMs >= BOAT_LAUNCH_MS) {
+      boat.x            = (float)(SCREEN_W + 10);
+      boat.active       = true;
+    }
+    return;
+  }
+  boat.x -= 0.5f;   // drifts right→left at half a pixel per frame (~30 s crossing)
+  if (boat.x < -(float)(BOAT_W + 10)) {
+    boat.active       = false;
+    boat.lastLaunchMs = millis();
+  }
+}
+
+void drawBoat() {
+  if (!boat.active) return;
+  int bx = (int)boat.x;
+  int by = TANK_TOP - 23;   // waterline; the rim will cover the keel below this
+
+  // ── Colours ───────────────────────────────────────────────────────────────
+  const uint32_t hullDark  = 0x7B3A10UL;  // dark chestnut hull
+  const uint32_t hullMid   = 0xA0522DUL;  // sienna hull body
+  const uint32_t deckCol   = 0xD2B48CUL;  // tan deck rail
+  const uint32_t cabinCol  = 0xFDF5E6UL;  // old-lace cabin walls
+  const uint32_t roofCol   = 0x888888UL;  // grey roof
+  const uint32_t winCol    = 0x87CEEBUL;  // sky-blue portholes
+  const uint32_t rimCol    = 0x555555UL;  // porthole rims
+  const uint32_t chimCol   = 0x444444UL;  // smokestack
+  const uint32_t smokeCol  = 0xBBBBBBUL;  // smoke puffs
+
+  // ── Keel (sits below waterline, hidden by tank rim) ───────────────────────
+  canvas.fillTriangle(bx + 4, by, bx + 72, by, bx + 38, by + 6, hullDark);
+
+  // ── Hull body ─────────────────────────────────────────────────────────────
+  canvas.fillRect(bx + 2, by - 11, 72, 11, hullMid);
+  // Bow taper (left / leading edge, boat travels left)
+  canvas.fillTriangle(bx, by, bx + 2, by - 8, bx + 2, by, hullDark);
+  // Stern bevel (right / trailing edge)
+  canvas.fillTriangle(bx + 74, by, bx + 74, by - 8, bx + 72, by - 8, hullDark);
+  // Hull highlight stripe
+  canvas.fillRect(bx + 2, by - 11, 72, 2, 0xC07040UL);
+
+  // ── Deck rail ─────────────────────────────────────────────────────────────
+  canvas.fillRect(bx + 2, by - 13, 72, 2, deckCol);
+
+  // ── Cabin ─────────────────────────────────────────────────────────────────
+  canvas.fillRect(bx + 16, by - 25, 40, 12, cabinCol);
+  // Roof
+  canvas.fillRect(bx + 14, by - 27, 44,  2, roofCol);
+  // Cabin outline (gives it crisp edges)
+  canvas.drawRect(bx + 16, by - 25, 40, 12, 0xAAAAAA);
+
+  // ── Portholes ─────────────────────────────────────────────────────────────
+  canvas.fillCircle(bx + 26, by - 20, 4, winCol);
+  canvas.fillCircle(bx + 44, by - 20, 4, winCol);
+  canvas.drawCircle(bx + 26, by - 20, 4, rimCol);
+  canvas.drawCircle(bx + 44, by - 20, 4, rimCol);
+
+  // ── Smokestack ────────────────────────────────────────────────────────────
+  canvas.fillRect(bx + 52, by - 37, 8, 14, chimCol);
+  canvas.fillRect(bx + 50, by - 39, 12,  3, chimCol);  // flared cap
+
+  // ── Animated smoke puffs (drift left and upward) ──────────────────────────
+  // Three puffs at staggered phases so they appear to rise continuously
+  for (int p = 0; p < 3; p++) {
+    float phase = fmodf(tick * 0.6f + p * 20.0f, 60.0f); // 0–60
+    int   sx    = bx + 55 - (int)(phase * 0.6f);
+    int   sy    = by - 42  - (int)(phase * 0.35f);
+    int   sr    = 4 - (int)(phase / 20.0f);   // shrinks as it drifts
+    if (sr < 1) sr = 1;
+    uint8_t alpha = (uint8_t)(180 - phase * 2);
+    uint32_t sc = (alpha > 150) ? 0xCCCCCCUL : (alpha > 100) ? smokeCol : 0xAAAAAAUL;
+    canvas.fillCircle(sx, sy, sr + 1, sc);
+  }
+}
+
 void drawBackground() {
   // Dark charcoal outside-the-tank area (overwritten below by drawWeatherSky)
   canvas.fillRect(0, 0, SCREEN_W, TANK_TOP, 0x1A1A1AUL);
@@ -1708,6 +1799,7 @@ void loop() {
   }
   updateWeatherEffects();
 
+  updateBoat();
   updateSnail();
   updateStarfish();
   updateBubbles();
@@ -1716,6 +1808,7 @@ void loop() {
 
   drawBackground();
   drawWeatherSky();   // overwrites the top TANK_TOP px with sky + weather effects
+  drawBoat();         // floats on the waterline above the tank rim
   drawBgPlants();     // behind everything — dark far-away silhouettes
   drawFishShadows();
   drawSnail();
