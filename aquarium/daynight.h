@@ -6,6 +6,10 @@
 #include <time.h>
 #include "wifi_config.h"
 
+#ifndef TIMEZONE_OFFSET_HOURS
+#define TIMEZONE_OFFSET_HOURS 0   // default UTC; set in wifi_config.h or as a build secret
+#endif
+
 enum TimeMode : uint8_t { TIME_REAL = 0, TIME_FAST };
 static TimeMode currentTimeMode = TIME_REAL;
 

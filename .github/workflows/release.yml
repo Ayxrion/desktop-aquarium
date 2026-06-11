@@ -51,7 +51,7 @@ jobs:
             "${{ secrets.WIFI_SSID }}" "${{ secrets.WIFI_PASSWORD }}" \
             "${{ secrets.WEATHER_API_KEY }}" \
             "${{ secrets.WEATHER_LAT }}" "${{ secrets.WEATHER_LON }}" \
-            "${{ secrets.TIMEZONE_OFFSET_HOURS }}" \
+            "${{ secrets.TIMEZONE_OFFSET_HOURS || '0' }}" \
             > aquarium/wifi_config.h
 
       # PlatformIO's LDF only scans src/ — copy all headers there so it
