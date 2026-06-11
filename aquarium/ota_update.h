@@ -69,6 +69,7 @@ static void checkForOTAUpdate() {
             }
             delay(200);
         }
+        delay(500);   // let DHCP/DNS fully settle before opening TLS connections
     }
 
     // ── Query GitHub releases/latest ─────────────────────────────────────────
@@ -77,7 +78,6 @@ static void checkForOTAUpdate() {
     {
         WiFiClientSecure apiClient;
         apiClient.setInsecure();
-        apiClient.setBufferSizes(4096, 1024);  // GitHub TLS needs a larger RX buffer
         apiClient.setTimeout(15);
 
         HTTPClient http;
