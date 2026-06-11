@@ -2,6 +2,9 @@
 // Fetches current weather from OpenWeatherMap and exposes a WeatherCondition enum.
 // Call initWeather() from setup() after OTA, updateWeather() each loop() iteration.
 // Requires WEATHER_API_KEY, WEATHER_LAT, WEATHER_LON in wifi_config.h.
+//
+// WiFi is left ON permanently after initWeather() — cycling the radio off and
+// back on every 5 minutes was causing silent reconnect failures on the ESP32-S3.
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -27,23 +30,30 @@ static bool             _lastFetchOk        = false;
 static const uint32_t _WEATHER_INTERVAL       = 5UL * 60UL * 1000UL;  // 5 min on success
 static const uint32_t _WEATHER_RETRY_INTERVAL = 60UL * 1000UL;         // 1 min on failure
 
-// Returns true on success and updates outCondition.
-static bool _fetchWeather(WeatherCondition& outCondition) {
-  // Brief pause so WiFi hardware fully powers up after any prior mode change.
-  delay(500);
+// Ensures WiFi is connected, reusing an existing connection if still up.
+// Returns true when connected, false on timeout.
+static bool _wifiEnsureConnected() {
+  if (WiFi.status() == WL_CONNECTED) return true;
 
-  WiFi.mode(WIFI_STA);
+  // Radio may be off (e.g. just after OTA) — turn it on and connect.
+  if (WiFi.getMode() == WIFI_OFF) {
+    WiFi.mode(WIFI_STA);
+    delay(200);
+  }
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - t0 > 15000UL) {
-      WiFi.disconnect(true);
-      WiFi.mode(WIFI_OFF);
-      return false;
-    }
+    if (millis() - t0 > 15000UL) return false;
     delay(200);
   }
+  return true;
+}
+
+// Returns true on success and updates outCondition.
+// WiFi is left connected after the call — no cycling.
+static bool _fetchWeather(WeatherCondition& outCondition) {
+  if (!_wifiEnsureConnected()) return false;
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -84,8 +94,7 @@ static bool _fetchWeather(WeatherCondition& outCondition) {
     http.end();
   }
 
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
+  // WiFi intentionally left on — avoids the reconnect failures caused by cycling.
   return success;
 }
 
