@@ -68,14 +68,16 @@ static bool _fetchWeather(WeatherCondition& outCondition) {
   bool success = false;
   HTTPClient http;
   if (http.begin(client, url)) {
+    http.setTimeout(12000);   // 12 s total HTTP timeout
     int code = http.GET();
     if (code == HTTP_CODE_OK) {
-      // Read the full body before parsing — stream closes if we delay first.
+      // Read full body first — stream can close if we delay parsing.
+      // DynamicJsonDocument(1024) is plenty for the ~500-byte OWM response;
+      // avoids the StaticJsonDocument filter-size pitfall that caused silent
+      // NoMemory errors and prevented the weather from ever updating.
       String body = http.getString();
-      StaticJsonDocument<64> filter;
-      filter["weather"][0]["id"] = true;
-      DynamicJsonDocument doc(512);
-      if (!deserializeJson(doc, body, DeserializationOption::Filter(filter))) {
+      DynamicJsonDocument doc(1024);
+      if (!deserializeJson(doc, body)) {
         int id = doc["weather"][0]["id"] | -1;
         if (id >= 0) {
           if      (id == 800)              outCondition = WEATHER_SUNNY;
