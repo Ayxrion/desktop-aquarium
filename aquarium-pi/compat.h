@@ -22,8 +22,11 @@ template<typename T> inline T constrain(T v, T lo, T hi) {
 using std::min;
 using std::max;
 
-static constexpr int HIGH = 1;
-static constexpr int LOW  = 0;
+static constexpr int HIGH       = 1;
+static constexpr int LOW        = 0;
+static constexpr int INPUT      = 0;
+static constexpr int OUTPUT     = 1;
+static constexpr int INPUT_PULLUP = 2;
 inline int  digitalRead(int)  { return HIGH; }
 inline void pinMode(int, int) {}
 inline int  analogRead(int)   { return std::rand() % 1024; }

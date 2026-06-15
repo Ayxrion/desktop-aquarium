@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <curl/curl.h>
 #include "compat.h"
+#include "version.h"
 #include "wifi_config.h"
 
 enum WeatherCondition : uint8_t {
