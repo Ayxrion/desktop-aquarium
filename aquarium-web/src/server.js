@@ -1,8 +1,12 @@
 'use strict';
 
+const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const store = require('./store');
+
+const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+const INDEX_HTML = fs.readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const API_KEY = process.env.API_KEY || '';
@@ -87,8 +91,20 @@ app.get('/api/stream', (req, res) => {
   });
 });
 
-// ─── Static dashboard ──────────────────────────────────────────────────────
-app.use(express.static(path.join(__dirname, '..', 'public')));
+// ─── Dashboard (prefix-aware) ────────────────────────────────────────────────
+// Inject a <base href> derived from X-Forwarded-Prefix so the page's relative
+// asset/API URLs resolve correctly when served under a reverse-proxy sub-path
+// (e.g. /aquarium/) — and regardless of whether the URL had a trailing slash.
+function sendIndex(req, res) {
+  const prefix = (req.get('x-forwarded-prefix') || '').replace(/\/+$/, '');
+  const base = prefix ? `${prefix}/` : '/';
+  res.type('html').send(INDEX_HTML.replace('<head>', `<head>\n  <base href="${base}">`));
+}
+app.get(['/', '/index.html'], sendIndex);
+
+// Other static assets (app.js, styles.css). After strip_prefix, these arrive at
+// their bare paths (/app.js, /styles.css) and are served from public/.
+app.use(express.static(PUBLIC_DIR));
 
 app.listen(PORT, () => {
   console.log(`aquarium-web listening on :${PORT} (stale after ${store.STALE_MS}ms)`);
