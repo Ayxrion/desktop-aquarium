@@ -46,6 +46,19 @@ static uint32_t _lastTelemetryMs = 0;
 // Worst case ~45 fish (~110 chars each) + plants + header ≈ 6 KB; 12 KB is safe.
 static char _telemetryBuf[12288];
 
+// Runtime state (toggled from the tank menu, surfaced in the tank view).
+static bool telemetryEnabled   = (TELEMETRY_ENABLED != 0); // initial from config
+static bool telemetryLastOk    = true;   // result of the most recent POST
+static bool telemetryEverTried = false;  // have we attempted a POST yet?
+static int  telemetryFailCount = 0;      // consecutive failures
+static char telemetryLastError[80] = ""; // human-readable reason of last failure
+
+// True when publishing is on but recent posts are failing — drives the
+// failure indicator drawn in the tank view.
+static inline bool telemetryHasError() {
+    return telemetryEnabled && telemetryEverTried && !telemetryLastOk;
+}
+
 static const char* _telemetryWeatherName(int c) {
     static const char* N[] = { "SUNNY", "PARTLY_CLOUDY", "CLOUDY", "RAINY",
                                "STORMY", "SNOWY", "FOGGY" };
@@ -143,32 +156,50 @@ static int _buildTelemetryJson() {
 }
 
 static void telemetryInit() {
-    if (TELEMETRY_ENABLED && TELEMETRY_HOST[0] != '\0')
+    if (telemetryEnabled && TELEMETRY_HOST[0] != '\0')
         Serial.printf("Telemetry: enabled -> %s/api/telemetry as '%s' every %d ms\n",
                       TELEMETRY_HOST, TELEMETRY_AQUARIUM_ID, TELEMETRY_INTERVAL_MS);
 }
 
+// Record a failed publish with a human-readable reason.
+static void _telemetryFail(const char* reason) {
+    telemetryEverTried = true;
+    telemetryLastOk    = false;
+    telemetryFailCount++;
+    snprintf(telemetryLastError, sizeof(telemetryLastError), "%s", reason);
+    Serial.printf("Telemetry post failed: %s\n", telemetryLastError);
+}
+
+// Record a successful publish.
+static void _telemetryOk() {
+    telemetryEverTried = true;
+    telemetryLastOk    = true;
+    telemetryFailCount = 0;
+    telemetryLastError[0] = '\0';
+}
+
 // Call once per loop(); rate-limited internally by TELEMETRY_INTERVAL_MS.
+// Gated by the runtime telemetryEnabled flag (toggled from the tank menu).
 static void telemetryUpdate() {
-    if (!TELEMETRY_ENABLED || TELEMETRY_HOST[0] == '\0') return;
+    if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
     uint32_t now = millis();
     if (now - _lastTelemetryMs < (uint32_t)TELEMETRY_INTERVAL_MS) return;
     _lastTelemetryMs = now;
 
-    if (!_wifiEnsureConnected()) return;   // reuses weather.h's connection helper
+    if (!_wifiEnsureConnected()) { _telemetryFail("WiFi not connected"); return; }
 
     int len = _buildTelemetryJson();
 
     String url = String(TELEMETRY_HOST) + "/api/telemetry";
     WiFiClient client;
     HTTPClient http;
-    if (http.begin(client, url)) {
-        http.addHeader("Content-Type", "application/json");
-        http.addHeader("X-Api-Key", TELEMETRY_API_KEY);
-        http.setTimeout(5000);
-        int code = http.POST((uint8_t*)_telemetryBuf, (size_t)len);
-        if (code <= 0)
-            Serial.printf("Telemetry post failed: %s\n", http.errorToString(code).c_str());
-        http.end();
-    }
+    if (!http.begin(client, url)) { _telemetryFail("begin() failed"); return; }
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Api-Key", TELEMETRY_API_KEY);
+    http.setTimeout(5000);
+    int code = http.POST((uint8_t*)_telemetryBuf, (size_t)len);
+    if (code >= 200 && code < 300) _telemetryOk();
+    else if (code <= 0)            _telemetryFail(http.errorToString(code).c_str());
+    else { char b[24]; snprintf(b, sizeof(b), "HTTP %d", code); _telemetryFail(b); }
+    http.end();
 }

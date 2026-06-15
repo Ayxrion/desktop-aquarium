@@ -5,3 +5,4 @@ aquarium/wifi_config.h
 .pio/
 aquarium-web/node_modules/
 aquarium-web/node_modules/*
+aquarium/wifi_config.h.template

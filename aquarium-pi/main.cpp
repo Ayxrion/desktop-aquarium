@@ -1255,6 +1255,49 @@ void drawMenu() {
         canvas.setTextSize(2); canvas.setTextColor(0xFFFFFFUL);
         canvas.setCursor(MENU_X + 224, ry4 + 7); canvas.print(">");
     }
+    // Telemetry publish toggle (compact row beneath the time row).
+    {
+        int ryT = MENU_Y + 45 + 5 * 58 + 38;
+        canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
+        canvas.setCursor(MENU_X + 10, ryT + 9); canvas.print("TELEMETRY");
+
+        bool on = telemetryEnabled;
+        uint32_t boxFill   = on ? 0x115522UL : 0x0C1A2AUL;
+        uint32_t boxBorder = on ? 0x33CC66UL : 0x4488CCUL;
+        canvas.fillRect(MENU_X + 148, ryT, 28, 28, boxFill);
+        canvas.drawRect(MENU_X + 148, ryT, 28, 28, boxBorder);
+        if (on) {  // check mark
+            canvas.drawLine(MENU_X + 153, ryT + 15, MENU_X + 159, ryT + 21, 0x66FF99UL);
+            canvas.drawLine(MENU_X + 159, ryT + 21, MENU_X + 170, ryT + 6,  0x66FF99UL);
+        }
+
+        // Status text: ON / OFF, or ERR when posts are failing.
+        const char* st  = !on ? "OFF" : (telemetryHasError() ? "ERR" : "ON");
+        uint32_t    col = !on ? 0x778899UL : (telemetryHasError() ? 0xFF6655UL : 0x66FF99UL);
+        canvas.setTextSize(2); canvas.setTextColor(col);
+        canvas.setCursor(MENU_X + 186, ryT + 6); canvas.print(st);
+    }
+}
+
+// Small failure badge drawn in the tank view when telemetry publishing is on
+// but recent POSTs are failing. Blinks to draw attention.
+void drawTelemetryStatus() {
+    if (!telemetryHasError()) return;
+    int x = 10, y = 10;
+    bool blink = ((int)tick / 6) % 2 == 0;
+    uint32_t dot = blink ? 0xFF4444UL : 0x7A2222UL;
+    canvas.fillCircle(x + 6, y + 7, 6, dot);
+    canvas.drawCircle(x + 6, y + 7, 6, 0xFFAAAAUL);
+    canvas.setTextSize(1); canvas.setTextColor(0xFFBBBBUL);
+    canvas.setCursor(x + 18, y + 3); canvas.print("TELEMETRY ERROR");
+
+    // Second line: the actual reason (HTTP code / connection error) + retry count.
+    char line[96];
+    snprintf(line, sizeof(line), "%s  (x%d)",
+             telemetryLastError[0] ? telemetryLastError : "no response",
+             telemetryFailCount);
+    canvas.setTextColor(0xFFAAAAUL);
+    canvas.setCursor(x, y + 18); canvas.print(line);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1308,6 +1351,17 @@ void loop() {
                     else forceWeatherRefetch();
                 }
             }
+            {
+                int ryT = MENU_Y + 45 + 5 * 58 + 38;
+                if (tx >= (uint16_t)(MENU_X + 148) && tx < (uint16_t)(MENU_X + 230) &&
+                    ty >= (uint16_t)ryT             && ty < (uint16_t)(ryT + 28)) {
+                    telemetryEnabled = !telemetryEnabled;
+                    if (telemetryEnabled) {   // start clean — clear any stale error
+                        telemetryEverTried = false;
+                        telemetryLastOk    = true;
+                    }
+                }
+            }
         } else if ((int)ty > TANK_TOP) {
             dropFood((int)tx, (int)ty);
         }
@@ -1346,6 +1400,7 @@ void loop() {
     drawFlakes();
     drawFish();
     drawTankRim();
+    drawTelemetryStatus();
     drawMenuButton();
     drawMenu();
     canvas.pushSprite(0, 0);

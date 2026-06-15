@@ -42,6 +42,19 @@
 
 static uint32_t _lastTelemetryMs = 0;
 
+// Runtime state (toggled from the tank menu, surfaced in the tank view).
+static bool telemetryEnabled  = (TELEMETRY_ENABLED != 0); // initial from config
+static bool telemetryLastOk   = true;   // result of the most recent POST
+static bool telemetryEverTried = false; // have we attempted a POST yet?
+static int  telemetryFailCount = 0;     // consecutive failures
+static char telemetryLastError[80] = "";// human-readable reason of last failure
+
+// True when publishing is on but recent posts are failing — drives the
+// failure indicator drawn in the tank view.
+static inline bool telemetryHasError() {
+    return telemetryEnabled && telemetryEverTried && !telemetryLastOk;
+}
+
 static size_t _telemetryDiscard(void*, size_t sz, size_t n, void*) { return sz * n; }
 
 static const char* _weatherName(int c) {
@@ -162,22 +175,39 @@ static void _postTelemetry(const std::string& body) {
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, _telemetryDiscard);
 
     CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK)
-        printf("Telemetry post: %s\n", curl_easy_strerror(res));
+    long httpCode = 0;
+    if (res == CURLE_OK)
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+
+    bool ok = (res == CURLE_OK && httpCode >= 200 && httpCode < 300);
+    telemetryEverTried = true;
+    telemetryLastOk    = ok;
+    if (ok) {
+        telemetryFailCount = 0;
+        telemetryLastError[0] = '\0';
+    } else {
+        telemetryFailCount++;
+        if (res != CURLE_OK)
+            snprintf(telemetryLastError, sizeof(telemetryLastError), "%s", curl_easy_strerror(res));
+        else
+            snprintf(telemetryLastError, sizeof(telemetryLastError), "HTTP %ld", httpCode);
+        printf("Telemetry post failed: %s\n", telemetryLastError);
+    }
 
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 }
 
 static void telemetryInit() {
-    if (TELEMETRY_ENABLED && TELEMETRY_HOST[0] != '\0')
+    if (telemetryEnabled && TELEMETRY_HOST[0] != '\0')
         printf("Telemetry: enabled → %s/api/telemetry as '%s' every %d ms\n",
                TELEMETRY_HOST, TELEMETRY_AQUARIUM_ID, TELEMETRY_INTERVAL_MS);
 }
 
 // Call once per loop(); rate-limited internally by TELEMETRY_INTERVAL_MS.
+// Gated by the runtime telemetryEnabled flag (toggled from the tank menu).
 static void telemetryUpdate() {
-    if (!TELEMETRY_ENABLED || TELEMETRY_HOST[0] == '\0') return;
+    if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
     uint32_t now = millis();
     if (now - _lastTelemetryMs < (uint32_t)TELEMETRY_INTERVAL_MS) return;
     _lastTelemetryMs = now;
