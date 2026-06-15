@@ -7,12 +7,13 @@
 # Usage:
 #   DEPLOY_HOST=http://192.168.1.215 API_KEY=your-secret ./register.sh
 #
-# DEPLOY_HOST must point at the task-scheduler backend (port 3000 / its ingress).
+# DEPLOY_HOST is the task-scheduler ingress (nginx on :80 routes /api to the
+# backend), e.g. http://192.168.1.215. The script posts to $DEPLOY_HOST/api/apps.
 # API_KEY MUST match TELEMETRY_API_KEY configured on the devices.
 
 set -euo pipefail
 
-DEPLOY_HOST="${DEPLOY_HOST:-http://localhost:3000}"
+DEPLOY_HOST="${DEPLOY_HOST:-http://192.168.1.215}"
 API_KEY="${API_KEY:-change-me}"
 IMAGE="${IMAGE:-ghcr.io/ayxrion/desktop-aquarium/aquarium-web:latest}"
 REPO="${REPO:-https://github.com/Ayxrion/desktop-aquarium/tree/RaspberryPi-WebServer}"

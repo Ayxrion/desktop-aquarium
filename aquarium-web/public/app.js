@@ -12,6 +12,7 @@ const SCREEN_H = 480;
 let selectedId = null;
 let stream = null;
 let latest = null; // latest snapshot for the selected aquarium
+let lastSnapshotMs = 0; // when we last received any snapshot (SSE or poll)
 
 const els = {
   list: document.getElementById('aquarium-list'),
@@ -21,6 +22,9 @@ const els = {
   stats: document.getElementById('stats'),
   conn: document.getElementById('conn'),
   canvas: document.getElementById('tank'),
+  viewName: document.getElementById('view-name'),
+  viewSub: document.getElementById('view-sub'),
+  viewDot: document.getElementById('view-dot'),
 };
 const ctx = els.canvas.getContext('2d');
 
@@ -62,31 +66,74 @@ function select(id) {
   if (selectedId === id) return;
   selectedId = id;
   latest = null;
+  lastSnapshotMs = 0;
   els.viewEmpty.hidden = true;
   els.viewContent.hidden = false;
   openStream(id);
   refreshList();
 }
 
+function applySnapshot(snap) {
+  latest = snap;
+  lastSnapshotMs = Date.now();
+  render();
+  setConn(true);
+}
+
 // ─── SSE stream for the selected aquarium ────────────────────────────────────
+// SSE is the primary, low-latency path. A watchdog (startWatchdog) polls as a
+// fallback whenever SSE goes quiet — e.g. when a reverse proxy buffers the
+// stream — so the tank never silently freezes.
 function openStream(id) {
   if (stream) stream.close();
-  stream = new EventSource('api/stream?id=' + encodeURIComponent(id));
-  stream.addEventListener('snapshot', (e) => {
-    try {
-      latest = JSON.parse(e.data);
-      render();
-      setConn(true);
-    } catch {}
-  });
-  stream.onerror = () => setConn(false);
+  try {
+    stream = new EventSource('api/stream?id=' + encodeURIComponent(id));
+    stream.addEventListener('snapshot', (e) => {
+      try {
+        applySnapshot(JSON.parse(e.data));
+      } catch {}
+    });
+    // Transient errors are normal (reconnects); don't flap the badge here —
+    // the watchdog + list poll decide the real connection state.
+  } catch {
+    stream = null;
+  }
+}
+
+// Poll the selected aquarium directly if SSE hasn't delivered recently.
+async function pollSelected() {
+  if (!selectedId) return;
+  try {
+    const res = await fetch('api/aquariums/' + encodeURIComponent(selectedId));
+    if (res.ok) applySnapshot(await res.json());
+  } catch {
+    setConn(false);
+  }
+}
+
+function startWatchdog() {
+  setInterval(() => {
+    if (!selectedId) return;
+    if (Date.now() - lastSnapshotMs > 4000) pollSelected();
+  }, 2000);
 }
 
 // ─── Rendering ───────────────────────────────────────────────────────────────
 function render() {
   if (!latest) return;
+  drawTitle(latest);
   drawTank(latest);
   drawStats(latest);
+}
+
+function drawTitle(s) {
+  els.viewName.textContent = s.aquarium_id || selectedId || '—';
+  const weather = s.weather ? (WEATHER_NAMES[s.weather.condition] || '') : '';
+  els.viewSub.textContent = [s.platform, s.fw_version ? 'fw ' + s.fw_version : '', weather]
+    .filter(Boolean)
+    .join(' · ');
+  const stale = s._stale || Date.now() - lastSnapshotMs > 8000;
+  els.viewDot.className = 'dot ' + (stale ? 'stale' : 'live');
 }
 
 function dayTint(progress) {
@@ -264,3 +311,4 @@ function escapeHtml(str) {
 // ─── Boot ────────────────────────────────────────────────────────────────────
 refreshList();
 setInterval(refreshList, 5000);
+startWatchdog();

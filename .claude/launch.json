@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "aquarium-web",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["aquarium-web/scripts/dev.js"],
+      "port": 3000
+    }
+  ]
+}
