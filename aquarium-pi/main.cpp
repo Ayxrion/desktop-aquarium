@@ -1292,10 +1292,12 @@ void drawTelemetryStatus() {
     canvas.setCursor(x + 18, y + 3); canvas.print("TELEMETRY ERROR");
 
     // Second line: the actual reason (HTTP code / connection error) + retry count.
+    char reason[80];
+    telemetryGetError(reason, sizeof(reason));
     char line[96];
     snprintf(line, sizeof(line), "%s  (x%d)",
-             telemetryLastError[0] ? telemetryLastError : "no response",
-             telemetryFailCount);
+             reason[0] ? reason : "no response",
+             telemetryFailCount.load());
     canvas.setTextColor(0xFFAAAAUL);
     canvas.setCursor(x, y + 18); canvas.print(line);
 }

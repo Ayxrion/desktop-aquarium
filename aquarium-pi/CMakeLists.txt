@@ -26,6 +26,10 @@ pkg_check_modules(SDL2_GFX REQUIRED SDL2_gfx)
 pkg_check_modules(SDL2_TTF REQUIRED SDL2_ttf)
 pkg_check_modules(CURL     REQUIRED libcurl)
 
+# Telemetry runs its network POST on a background std::thread.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 add_executable(aquarium main.cpp)
 
 target_include_directories(aquarium PRIVATE
@@ -44,7 +48,8 @@ target_link_libraries(aquarium PRIVATE
     ${SDL2_LIBRARIES}
     ${SDL2_GFX_LIBRARIES}
     ${SDL2_TTF_LIBRARIES}
-    ${CURL_LIBRARIES})
+    ${CURL_LIBRARIES}
+    Threads::Threads)
 
 # Build:
 #   mkdir build && cd build

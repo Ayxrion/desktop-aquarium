@@ -21,6 +21,10 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <stdarg.h>
+#include <atomic>
+#include <mutex>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "version.h"
 #include "wifi_config.h"
 
@@ -44,19 +48,38 @@ static uint32_t _lastTelemetryMs = 0;
 
 // Static scratch buffer — avoids heap fragmentation from String concatenation.
 // Worst case ~45 fish (~110 chars each) + plants + header ≈ 6 KB; 12 KB is safe.
+// Written by the loop thread (build) only while the worker is idle; read by the
+// worker only while busy — see _telemetryBusy below — so no lock is needed.
 static char _telemetryBuf[12288];
+static int  _telemetryBufLen = 0;
 
-// Runtime state (toggled from the tank menu, surfaced in the tank view).
-static bool telemetryEnabled   = (TELEMETRY_ENABLED != 0); // initial from config
-static bool telemetryLastOk    = true;   // result of the most recent POST
-static bool telemetryEverTried = false;  // have we attempted a POST yet?
-static int  telemetryFailCount = 0;      // consecutive failures
-static char telemetryLastError[80] = ""; // human-readable reason of last failure
+// ── Runtime state ─────────────────────────────────────────────────────────────
+// telemetryEnabled is touched only by the loop thread (menu + draw). The result
+// fields are written by the worker task and read by the loop, so they're atomic;
+// the error string is guarded by a mutex.
+static bool                  telemetryEnabled   = (TELEMETRY_ENABLED != 0);
+static std::atomic<bool>     telemetryLastOk{true};
+static std::atomic<bool>     telemetryEverTried{false};
+static std::atomic<int>      telemetryFailCount{0};
+static char                  telemetryLastError[80] = "";
+static std::mutex            _telemetryErrMutex;
 
-// True when publishing is on but recent posts are failing — drives the
-// failure indicator drawn in the tank view.
+// Background-publish coordination: the blocking HTTP POST runs in a FreeRTOS
+// task pinned to core 0 so it never stalls the render loop (core 1). The loop
+// builds the snapshot and, only when the worker is idle, hands it over.
+static std::atomic<bool>     _telemetryBusy{false};
+static TaskHandle_t          _telemetryTaskHandle = nullptr;
+
+// True when publishing is on but recent posts are failing — drives the failure
+// indicator in the tank view.
 static inline bool telemetryHasError() {
-    return telemetryEnabled && telemetryEverTried && !telemetryLastOk;
+    return telemetryEnabled && telemetryEverTried.load() && !telemetryLastOk.load();
+}
+
+// Copy the last error reason out under lock (for the render/loop thread).
+static inline void telemetryGetError(char* out, size_t n) {
+    std::lock_guard<std::mutex> lk(_telemetryErrMutex);
+    snprintf(out, n, "%s", telemetryLastError);
 }
 
 static const char* _telemetryWeatherName(int c) {
@@ -155,40 +178,30 @@ static int _buildTelemetryJson() {
     return o;
 }
 
-static void telemetryInit() {
-    if (telemetryEnabled && TELEMETRY_HOST[0] != '\0')
-        Serial.printf("Telemetry: enabled -> %s/api/telemetry as '%s' every %d ms\n",
-                      TELEMETRY_HOST, TELEMETRY_AQUARIUM_ID, TELEMETRY_INTERVAL_MS);
-}
-
-// Record a failed publish with a human-readable reason.
+// Record a failed publish with a human-readable reason (called from the worker).
 static void _telemetryFail(const char* reason) {
-    telemetryEverTried = true;
-    telemetryLastOk    = false;
-    telemetryFailCount++;
-    snprintf(telemetryLastError, sizeof(telemetryLastError), "%s", reason);
-    Serial.printf("Telemetry post failed: %s\n", telemetryLastError);
+    telemetryEverTried.store(true);
+    telemetryLastOk.store(false);
+    telemetryFailCount.fetch_add(1);
+    {
+        std::lock_guard<std::mutex> lk(_telemetryErrMutex);
+        snprintf(telemetryLastError, sizeof(telemetryLastError), "%s", reason);
+    }
+    Serial.printf("Telemetry post failed: %s\n", reason);
 }
 
-// Record a successful publish.
+// Record a successful publish (called from the worker).
 static void _telemetryOk() {
-    telemetryEverTried = true;
-    telemetryLastOk    = true;
-    telemetryFailCount = 0;
+    telemetryEverTried.store(true);
+    telemetryLastOk.store(true);
+    telemetryFailCount.store(0);
+    std::lock_guard<std::mutex> lk(_telemetryErrMutex);
     telemetryLastError[0] = '\0';
 }
 
-// Call once per loop(); rate-limited internally by TELEMETRY_INTERVAL_MS.
-// Gated by the runtime telemetryEnabled flag (toggled from the tank menu).
-static void telemetryUpdate() {
-    if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
-    uint32_t now = millis();
-    if (now - _lastTelemetryMs < (uint32_t)TELEMETRY_INTERVAL_MS) return;
-    _lastTelemetryMs = now;
-
+// Performs one blocking POST of the current _telemetryBuf snapshot.
+static void _telemetryPost() {
     if (!_wifiEnsureConnected()) { _telemetryFail("WiFi not connected"); return; }
-
-    int len = _buildTelemetryJson();
 
     String url = String(TELEMETRY_HOST) + "/api/telemetry";
     WiFiClient client;
@@ -196,10 +209,51 @@ static void telemetryUpdate() {
     if (!http.begin(client, url)) { _telemetryFail("begin() failed"); return; }
     http.addHeader("Content-Type", "application/json");
     http.addHeader("X-Api-Key", TELEMETRY_API_KEY);
+    http.setConnectTimeout(3000);
     http.setTimeout(5000);
-    int code = http.POST((uint8_t*)_telemetryBuf, (size_t)len);
+    int code = http.POST((uint8_t*)_telemetryBuf, (size_t)_telemetryBufLen);
     if (code >= 200 && code < 300) _telemetryOk();
     else if (code <= 0)            _telemetryFail(http.errorToString(code).c_str());
     else { char b[24]; snprintf(b, sizeof(b), "HTTP %d", code); _telemetryFail(b); }
     http.end();
+}
+
+// Worker task (pinned to core 0): waits for a snapshot, POSTs it off the render
+// thread, then marks itself idle. The render loop won't overwrite _telemetryBuf
+// while _telemetryBusy is true, so no lock is needed on the buffer.
+static void _telemetryTask(void*) {
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        _telemetryPost();
+        _telemetryBusy.store(false);
+    }
+}
+
+static void telemetryInit() {
+    if (!_telemetryTaskHandle) {
+        // Core 0; the Arduino loop runs on core 1. 8 KB stack covers plain-HTTP
+        // HTTPClient (the 12 KB body lives in the static buffer, not the stack).
+        xTaskCreatePinnedToCore(_telemetryTask, "telemetry", 8192, nullptr, 1,
+                                &_telemetryTaskHandle, 0);
+    }
+    if (telemetryEnabled && TELEMETRY_HOST[0] != '\0')
+        Serial.printf("Telemetry: enabled -> %s/api/telemetry as '%s' every %d ms\n",
+                      TELEMETRY_HOST, TELEMETRY_AQUARIUM_ID, TELEMETRY_INTERVAL_MS);
+}
+
+// Call once per loop(); rate-limited internally by TELEMETRY_INTERVAL_MS.
+// Non-blocking: builds the snapshot on the loop thread and, only when the worker
+// is idle, hands it over. If a previous POST is still in flight, this interval
+// is skipped (latest-wins) rather than blocking or queueing.
+static void telemetryUpdate() {
+    if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
+    uint32_t now = millis();
+    if (now - _lastTelemetryMs < (uint32_t)TELEMETRY_INTERVAL_MS) return;
+    _lastTelemetryMs = now;
+
+    if (_telemetryBusy.load()) return;          // worker still sending — skip
+    _telemetryBufLen = _buildTelemetryJson();   // build on this (loop) thread
+    _telemetryBusy.store(true);
+    if (_telemetryTaskHandle) xTaskNotifyGive(_telemetryTaskHandle);
+    else _telemetryBusy.store(false);
 }

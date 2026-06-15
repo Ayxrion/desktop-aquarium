@@ -21,6 +21,11 @@
 #include <string>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
 #include "version.h"
 #include "wifi_config.h"
 
@@ -42,18 +47,40 @@
 
 static uint32_t _lastTelemetryMs = 0;
 
-// Runtime state (toggled from the tank menu, surfaced in the tank view).
-static bool telemetryEnabled  = (TELEMETRY_ENABLED != 0); // initial from config
-static bool telemetryLastOk   = true;   // result of the most recent POST
-static bool telemetryEverTried = false; // have we attempted a POST yet?
-static int  telemetryFailCount = 0;     // consecutive failures
-static char telemetryLastError[80] = "";// human-readable reason of last failure
+// ── Runtime state ─────────────────────────────────────────────────────────────
+// telemetryEnabled is touched only by the main/render thread (menu + draw).
+// The result fields are written by the background POST thread and read by the
+// render thread, so they're atomic; the error string is guarded by a mutex.
+static bool                  telemetryEnabled   = (TELEMETRY_ENABLED != 0);
+static std::atomic<bool>     telemetryLastOk{true};    // most recent POST result
+static std::atomic<bool>     telemetryEverTried{false};// any POST attempted yet?
+static std::atomic<int>      telemetryFailCount{0};    // consecutive failures
+static char                  telemetryLastError[80] = "";
+static std::mutex            _telemetryErrMutex;
 
-// True when publishing is on but recent posts are failing — drives the
-// failure indicator drawn in the tank view.
+// True when publishing is on but recent posts are failing — drives the failure
+// indicator in the tank view. Safe to call from the render thread.
 static inline bool telemetryHasError() {
-    return telemetryEnabled && telemetryEverTried && !telemetryLastOk;
+    return telemetryEnabled && telemetryEverTried.load() && !telemetryLastOk.load();
 }
+
+// Copy the last error reason out under lock (for the render thread).
+static inline void telemetryGetError(char* out, size_t n) {
+    std::lock_guard<std::mutex> lk(_telemetryErrMutex);
+    snprintf(out, n, "%s", telemetryLastError);
+}
+
+// ── Background publish thread ─────────────────────────────────────────────────
+// The libcurl POST blocks (DNS/connect/timeout), which would freeze the render
+// loop when the server is unreachable. So the main thread only builds the JSON
+// snapshot (fast) and hands it to this worker; the network I/O happens here.
+static std::thread              _telemetryThread;
+static std::mutex               _telemetryQueueMutex;
+static std::condition_variable  _telemetryCv;
+static std::string              _telemetryPending;     // latest snapshot to send
+static bool                     _telemetryHasPending = false;
+static bool                     _telemetryShutdown   = false;
+static bool                     _telemetryStarted    = false;
 
 static size_t _telemetryDiscard(void*, size_t sz, size_t n, void*) { return sz * n; }
 
@@ -171,7 +198,9 @@ static void _postTelemetry(const std::string& body) {
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);   // required for use off the main thread
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, _telemetryDiscard);
 
     CURLcode res = curl_easy_perform(curl);
@@ -180,13 +209,15 @@ static void _postTelemetry(const std::string& body) {
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
 
     bool ok = (res == CURLE_OK && httpCode >= 200 && httpCode < 300);
-    telemetryEverTried = true;
-    telemetryLastOk    = ok;
+    telemetryEverTried.store(true);
+    telemetryLastOk.store(ok);
     if (ok) {
-        telemetryFailCount = 0;
+        telemetryFailCount.store(0);
+        std::lock_guard<std::mutex> lk(_telemetryErrMutex);
         telemetryLastError[0] = '\0';
     } else {
-        telemetryFailCount++;
+        telemetryFailCount.fetch_add(1);
+        std::lock_guard<std::mutex> lk(_telemetryErrMutex);
         if (res != CURLE_OK)
             snprintf(telemetryLastError, sizeof(telemetryLastError), "%s", curl_easy_strerror(res));
         else
@@ -198,18 +229,51 @@ static void _postTelemetry(const std::string& body) {
     curl_easy_cleanup(curl);
 }
 
+// Worker loop: waits for a snapshot, POSTs it (blocking here, off the render
+// thread). If a newer snapshot arrives while a POST is in flight, only the
+// latest is kept — no backlog builds up when the server is slow/unreachable.
+static void _telemetryWorker() {
+    for (;;) {
+        std::string payload;
+        {
+            std::unique_lock<std::mutex> lk(_telemetryQueueMutex);
+            _telemetryCv.wait(lk, [] { return _telemetryHasPending || _telemetryShutdown; });
+            if (_telemetryShutdown) return;
+            payload.swap(_telemetryPending);
+            _telemetryHasPending = false;
+        }
+        _postTelemetry(payload);
+    }
+}
+
 static void telemetryInit() {
+    // curl_global_init must run once on the main thread before the worker uses
+    // libcurl (the lazy init inside curl_easy_init is not thread-safe).
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    if (!_telemetryStarted) {
+        _telemetryThread = std::thread(_telemetryWorker);
+        _telemetryThread.detach();   // runs for process lifetime; avoids join-at-exit terminate
+        _telemetryStarted = true;
+    }
     if (telemetryEnabled && TELEMETRY_HOST[0] != '\0')
         printf("Telemetry: enabled → %s/api/telemetry as '%s' every %d ms\n",
                TELEMETRY_HOST, TELEMETRY_AQUARIUM_ID, TELEMETRY_INTERVAL_MS);
 }
 
 // Call once per loop(); rate-limited internally by TELEMETRY_INTERVAL_MS.
-// Gated by the runtime telemetryEnabled flag (toggled from the tank menu).
+// Non-blocking: builds the JSON snapshot on the caller (render) thread, then
+// hands it to the background worker for the actual network POST.
 static void telemetryUpdate() {
     if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
     uint32_t now = millis();
     if (now - _lastTelemetryMs < (uint32_t)TELEMETRY_INTERVAL_MS) return;
     _lastTelemetryMs = now;
-    _postTelemetry(_buildTelemetryJson());
+
+    std::string json = _buildTelemetryJson();   // reads live state on this thread
+    {
+        std::lock_guard<std::mutex> lk(_telemetryQueueMutex);
+        _telemetryPending.swap(json);            // replace any unsent snapshot
+        _telemetryHasPending = true;
+    }
+    _telemetryCv.notify_one();
 }
