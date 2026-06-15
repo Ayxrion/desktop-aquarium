@@ -1,0 +1,99 @@
+:root {
+  --bg: #0b1622;
+  --panel: #132637;
+  --panel-2: #1b3147;
+  --text: #d6e6f5;
+  --muted: #7fa0bb;
+  --accent: #44ddff;
+  --live: #36d36b;
+  --stale: #c8593f;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 18px;
+  background: var(--panel);
+  border-bottom: 1px solid #0006;
+}
+header h1 { font-size: 18px; margin: 0; flex: 1; }
+
+.conn {
+  font-size: 12px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: #0004;
+}
+.conn.online { color: var(--live); }
+.conn.offline { color: var(--stale); }
+
+main {
+  display: flex;
+  height: calc(100vh - 49px);
+}
+
+#sidebar {
+  width: 280px;
+  flex-shrink: 0;
+  background: var(--panel);
+  padding: 14px;
+  overflow-y: auto;
+  border-right: 1px solid #0006;
+}
+#sidebar h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+
+#aquarium-list { list-style: none; margin: 0; padding: 0; }
+#aquarium-list li {
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: var(--panel-2);
+  border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+#aquarium-list li:hover { border-color: var(--accent); }
+#aquarium-list li.active { border-color: var(--accent); background: #24486a; }
+.aq-name { font-weight: 600; display: flex; align-items: center; gap: 7px; }
+.aq-meta { font-size: 12px; color: var(--muted); margin-top: 3px; }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.dot.live { background: var(--live); box-shadow: 0 0 6px var(--live); }
+.dot.stale { background: var(--stale); }
+
+#view { flex: 1; padding: 18px; overflow-y: auto; }
+.hint { color: var(--muted); font-size: 14px; }
+
+.tank-wrap {
+  max-width: 900px;
+  aspect-ratio: 800 / 480;
+  background: #000;
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 8px 30px #0008;
+}
+#tank { width: 100%; height: 100%; display: block; image-rendering: auto; }
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  max-width: 900px;
+  margin-top: 16px;
+}
+.stat {
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.stat .label { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+.stat .value { font-size: 20px; font-weight: 600; margin-top: 4px; }
+.stat .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }

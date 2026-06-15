@@ -753,6 +753,11 @@ void drawWeatherSky() {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  setup
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// Telemetry publisher — included here (not at the top) because it references the
+// aquarium globals declared above (fish[], fishColor, snail, plants, weather…).
+#include "telemetry.h"
+
 void setup() {
   Serial.begin(115200);
   randomSeed(analogRead(36));
@@ -777,6 +782,7 @@ void setup() {
   checkForOTAUpdate();
   initWeather();          // fetch current conditions from OpenWeatherMap
   initDayNight();         // NTP time sync (WiFi already on from initWeather)
+  telemetryInit();        // log telemetry target if enabled
 
   for (int x = 0; x < SCREEN_W; x++) {
     float h = sinf(x * 0.018f) * 4.0f
@@ -1798,6 +1804,7 @@ void loop() {
     if (currentWeather != prevW) initWeatherEffects();
   }
   updateWeatherEffects();
+  telemetryUpdate();
 
   updateBoat();
   updateSnail();

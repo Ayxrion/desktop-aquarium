@@ -1,0 +1,18 @@
+{
+  "name": "aquarium-web",
+  "version": "1.0.0",
+  "description": "Live telemetry visualization for desktop aquariums (ESP32 / Raspberry Pi)",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "mock": "node scripts/mock-publisher.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

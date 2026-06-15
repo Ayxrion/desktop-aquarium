@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Aquarium Telemetry</title>
+  <!-- Relative href so it works under the /aquarium/ reverse-proxy prefix -->
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>🐟 Aquarium Telemetry</h1>
+    <span id="conn" class="conn offline">connecting…</span>
+  </header>
+
+  <main>
+    <aside id="sidebar">
+      <h2>Aquariums</h2>
+      <ul id="aquarium-list"></ul>
+      <p id="empty-hint" class="hint">No aquariums reporting yet.</p>
+    </aside>
+
+    <section id="view">
+      <div id="view-empty" class="hint">Select an aquarium to view its tank.</div>
+      <div id="view-content" hidden>
+        <div class="tank-wrap">
+          <canvas id="tank" width="800" height="480"></canvas>
+        </div>
+        <div id="stats" class="stats"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Relative src so it works under the prefix -->
+  <script src="app.js"></script>
+</body>
+</html>

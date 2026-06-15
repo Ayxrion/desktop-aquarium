@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 
 static inline void _colRGB(uint32_t c, uint8_t& r, uint8_t& g, uint8_t& b) {
     r = (c >> 16) & 0xFF;
@@ -36,8 +37,14 @@ public:
             800, 480, SDL_WINDOW_SHOWN);
         if (!window) { printf("SDL_CreateWindow: %s\n", SDL_GetError()); return false; }
 
-        renderer = SDL_CreateRenderer(window, -1,
-            SDL_RENDERER_ACCELERATED | SDL_RENDERER_TARGETTEXTURE);
+        // On the Pi Zero's legacy VideoCore IV GL driver the "accelerated"
+        // path is often slower than pure software for this 2D primitive-heavy
+        // workload (SDL2_gfx draws on the CPU regardless). Set
+        // AQUARIUM_SOFTWARE=1 to A/B test the software renderer.
+        Uint32 flags = getenv("AQUARIUM_SOFTWARE")
+            ? SDL_RENDERER_SOFTWARE
+            : SDL_RENDERER_ACCELERATED;
+        renderer = SDL_CreateRenderer(window, -1, flags);
         if (!renderer) { printf("SDL_CreateRenderer: %s\n", SDL_GetError()); return false; }
 
         SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
@@ -65,7 +72,6 @@ public:
 // ─── Canvas (sprite) ──────────────────────────────────────────────────────────
 class Canvas {
     Display*      _disp    = nullptr;
-    SDL_Texture*  _tex     = nullptr;
     int           _w = 0,  _h = 0;
     uint32_t      _textCol  = 0xFFFFFF;
     int           _textSize = 1;
@@ -74,14 +80,52 @@ class Canvas {
     // fonts[1..4] for textSize 1–4
     TTF_Font* _fonts[5] = {};
 
+    // ── Glyph cache ─────────────────────────────────────────────────────────
+    // Per-frame TTF_RenderText_Solid + CreateTextureFromSurface + DestroyTexture
+    // was the dominant cost (the fish ARE text, drawn ~17×/frame). Instead we
+    // pre-render every printable ASCII glyph once, in white, per font size, then
+    // blit cached textures with a per-draw colour mod.
+    static constexpr int GLYPH_FIRST = 32;   // space
+    static constexpr int GLYPH_LAST  = 126;  // '~'
+    static constexpr int GLYPH_COUNT = GLYPH_LAST - GLYPH_FIRST + 1;
+    SDL_Texture* _glyphs[5][GLYPH_COUNT] = {};   // [size][char-32]
+    int          _glyphW[5][GLYPH_COUNT] = {};
+    int          _glyphH[5][GLYPH_COUNT] = {};
+    int          _advance[5] = {};               // monospace step per size
+
     // Base TTF point size at textSize=1. Scaled ×textSize for larger sizes.
     static constexpr int BASE_PT = 9;
 
     SDL_Renderer* rend() const { return _disp->renderer; }
 
-    TTF_Font* curFont() const {
-        int s = (_textSize < 1) ? 1 : (_textSize > 4 ? 4 : _textSize);
-        return _fonts[s];
+    int clampSize() const {
+        return (_textSize < 1) ? 1 : (_textSize > 4 ? 4 : _textSize);
+    }
+
+    // Render every printable glyph for one font size into the cache.
+    void buildGlyphCache(int s) {
+        TTF_Font* fnt = _fonts[s];
+        if (!fnt) return;
+        SDL_Color white = { 255, 255, 255, 255 };
+        for (int i = 0; i < GLYPH_COUNT; i++) {
+            char ch = (char)(GLYPH_FIRST + i);
+            // Solid (not Blended) to match the original RenderText_Solid look.
+            SDL_Surface* surf = TTF_RenderGlyph_Solid(fnt, (Uint16)ch, white);
+            if (!surf) continue;
+            SDL_Texture* tex = SDL_CreateTextureFromSurface(rend(), surf);
+            if (tex) {
+                SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+                _glyphs[s][i] = tex;
+                _glyphW[s][i] = surf->w;
+                _glyphH[s][i] = surf->h;
+            }
+            SDL_FreeSurface(surf);
+        }
+        int minx, maxx, miny, maxy, adv;
+        if (TTF_GlyphMetrics(fnt, 'A', &minx, &maxx, &miny, &maxy, &adv) == 0 && adv > 0)
+            _advance[s] = adv;
+        else
+            _advance[s] = BASE_PT * s;  // sane fallback
     }
 
 public:
@@ -93,20 +137,21 @@ public:
     explicit Canvas(Display* d) : _disp(d) {}
 
     ~Canvas() {
+        for (int s = 1; s <= 4; s++) {
+            for (int i = 0; i < GLYPH_COUNT; i++)
+                if (_glyphs[s][i]) SDL_DestroyTexture(_glyphs[s][i]);
+        }
         for (int i = 1; i <= 4; i++) { if (_fonts[i]) TTF_CloseFont(_fonts[i]); }
-        if (_tex) SDL_DestroyTexture(_tex);
     }
 
     void setPsram(bool) {}
 
     bool createSprite(int w, int h) {
         _w = w; _h = h;
-        _tex = SDL_CreateTexture(rend(), SDL_PIXELFORMAT_RGB888,
-                                 SDL_TEXTUREACCESS_TARGET, w, h);
-        if (!_tex) {
-            printf("Canvas: SDL_CreateTexture failed: %s\n", SDL_GetError());
-            return false;
-        }
+        // No offscreen target texture: SDL's renderer is already double-buffered
+        // (Clear → draw → Present), so the LovyanGFX sprite-blit pattern just
+        // added a redundant full-screen copy plus render-target switches every
+        // frame — both slow on the Pi Zero. We draw straight to the backbuffer.
 
         // Try common monospace fonts on Raspberry Pi OS
         static const char* kFontPaths[] = {
@@ -128,26 +173,21 @@ public:
             if (!_fonts[s]) printf("Canvas: no font found at size %d\n", s);
         }
 
+        // Pre-render all glyphs once per size.
+        for (int s = 1; s <= 4; s++) buildGlyphCache(s);
+
         // Measure character dimensions from font at size 1
         if (_fonts[1]) {
-            int minx, maxx, miny, maxy, advance;
-            if (TTF_GlyphMetrics(_fonts[1], 'A', &minx, &maxx, &miny, &maxy, &advance) == 0 && advance > 0)
-                charW = advance;
+            if (_advance[1] > 0) charW = _advance[1];
             charH = TTF_FontHeight(_fonts[1]);
         }
-
-        // Set sprite as the active render target for all subsequent draw calls
-        SDL_SetRenderTarget(rend(), _tex);
         return true;
     }
 
-    // Blit sprite to the window and present, then restore sprite as target.
-    void pushSprite(int x, int y) {
-        SDL_SetRenderTarget(rend(), nullptr);
-        SDL_Rect dst = { x, y, _w, _h };
-        SDL_RenderCopy(rend(), _tex, nullptr, &dst);
+    // Present the finished frame. (x,y) retained for API compatibility with the
+    // LovyanGFX sprite call site; we always draw full-screen to the backbuffer.
+    void pushSprite(int /*x*/, int /*y*/) {
         SDL_RenderPresent(rend());
-        SDL_SetRenderTarget(rend(), _tex);
     }
 
     // ── Draw primitives ────────────────────────────────────────────────────────
@@ -211,21 +251,22 @@ public:
 
     void print(const char* s) {
         if (!s || !*s) return;
-        TTF_Font* fnt = curFont();
-        if (!fnt) return;
+        int sz = clampSize();
+        if (!_fonts[sz]) return;
         uint8_t r, g, b; _colRGB(_textCol, r, g, b);
-        SDL_Color col = { r, g, b, 255 };
-        SDL_Surface* surf = TTF_RenderText_Solid(fnt, s, col);
-        if (!surf) return;
-        SDL_Texture* tex = SDL_CreateTextureFromSurface(rend(), surf);
-        if (tex) {
-            SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
-            SDL_Rect dst = { _curX, _curY, surf->w, surf->h };
-            SDL_RenderCopy(rend(), tex, nullptr, &dst);
-            _curX += surf->w;
-            SDL_DestroyTexture(tex);
+        int adv = _advance[sz];
+        for (const char* p = s; *p; ++p) {
+            unsigned char ch = (unsigned char)*p;
+            if (ch < GLYPH_FIRST || ch > GLYPH_LAST) { _curX += adv; continue; }
+            int i = ch - GLYPH_FIRST;
+            SDL_Texture* tex = _glyphs[sz][i];
+            if (tex) {
+                SDL_SetTextureColorMod(tex, r, g, b);
+                SDL_Rect dst = { _curX, _curY, _glyphW[sz][i], _glyphH[sz][i] };
+                SDL_RenderCopy(rend(), tex, nullptr, &dst);
+            }
+            _curX += adv;   // monospace step keeps fish/menu alignment intact
         }
-        SDL_FreeSurface(surf);
     }
 
     void print(char c) { char s[2] = { c, '\0' }; print(s); }

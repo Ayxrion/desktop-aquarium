@@ -548,6 +548,10 @@ void drawWeatherSky() {
     }
 }
 
+// Telemetry publisher — included here (not at the top) because it references the
+// aquarium globals declared above (fish[], fishColor, snail, plants, weather…).
+#include "telemetry.h"
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  setup
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -568,6 +572,7 @@ void setup() {
 
     initWeather();
     initDayNight();
+    telemetryInit();
 
     for (int x = 0; x < SCREEN_W; x++) {
         float h = sinf(x * 0.018f) * 4.0f
@@ -1320,6 +1325,7 @@ void loop() {
         if (currentWeather != prevW) initWeatherEffects();
     }
     updateWeatherEffects();
+    telemetryUpdate();
     updateBoat();
     updateSnail();
     updateStarfish();
