@@ -81,6 +81,7 @@ function step() {
       id: f.id,
       x: Math.round(f.x), y: Math.round(f.y), z: f.z,
       vx: parseFloat(f.vx.toFixed(2)), vy: parseFloat(f.vy.toFixed(2)), vz: 0,
+      tx: Math.round(f.tx), ty: Math.round(f.ty),
       type: f.type,
       facing_right: f.facing_right, color: f.color,
       going_for_food: f.going_for_food, chasing: f.chasing,

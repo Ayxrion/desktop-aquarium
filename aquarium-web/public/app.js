@@ -9,28 +9,62 @@ const TANK_TOP = 72;
 const SCREEN_W = 800;
 const SCREEN_H = 480;
 
-// ─── Physics extrapolation constants (must match device) ─────────────────────
-// Device applies per-frame: vx *= 0.85; x += vx (at FRAME_MS intervals).
-// Continuous-time integral: x(t) = x₀ + vx·fm·(1 − d^(t/fm)) / (−ln d)
-const _DAMP_XY  = 0.85;
-const _DAMP_Z   = 0.88;
-const _LOG_D_XY = Math.log(_DAMP_XY); // ≈ -0.1625
-const _LOG_D_Z  = Math.log(_DAMP_Z);  // ≈ -0.1278
+// ─── Physics simulation (mirrors device updateFish, aquarium.ino / main.cpp) ──
+// Seek strengths and max velocities by fish type (0=pair,1=school,2=school2,3=angel).
+// These must match the device constants.
+const _SEEK  = [0.018, 0.012, 0.012, 0.020]; // seekStr per type
+const _MAXV  = [7.0,   5.5,   5.5,   7.0  ]; // max horizontal speed per type
+const _DAMP  = 0.85;
+const _DAMPZ = 0.88;
 
+// Boundary spring: mirrors boundAccel() on the device.
+function _bound(v, lo, hi, k) {
+  if (v < lo) return (lo - v) * k;
+  if (v > hi) return (hi - v) * k;
+  return 0;
+}
+
+// Simulate n device frames forward from the snapshot state.
+// Uses the fish's own wander target (tx, ty) for seek acceleration —
+// the dominant force that the pure-decay formula was missing.
 function _extrapolateFish(f, elapsedMs, frameMs) {
-  const vx = f.vx || 0, vy = f.vy || 0, vz = f.vz || 0;
-  if (!vx && !vy && !vz) return f;
   const fm = frameMs || 50;
-  const t = Math.min(elapsedMs, 2000); // cap drift at 2 s
-  // vx is px/frame, so scale = (1 − d^(t/fm)) / (−ln d) in frame units
-  const sXY = (1 - Math.pow(_DAMP_XY, t / fm)) / (-_LOG_D_XY);
-  const sZ  = (1 - Math.pow(_DAMP_Z,  t / fm)) / (-_LOG_D_Z);
+  const n  = Math.round(Math.min(elapsedMs, 2000) / fm);
+  if (n === 0) return f;
+
+  const type    = f.type || 0;
+  const seek    = _SEEK[type] ?? 0.012;
+  const maxV    = f.going_for_food ? 8.0 : (_MAXV[type] ?? 5.5);
+  const maxVy   = maxV * 0.5;
+  const tx      = f.tx ?? f.x;   // wander target; falls back to current pos if absent
+  const ty      = f.ty ?? f.y;
+
+  let x = f.x, y = f.y, z = f.z || 0;
+  let vx = f.vx || 0, vy = f.vy || 0, vz = f.vz || 0;
+
+  for (let i = 0; i < n; i++) {
+    // Seek wander target
+    let ax = (tx - x) * seek;
+    let ay = (ty - y) * seek;
+    let az = 0; // z target unknown; let it decay naturally
+
+    // Boundary springs (match device boundAccel with k=0.30)
+    ax += _bound(x, 30,            SCREEN_W - 30,  0.30);
+    ay += _bound(y, TANK_TOP + 20, SCREEN_H - 80,  0.30);
+    az += _bound(z, 0.0,           0.75,            0.08);
+
+    // Clamp, damp, move
+    vx = Math.max(-maxV,  Math.min(maxV,  vx + ax)) * _DAMP;
+    vy = Math.max(-maxVy, Math.min(maxVy, vy + ay)) * _DAMP;
+    vz = Math.max(-0.015, Math.min(0.015, vz + az)) * _DAMPZ;
+    x  = Math.max(5,            Math.min(SCREEN_W - 5,  x + vx));
+    y  = Math.max(TANK_TOP + 5, Math.min(SCREEN_H - 60, y + vy));
+    z  = Math.max(0,            Math.min(0.78,           z + vz));
+  }
+
   return {
     ...f,
-    x: Math.min(Math.max(Math.round(f.x + vx * sXY), 5), SCREEN_W - 5),
-    y: Math.min(Math.max(Math.round(f.y + vy * sXY), TANK_TOP + 5), SCREEN_H - 60),
-    z: Math.min(Math.max(f.z + vz * sZ, 0), 0.78),
-    // Update facing direction if velocity is strong enough (mirrors device logic)
+    x: Math.round(x), y: Math.round(y), z,
     facing_right: Math.abs(vx) > 0.4 ? vx > 0 : f.facing_right,
   };
 }
