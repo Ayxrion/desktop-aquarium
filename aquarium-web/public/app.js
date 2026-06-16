@@ -13,6 +13,8 @@ let selectedId = null;
 let stream = null;
 let latest = null; // latest snapshot for the selected aquarium
 let lastSnapshotMs = 0; // when we last received any snapshot (SSE or poll)
+let highlightedFishId = null; // legend row → highlight on the canvas
+const legendRows = new Map(); // fishId -> { el, nameInput, ageEl, swatchEl }
 
 const els = {
   list: document.getElementById('aquarium-list'),
@@ -25,6 +27,7 @@ const els = {
   viewName: document.getElementById('view-name'),
   viewSub: document.getElementById('view-sub'),
   viewDot: document.getElementById('view-dot'),
+  legend: document.getElementById('legend'),
 };
 const ctx = els.canvas.getContext('2d');
 
@@ -67,6 +70,9 @@ function select(id) {
   selectedId = id;
   latest = null;
   lastSnapshotMs = 0;
+  highlightedFishId = null;
+  legendRows.clear();
+  els.legend.innerHTML = '';
   els.viewEmpty.hidden = true;
   els.viewContent.hidden = false;
   openStream(id);
@@ -124,6 +130,92 @@ function render() {
   drawTitle(latest);
   drawTank(latest);
   drawStats(latest);
+  renderLegend(latest);
+}
+
+// Legend: one row per fish, color-matched, with editable name, age, and
+// click-to-highlight. Reconciled by fish id so live updates don't clobber a
+// rename in progress.
+function renderLegend(s) {
+  const fish = Array.isArray(s.fish) ? s.fish.filter((f) => typeof f.id === 'number') : [];
+  const seen = new Set();
+
+  for (const f of fish) {
+    seen.add(f.id);
+    let row = legendRows.get(f.id);
+    if (!row) {
+      row = buildLegendRow(f);
+      legendRows.set(f.id, row);
+      els.legend.appendChild(row.el);
+    }
+    const color = hex(f.color || 0x00ee66);
+    row.swatchEl.style.background = color;
+    row.el.style.borderLeftColor = color;
+    row.ageEl.textContent = formatAge(f.ageMs);
+    row.nameInput.placeholder = `${FISH_TYPE_NAMES[f.type] || 'Fish'} #${f.id}`;
+    if (document.activeElement !== row.nameInput) row.nameInput.value = f.name || '';
+    row.el.classList.toggle('active', f.id === highlightedFishId);
+  }
+
+  for (const [id, row] of legendRows) {
+    if (!seen.has(id)) {
+      row.el.remove();
+      legendRows.delete(id);
+    }
+  }
+}
+
+function buildLegendRow(f) {
+  const el = document.createElement('div');
+  el.className = 'legend-row';
+
+  const swatchEl = document.createElement('span');
+  swatchEl.className = 'legend-swatch';
+
+  const nameInput = document.createElement('input');
+  nameInput.className = 'legend-name';
+  nameInput.spellcheck = false;
+  nameInput.maxLength = 24;
+  nameInput.addEventListener('click', (e) => e.stopPropagation());
+  nameInput.addEventListener('blur', () => saveName(f.id, nameInput.value));
+  nameInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') nameInput.blur();
+    if (e.key === 'Escape') { nameInput.value = ''; nameInput.blur(); }
+  });
+
+  const ageEl = document.createElement('span');
+  ageEl.className = 'legend-age';
+
+  el.append(swatchEl, nameInput, ageEl);
+  el.addEventListener('click', () => {
+    highlightedFishId = highlightedFishId === f.id ? null : f.id;
+    render();
+  });
+  return { el, nameInput, ageEl, swatchEl };
+}
+
+async function saveName(fishId, value) {
+  if (!selectedId) return;
+  try {
+    await fetch(`api/aquariums/${encodeURIComponent(selectedId)}/fish/${fishId}/name`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: value }),
+    });
+  } catch {
+    /* leave the field as typed; it'll re-sync on the next snapshot */
+  }
+}
+
+function formatAge(ms) {
+  if (!ms || ms < 0) return '';
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + 'h ' + (m % 60) + 'm';
+  return Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
 }
 
 function drawTitle(s) {
@@ -212,6 +304,27 @@ function drawTank(s) {
 
 function drawFish(f) {
   const size = f.type === 3 ? 16 : f.type === 0 ? 13 : 10; // angel bigger, school smaller
+
+  // Highlight ring + name label for the legend-selected fish.
+  if (f.id === highlightedFishId) {
+    ctx.save();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, size + 9, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+  if (f.name) {
+    ctx.save();
+    ctx.font = '12px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = f.id === highlightedFishId ? '#ffffff' : 'rgba(230,240,255,0.85)';
+    ctx.fillText(f.name, f.x, f.y - size - 8);
+    ctx.restore();
+  }
+
   const dir = f.facing_right ? 1 : -1;
   ctx.save();
   ctx.translate(f.x, f.y);

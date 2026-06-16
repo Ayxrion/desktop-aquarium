@@ -13,6 +13,7 @@ const PALETTE = [0x00ee66, 0xffdd00, 0xff6600, 0xcc44ff, 0x44ddff, 0xff44aa, 0x0
 
 // Persistent fish so motion looks continuous.
 const fish = Array.from({ length: 14 }, (_, i) => ({
+  id: i,
   x: Math.random() * W,
   y: TOP + Math.random() * (H - TOP - 60),
   type: i < 2 ? 0 : i < 7 ? 1 : i < 11 ? 2 : 3,
@@ -54,6 +55,7 @@ function step() {
     time: { day_progress: dayProgress, mode: 'FAST' },
     counts: { pair: 2, school: 5, school2: 4, angel: 3 },
     fish: fish.map((f) => ({
+      id: f.id,
       x: Math.round(f.x), y: Math.round(f.y), z: 0.3, type: f.type,
       facing_right: f.facing_right, color: f.color,
       going_for_food: f.going_for_food, chasing: f.chasing,
