@@ -167,13 +167,13 @@ static int _buildTelemetryJson() {
         o = _tAppend(o,
             "%s{\"id\":%d,\"x\":%d,\"y\":%d,\"z\":%.3f,"
             "\"vx\":%.2f,\"vy\":%.2f,\"vz\":%.4f,"
-            "\"tx\":%d,\"ty\":%d,"
+            "\"tx\":%d,\"ty\":%d,\"wander_cd\":%d,"
             "\"type\":%d,\"facing_right\":%s,"
             "\"color\":%u,\"going_for_food\":%s,\"chasing\":%s}",
             first ? "" : ",", i,
             (int)f.x, (int)f.y, f.z,
             f.vx, f.vy, f.vz,
-            (int)f.tx, (int)f.ty,
+            (int)f.tx, (int)f.ty, (int)f.wanderCD,
             (int)f.type,
             f.facingRight ? "true" : "false",
             (unsigned)fishColor(i),
@@ -277,6 +277,67 @@ static void _telemetryTask(void*) {
     }
 }
 
+// ── Bootstrap (on-boot state restore) ────────────────────────────────────────
+// GETs /api/aquariums/:id/bootstrap and applies the server's last-known fish
+// positions, velocities, wander targets, and names to the live fish[] array.
+// Parsed with ArduinoJson; runs synchronously in setup() before the render loop.
+
+#include <ArduinoJson.h>
+
+static void telemetryBootstrap() {
+    if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
+    if (!_wifiEnsureConnected()) return;
+
+    // Build URL: strip /api/telemetry suffix if present, append bootstrap path.
+    String base = String(TELEMETRY_HOST);
+    if (base.endsWith("/api/telemetry")) base = base.substring(0, base.length() - 14);
+
+    String url = base + "/api/aquariums/" + TELEMETRY_AQUARIUM_ID + "/bootstrap";
+
+    WiFiClient client;
+    HTTPClient http;
+    if (!http.begin(client, url)) return;
+    http.addHeader("X-Api-Key", TELEMETRY_API_KEY);
+    http.setConnectTimeout(5000);
+    http.setTimeout(8000);
+    int code = http.GET();
+    if (code != 200) {
+        Serial.printf("Telemetry: bootstrap skipped (HTTP %d)\n", code);
+        http.end(); return;
+    }
+
+    // ArduinoJson: 8 KB covers 14 fish × ~200 bytes each + overhead.
+    DynamicJsonDocument doc(8192);
+    DeserializationError err = deserializeJson(doc, http.getStream());
+    http.end();
+    if (err || !doc["exists"].as<bool>()) {
+        Serial.println("Telemetry: no prior aquarium state on server");
+        return;
+    }
+
+    JsonArray fishArr = doc["fish"].as<JsonArray>();
+    for (JsonObject jf : fishArr) {
+        int id = jf["id"] | -1;
+        if (id < 0 || id >= MAX_FISH || !isFishActive(id)) continue;
+        Fish& f = fish[id];
+        f.x        = jf["x"]         | f.x;
+        f.y        = jf["y"]         | f.y;
+        f.vx       = jf["vx"]        | 0.0f;
+        f.vy       = jf["vy"]        | 0.0f;
+        f.tx       = jf["tx"]        | f.x;
+        f.ty       = jf["ty"]        | f.y;
+        f.wanderCD = jf["wander_cd"] | f.wanderCD;
+        f.chasing  = jf["chasing"]   | false;
+        const char* name = jf["name"];
+        if (name && name[0] != '\0') {
+            std::lock_guard<std::mutex> lk(_telemetryNameMutex);
+            strncpy(telemetryFishName[id], name, TELEMETRY_NAME_LEN - 1);
+            telemetryFishName[id][TELEMETRY_NAME_LEN - 1] = '\0';
+        }
+    }
+    Serial.println("Telemetry: aquarium state restored from server");
+}
+
 static void telemetryInit() {
     if (!_telemetryTaskHandle) {
         // Core 0; the Arduino loop runs on core 1. 8 KB stack covers plain-HTTP
@@ -287,6 +348,8 @@ static void telemetryInit() {
     if (telemetryEnabled && TELEMETRY_HOST[0] != '\0')
         Serial.printf("Telemetry: enabled -> %s as '%s' every %d ms\n",
                       TELEMETRY_HOST, TELEMETRY_AQUARIUM_ID, TELEMETRY_INTERVAL_MS);
+    // Restore last-known state from the server before the render loop starts.
+    telemetryBootstrap();
 }
 
 // Call once per loop(); rate-limited internally by TELEMETRY_INTERVAL_MS.

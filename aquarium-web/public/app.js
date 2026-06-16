@@ -10,69 +10,124 @@ const SCREEN_W = 800;
 const SCREEN_H = 480;
 
 // ─── Physics simulation (mirrors device updateFish, aquarium.ino / main.cpp) ──
-// Seek strengths and max velocities by fish type (0=pair,1=school,2=school2,3=angel).
-// These must match the device constants.
-const _SEEK  = [0.018, 0.012, 0.012, 0.020]; // seekStr per type
-const _MAXV  = [7.0,   5.5,   5.5,   7.0  ]; // max horizontal speed per type
 const _DAMP  = 0.85;
 const _DAMPZ = 0.88;
 
-// Boundary spring: mirrors boundAccel() on the device.
 function _bound(v, lo, hi, k) {
   if (v < lo) return (lo - v) * k;
   if (v > hi) return (hi - v) * k;
   return 0;
 }
 
-// Simulate n device frames forward from the snapshot state.
-// Uses the fish's own wander target (tx, ty) for seek acceleration —
-// the dominant force that the pure-decay formula was missing.
+// Single-fish approximation used only for blend-from captures (≤250ms window).
+// Does NOT include schooling forces — good enough for a visual blend start.
 function _extrapolateFish(f, elapsedMs, frameMs) {
-  const fm = frameMs || 50;
-  const n  = Math.round(Math.min(elapsedMs, 2000) / fm);
+  const fm  = frameMs || 50;
+  const n   = Math.round(Math.min(elapsedMs, 2000) / fm);
   if (n === 0) return f;
-
-  const type    = f.type || 0;
-  const seek    = _SEEK[type] ?? 0.012;
-  const maxV    = f.going_for_food ? 8.0 : (_MAXV[type] ?? 5.5);
-  const maxVy   = maxV * 0.5;
-  const tx      = f.tx ?? f.x;   // wander target; falls back to current pos if absent
-  const ty      = f.ty ?? f.y;
-
+  const type = f.type || 0;
+  const chasing = f.chasing && type === 0;
+  const seek = chasing ? 0.018 : (type === 3 ? 0.020 : 0.012);
+  const maxV = f.going_for_food ? 8.0 : (chasing || type === 3) ? 7.0 : 5.5;
+  const wcd  = typeof f.wander_cd === 'number' ? f.wander_cd : n;
+  const tx = f.tx ?? f.x, ty = f.ty ?? f.y;
   let x = f.x, y = f.y, z = f.z || 0;
   let vx = f.vx || 0, vy = f.vy || 0, vz = f.vz || 0;
-
   for (let i = 0; i < n; i++) {
-    // Seek wander target
-    let ax = (tx - x) * seek;
-    let ay = (ty - y) * seek;
-    let az = 0; // z target unknown; let it decay naturally
-
-    // Boundary springs (match device boundAccel with k=0.30)
-    ax += _bound(x, 30,            SCREEN_W - 30,  0.30);
-    ay += _bound(y, TANK_TOP + 20, SCREEN_H - 80,  0.30);
-    az += _bound(z, 0.0,           0.75,            0.08);
-
-    // Clamp, damp, move
-    vx = Math.max(-maxV,  Math.min(maxV,  vx + ax)) * _DAMP;
-    vy = Math.max(-maxVy, Math.min(maxVy, vy + ay)) * _DAMP;
-    vz = Math.max(-0.015, Math.min(0.015, vz + az)) * _DAMPZ;
-    x  = Math.max(5,            Math.min(SCREEN_W - 5,  x + vx));
-    y  = Math.max(TANK_TOP + 5, Math.min(SCREEN_H - 60, y + vy));
-    z  = Math.max(0,            Math.min(0.78,           z + vz));
+    const seeking = f.going_for_food || i < wcd;
+    let ax = (seeking ? (tx - x) * seek : 0) + _bound(x, 30, SCREEN_W - 30, 0.30);
+    let ay = (seeking ? (ty - y) * seek : 0) + _bound(y, TANK_TOP + 20, SCREEN_H - 80, 0.30);
+    let az = _bound(z, 0.0, 0.75, 0.08);
+    vx = Math.max(-maxV,      Math.min(maxV,      vx + ax)) * _DAMP;
+    vy = Math.max(-maxV*0.5,  Math.min(maxV*0.5,  vy + ay)) * _DAMP;
+    vz = Math.max(-0.015,     Math.min(0.015,     vz + az)) * _DAMPZ;
+    x  = Math.max(5,          Math.min(SCREEN_W - 5,  x + vx));
+    y  = Math.max(TANK_TOP+5, Math.min(SCREEN_H - 60, y + vy));
+    z  = Math.max(0,          Math.min(0.78,           z + vz));
   }
-
-  return {
-    ...f,
-    x: Math.round(x), y: Math.round(y), z,
-    facing_right: Math.abs(vx) > 0.4 ? vx > 0 : f.facing_right,
-  };
+  return { ...f, x: Math.round(x), y: Math.round(y), z,
+           facing_right: Math.abs(vx) > 0.4 ? vx > 0 : f.facing_right };
 }
 
+// Joint simulation: all fish stepped together each frame so school centroids
+// and pairwise separation forces update correctly — matching device updateFish().
 function _extrapolateSnapshot(snap, elapsedMs) {
-  if (!snap || !Array.isArray(snap.fish)) return snap;
+  if (!snap || !Array.isArray(snap.fish) || snap.fish.length === 0) return snap;
   const fm = snap.frame_ms || 50;
-  return { ...snap, fish: snap.fish.map((f) => _extrapolateFish(f, elapsedMs, fm)) };
+  const n  = Math.round(Math.min(elapsedMs, 2000) / fm);
+  if (n === 0) return snap;
+
+  // Working copies of mutable state
+  const st = snap.fish.map((f) => ({
+    id: f.id, type: f.type || 0,
+    x: f.x, y: f.y, z: f.z || 0,
+    vx: f.vx || 0, vy: f.vy || 0, vz: f.vz || 0,
+    tx: f.tx ?? f.x, ty: f.ty ?? f.y,
+    wcd: typeof f.wander_cd === 'number' ? f.wander_cd : n,
+    chasing: !!f.chasing, going_for_food: !!f.going_for_food,
+    facing_right: f.facing_right,
+  }));
+
+  for (let frame = 0; frame < n; frame++) {
+    // Recompute centroids from current positions each frame (matches device)
+    const cent = [0, 1, 2, 3].map((t) => {
+      const g = st.filter((f) => f.type === t);
+      if (!g.length) return { x: 0, y: 0 };
+      return { x: g.reduce((s, f) => s + f.x, 0) / g.length,
+               y: g.reduce((s, f) => s + f.y, 0) / g.length };
+    });
+
+    for (const f of st) {
+      f.wcd--;
+      const t = f.type;
+      const seeking = f.going_for_food || f.wcd >= 0;
+      const chasing = f.chasing && t === 0;
+      const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
+      const maxV    = f.going_for_food ? 8.0 : (chasing || t === 3) ? 7.0 : 5.5;
+
+      let ax = (seeking ? (f.tx - f.x) * seekStr : 0);
+      let ay = (seeking ? (f.ty - f.y) * seekStr : 0);
+
+      // Cohesion toward group centroid (school / angel)
+      if (t === 1 || t === 2) {
+        ax += (cent[t].x - f.x) * 0.010;
+        ay += (cent[t].y - f.y) * 0.007;
+      } else if (t === 3) {
+        ax += (cent[3].x - f.x) * 0.012;
+        ay += (cent[3].y - f.y) * 0.010;
+      }
+
+      // Pairwise separation within school / angel groups
+      const sepR2 = (t === 3) ? 60 * 60 : 80 * 80;
+      const sepK  = (t === 3) ? 7 : 8;
+      if (t === 1 || t === 2 || t === 3) {
+        for (const o of st) {
+          if (o === f || o.type !== t) continue;
+          const dx = f.x - o.x, dy = f.y - o.y;
+          const d2 = dx * dx + dy * dy;
+          if (d2 < sepR2 && d2 > 0.01) { const inv = sepK / d2; ax += dx * inv; ay += dy * inv; }
+        }
+      }
+
+      // Boundary springs
+      ax += _bound(f.x, 30, SCREEN_W - 30, 0.30);
+      ay += _bound(f.y, TANK_TOP + 20, SCREEN_H - 80, 0.30);
+
+      f.vx = Math.max(-maxV,     Math.min(maxV,     f.vx + ax)) * _DAMP;
+      f.vy = Math.max(-maxV*0.5, Math.min(maxV*0.5, f.vy + ay)) * _DAMP;
+      f.x  = Math.max(5,         Math.min(SCREEN_W - 5,  f.x + f.vx));
+      f.y  = Math.max(TANK_TOP+5,Math.min(SCREEN_H - 60, f.y + f.vy));
+      if (Math.abs(f.vx) > 0.4) f.facing_right = f.vx > 0;
+    }
+  }
+
+  const fishOut = snap.fish.map((orig, i) => ({
+    ...orig,
+    x: Math.round(st[i].x), y: Math.round(st[i].y), z: st[i].z,
+    vx: st[i].vx, vy: st[i].vy,
+    facing_right: st[i].facing_right,
+  }));
+  return { ...snap, fish: fishOut };
 }
 
 let selectedId = null;
@@ -156,20 +211,25 @@ function select(id) {
 
 function applySnapshot(snap) {
   const now = Date.now();
+  // _lastSeenMs is when the server received the telemetry POST — the closest
+  // proxy to when the device built the snapshot. Back-dating snapshotReceivedAt
+  // to that point compensates for POST + SSE latency (~50–150 ms on LAN).
+  const serverRx = (snap._lastSeenMs && snap._lastSeenMs <= now) ? snap._lastSeenMs : now;
+
   // Capture each fish's current predicted position before replacing the snapshot,
   // so we can blend smoothly from there to the new snapshot's trajectory.
   if (latestSnapshot) {
-    const oldElapsed = now - snapshotReceivedAt;
+    const oldElapsed = serverRx - snapshotReceivedAt;
     const oldFm = latestSnapshot.frame_ms || 50;
     _blendFrom.clear();
     for (const f of (latestSnapshot.fish || [])) {
-      const p = _extrapolateFish(f, oldElapsed, oldFm);
+      const p = _extrapolateFish(f, Math.max(0, oldElapsed), oldFm);
       _blendFrom.set(f.id, { x: p.x, y: p.y });
     }
     _blendStartMs = now;
   }
   latestSnapshot = snap;
-  snapshotReceivedAt = now;
+  snapshotReceivedAt = serverRx;
   // Legend, stats, and title update at telemetry rate (≤1 Hz) — cheap DOM work.
   drawTitle(snap);
   drawStats(snap);
@@ -188,10 +248,8 @@ function _rafDraw() {
   const elapsed = now - snapshotReceivedAt;
   const fm = latestSnapshot.frame_ms || 50;
 
-  // Build extrapolated snapshot, then smooth any blend in progress.
   const blendAge = _blendStartMs ? now - _blendStartMs : BLEND_MS;
   if (blendAge >= BLEND_MS) {
-    // No active blend — straight extrapolation.
     drawTank(_extrapolateSnapshot(latestSnapshot, elapsed));
     return;
   }
@@ -252,7 +310,6 @@ function startWatchdog() {
 // Horizontal current band across the mid-tank. Fish drift left to right.
 const EAC_Y1 = 180, EAC_Y2 = 270;   // horizontal band (mid-tank)
 const EAC_MAX_FISH = 12;
-const EAC_MIN_FISH = 2;             // always visible even at 0 congestion
 
 let eacFish = [];
 let eacTargetCount = 0;
@@ -271,7 +328,7 @@ function eacSpawnFish(startX) {
 }
 
 function updateEacCount(congestion) {
-  eacTargetCount = EAC_MIN_FISH + Math.round(congestion * (EAC_MAX_FISH - EAC_MIN_FISH));
+  eacTargetCount = Math.round(congestion * EAC_MAX_FISH);
 }
 
 function tickEac(frameCount) {
@@ -288,9 +345,10 @@ function tickEac(frameCount) {
 }
 
 function drawEacZone(bright) {
+  // No zone tint — silhouettes only
   ctx.save();
-  ctx.globalAlpha = 0.28 * bright + 0.10;
-  ctx.fillStyle = '#7a9db8';  // light blue-gray, reads as pale silhouette on dark water
+  ctx.globalAlpha = 0.13 * bright + 0.04;  // very faint, brightest at noon
+  ctx.fillStyle = '#061c2e';
   for (const f of eacFish) {
     drawSilhouetteFish(f.x, f.y, f.size);
   }
@@ -630,12 +688,14 @@ function escapeHtml(str) {
 }
 
 // ─── Traffic monitor ─────────────────────────────────────────────────────────
-let trafficZip = '';
+let trafficZip = localStorage.getItem('traffic_zip') || '';
 let trafficTimer = null;
 
 const zipInput = document.getElementById('zip-input');
 const zipGo = document.getElementById('zip-go');
 const trafficStatus = document.getElementById('traffic-status');
+
+if (trafficZip) zipInput.value = trafficZip;
 
 function congestionLabel(c) {
   if (c < 0.15) return 'Free flow';
@@ -682,42 +742,23 @@ function startTrafficPolling(zip) {
   trafficTimer = setInterval(() => fetchTraffic(zip), 60_000);
 }
 
-async function applyZip() {
+function applyZip() {
   const zip = zipInput.value.trim();
   if (!/^\d{5}$/.test(zip)) {
     trafficStatus.textContent = 'Enter a valid 5-digit ZIP code.';
     return;
   }
-  // Save to server so the ESP picks it up
-  try {
-    await fetch('api/traffic/zip', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ zip }),
-    });
-  } catch { /* non-fatal — still poll traffic below */ }
   trafficZip = zip;
+  localStorage.setItem('traffic_zip', zip);
   startTrafficPolling(zip);
 }
 
 zipGo.addEventListener('click', applyZip);
 zipInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyZip(); });
 
-// Load ZIP from server on startup
-async function initTrafficZip() {
-  try {
-    const res = await fetch('api/traffic/zip');
-    const data = await res.json();
-    if (data.ok && /^\d{5}$/.test(data.zip)) {
-      trafficZip = data.zip;
-      zipInput.value = data.zip;
-      startTrafficPolling(data.zip);
-    }
-  } catch { /* no zip configured yet */ }
-}
+if (trafficZip) startTrafficPolling(trafficZip);
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
 refreshList();
 setInterval(refreshList, 5000);
 startWatchdog();
-initTrafficZip();

@@ -2,12 +2,14 @@
 
 // In-memory store of the latest telemetry snapshot per aquarium, plus per-fish
 // names and age tracking, plus a tiny pub/sub used to push updates to SSE
-// subscribers. State is ephemeral (live view) but persists for the life of the
-// process — a restart simply waits for the next telemetry post.
+// subscribers. State is persisted to SQLite (via db.js) and restored on startup
+// so a server restart doesn't lose aquarium history or fish names.
 //
 // Fish identity is the device-provided `id` (the fish's stable array slot).
 // Names are keyed by (aquarium_id, fish_id); age is derived from when the
 // server first saw a given fish id (reset if the fish was absent for a while).
+
+const db = require('./db');
 
 const STALE_MS = parseInt(process.env.STALE_MS || '15000', 10);
 const MAX_AQUARIUMS = parseInt(process.env.MAX_AQUARIUMS || '64', 10);
@@ -15,11 +17,8 @@ const FISH_GAP_MS = parseInt(process.env.FISH_GAP_MS || '10000', 10); // absence
 const MAX_NAME_LEN = 24;
 
 // Physics simulation matching the device (aquarium.ino / main.cpp).
-// Seek strengths and max velocities by fish type (0=pair,1=school,2=school2,3=angel).
-const _SEEK  = [0.018, 0.012, 0.012, 0.020];
-const _MAXV  = [7.0,   5.5,   5.5,   7.0  ];
 const _DAMP  = 0.85;
-const _DAMPZ = 0.88;
+const TANK_TOP = 72, SCREEN_W = 800, SCREEN_H = 480;
 
 function _bound(v, lo, hi, k) {
   if (v < lo) return (lo - v) * k;
@@ -27,30 +26,65 @@ function _bound(v, lo, hi, k) {
   return 0;
 }
 
-function _extrapolateFish(f, elapsedMs, frameMs) {
-  const fm   = frameMs || 50;
-  const n    = Math.round(Math.min(elapsedMs, 3000) / fm);
-  if (n === 0) return f;
-  const type  = f.type || 0;
-  const seek  = _SEEK[type] ?? 0.012;
-  const maxV  = f.going_for_food ? 8.0 : (_MAXV[type] ?? 5.5);
-  const maxVy = maxV * 0.5;
-  const tx = f.tx ?? f.x, ty = f.ty ?? f.y;
-  const TANK_TOP = 72, SCREEN_W = 800, SCREEN_H = 480;
-  let x = f.x, y = f.y, z = f.z || 0;
-  let vx = f.vx || 0, vy = f.vy || 0, vz = f.vz || 0;
-  for (let i = 0; i < n; i++) {
-    let ax = (tx - x) * seek + _bound(x, 30, SCREEN_W - 30, 0.30);
-    let ay = (ty - y) * seek + _bound(y, TANK_TOP + 20, SCREEN_H - 80, 0.30);
-    let az = _bound(z, 0.0, 0.75, 0.08);
-    vx = Math.max(-maxV,  Math.min(maxV,  vx + ax)) * _DAMP;
-    vy = Math.max(-maxVy, Math.min(maxVy, vy + ay)) * _DAMP;
-    vz = Math.max(-0.015, Math.min(0.015, vz + az)) * _DAMPZ;
-    x  = Math.max(5,            Math.min(SCREEN_W - 5,  x + vx));
-    y  = Math.max(TANK_TOP + 5, Math.min(SCREEN_H - 60, y + vy));
-    z  = Math.max(0,            Math.min(0.78,           z + vz));
+// Joint simulation: all fish stepped together each frame so school centroids
+// and pairwise separation forces match the device's updateFish() exactly.
+function _extrapolateSnapshot(snapshot, elapsedMs) {
+  const fish = snapshot && Array.isArray(snapshot.fish) ? snapshot.fish : [];
+  if (!fish.length) return snapshot;
+  const fm = snapshot.frame_ms || 50;
+  const n  = Math.round(Math.min(elapsedMs, 3000) / fm);
+  if (n === 0) return snapshot;
+
+  const st = fish.map((f) => ({
+    id: f.id, type: f.type || 0,
+    x: f.x, y: f.y, z: f.z || 0,
+    vx: f.vx || 0, vy: f.vy || 0, vz: f.vz || 0,
+    tx: f.tx ?? f.x, ty: f.ty ?? f.y,
+    wcd: typeof f.wander_cd === 'number' ? f.wander_cd : n,
+    chasing: !!f.chasing, going_for_food: !!f.going_for_food,
+  }));
+
+  for (let frame = 0; frame < n; frame++) {
+    const cent = [0, 1, 2, 3].map((t) => {
+      const g = st.filter((f) => f.type === t);
+      if (!g.length) return { x: 0, y: 0 };
+      return { x: g.reduce((s, f) => s + f.x, 0) / g.length,
+               y: g.reduce((s, f) => s + f.y, 0) / g.length };
+    });
+    for (const f of st) {
+      f.wcd--;
+      const t = f.type, chasing = f.chasing && t === 0;
+      const seeking = f.going_for_food || f.wcd >= 0;
+      const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
+      const maxV    = f.going_for_food ? 8.0 : (chasing || t === 3) ? 7.0 : 5.5;
+      let ax = seeking ? (f.tx - f.x) * seekStr : 0;
+      let ay = seeking ? (f.ty - f.y) * seekStr : 0;
+      if (t === 1 || t === 2) {
+        ax += (cent[t].x - f.x) * 0.010; ay += (cent[t].y - f.y) * 0.007;
+      } else if (t === 3) {
+        ax += (cent[3].x - f.x) * 0.012; ay += (cent[3].y - f.y) * 0.010;
+      }
+      const sepR2 = t === 3 ? 60*60 : 80*80, sepK = t === 3 ? 7 : 8;
+      if (t === 1 || t === 2 || t === 3) {
+        for (const o of st) {
+          if (o === f || o.type !== t) continue;
+          const dx = f.x - o.x, dy = f.y - o.y, d2 = dx*dx + dy*dy;
+          if (d2 < sepR2 && d2 > 0.01) { const inv = sepK/d2; ax += dx*inv; ay += dy*inv; }
+        }
+      }
+      ax += _bound(f.x, 30, SCREEN_W - 30, 0.30);
+      ay += _bound(f.y, TANK_TOP + 20, SCREEN_H - 80, 0.30);
+      f.vx = Math.max(-maxV,     Math.min(maxV,     f.vx + ax)) * _DAMP;
+      f.vy = Math.max(-maxV*0.5, Math.min(maxV*0.5, f.vy + ay)) * _DAMP;
+      f.x  = Math.max(5,          Math.min(SCREEN_W - 5,  f.x + f.vx));
+      f.y  = Math.max(TANK_TOP+5, Math.min(SCREEN_H - 60, f.y + f.vy));
+    }
   }
-  return { ...f, x: Math.round(x), y: Math.round(y), z };
+
+  const fishOut = fish.map((orig, i) => ({
+    ...orig, x: Math.round(st[i].x), y: Math.round(st[i].y), z: st[i].z,
+  }));
+  return { ...snapshot, fish: fishOut };
 }
 
 /**
@@ -60,6 +94,31 @@ function _extrapolateFish(f, elapsedMs, frameMs) {
  */
 /** @type {Map<string, Entry>} */
 const aquariums = new Map();
+
+// Restore persisted state on startup so the server is immediately useful after
+// a restart without waiting for the next device telemetry post.
+(function _restore() {
+  const rows = db.loadAll();
+  for (const row of rows) {
+    if (!row.snapshot) continue;
+    const entry = {
+      snapshot: row.snapshot,
+      lastSeenMs: row.lastSeenMs,
+      createdAt: row.createdAt,
+      names: row.names,           // Map<fishId, name> from DB
+      meta: new Map(),
+    };
+    // Re-seed fish meta from the persisted snapshot so ageMs is meaningful.
+    if (Array.isArray(row.snapshot.fish)) {
+      for (const f of row.snapshot.fish) {
+        if (typeof f.id === 'number')
+          entry.meta.set(f.id, { firstSeenMs: row.createdAt, lastSeenMs: row.lastSeenMs });
+      }
+    }
+    aquariums.set(row.id, entry);
+  }
+  if (rows.length) console.log(`Store: restored ${rows.length} aquarium(s) from DB`);
+})();
 
 /** @type {Set<(snapshot: object) => void>} */
 const subscribers = new Set();
@@ -82,7 +141,7 @@ function sanitizeName(name) {
 function getOrCreate(id) {
   let entry = aquariums.get(id);
   if (!entry) {
-    entry = { snapshot: null, lastSeenMs: 0, names: new Map(), meta: new Map() };
+    entry = { snapshot: null, lastSeenMs: 0, createdAt: now(), names: new Map(), meta: new Map() };
     aquariums.set(id, entry);
   }
   return entry;
@@ -128,11 +187,7 @@ function enrichExtrapolated(entry) {
   const base = enrich(entry);
   if (!base) return null;
   const elapsedMs = now() - entry.lastSeenMs;
-  const frameMs = (entry.snapshot && entry.snapshot.frame_ms) || 50;
-  return {
-    ...base,
-    fish: base.fish.map((f) => _extrapolateFish(f, elapsedMs, frameMs)),
-  };
+  return _extrapolateSnapshot(base, elapsedMs);
 }
 
 function broadcast(entry) {
@@ -154,9 +209,11 @@ function upsert(snapshot) {
     return { ok: false, error: 'max_aquariums_reached' };
   }
   const entry = getOrCreate(id);
+  const t = now();
   entry.snapshot = snapshot;
-  entry.lastSeenMs = now();
+  entry.lastSeenMs = t;
   if (Array.isArray(snapshot.fish)) updateFishMeta(entry, snapshot.fish);
+  db.saveSnapshot(id, snapshot, t, entry.createdAt);
   broadcast(entry);
   return { ok: true };
 }
@@ -178,6 +235,7 @@ function setName(aquariumId, fishId, rawName) {
   if (name === null) return { ok: false, error: 'invalid_name' };
   if (name === '') entry.names.delete(fishId);
   else entry.names.set(fishId, name);
+  db.saveName(aquariumId, fishId, name);
   broadcast(entry); // open dashboards update immediately
   return { ok: true, name };
 }
@@ -211,12 +269,42 @@ function get(id) {
   return enrichExtrapolated(entry);
 }
 
+// Bootstrap response for a device that just booted. Returns the last-persisted
+// snapshot with names embedded in each fish object so the device can restore
+// positions and names in one call. Returns null if no record exists yet.
+function bootstrap(id) {
+  // Prefer in-memory (may have names set since last snapshot), fall back to DB.
+  const entry = aquariums.get(id);
+  if (!entry || !entry.snapshot) {
+    // Try DB directly in case the server just restarted and hasn't received a
+    // telemetry post yet (loadAll already ran, so this is a true miss).
+    return null;
+  }
+  const s = entry.snapshot;
+  const snapshotAgeMs = now() - entry.lastSeenMs;
+  const fish = Array.isArray(s.fish)
+    ? s.fish.map((f) => ({
+        ...f,
+        name: entry.names.get(f.id) || null,
+      }))
+    : [];
+  return {
+    exists: true,
+    aquarium_id: id,
+    snapshot_age_ms: snapshotAgeMs,
+    created_at: entry.createdAt,
+    fish,
+    counts: s.counts || null,
+    screen: s.screen || null,
+  };
+}
+
 function subscribe(fn) {
   subscribers.add(fn);
   return () => subscribers.delete(fn);
 }
 
 module.exports = {
-  upsert, list, get, subscribe, setName, getNamesText,
+  upsert, list, get, bootstrap, subscribe, setName, getNamesText,
   STALE_MS, MAX_AQUARIUMS,
 };

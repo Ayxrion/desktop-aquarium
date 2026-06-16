@@ -172,13 +172,13 @@ static std::string _buildTelemetryJson() {
         snprintf(tmp, sizeof(tmp),
             "%s{\"id\":%d,\"x\":%d,\"y\":%d,\"z\":%.3f,"
             "\"vx\":%.2f,\"vy\":%.2f,\"vz\":%.4f,"
-            "\"tx\":%d,\"ty\":%d,"
+            "\"tx\":%d,\"ty\":%d,\"wander_cd\":%d,"
             "\"type\":%d,\"facing_right\":%s,"
             "\"color\":%u,\"going_for_food\":%s,\"chasing\":%s}",
             first ? "" : ",", i,
             (int)f.x, (int)f.y, f.z,
             f.vx, f.vy, f.vz,
-            (int)f.tx, (int)f.ty,
+            (int)f.tx, (int)f.ty, (int)f.wanderCD,
             (int)f.type,
             f.facingRight ? "true" : "false",
             (unsigned)fishColor(i),
@@ -307,6 +307,151 @@ static void _telemetryWorker() {
     }
 }
 
+// ── Bootstrap (on-boot state restore) ────────────────────────────────────────
+// GETs /api/aquariums/:id/bootstrap and applies the server's last-known fish
+// positions, velocities, wander targets, and names to the live fish[] array.
+// Called synchronously from telemetryInit() before the render loop starts.
+
+struct _BootstrapResp { char data[16384]; size_t len; };
+static size_t _bootstrapCapture(void* ptr, size_t sz, size_t n, void* ud) {
+    _BootstrapResp* r = static_cast<_BootstrapResp*>(ud);
+    size_t bytes = sz * n;
+    if (r->len + bytes < sizeof(r->data) - 1) {
+        memcpy(r->data + r->len, ptr, bytes);
+        r->len += bytes;
+        r->data[r->len] = '\0';
+    }
+    return bytes;
+}
+
+// Tiny helper: find `"key":value` (number) in a JSON object starting at p.
+static bool _jGetInt(const char* p, const char* key, int* out) {
+    char needle[64]; snprintf(needle, sizeof(needle), "\"%s\":", key);
+    const char* f = strstr(p, needle);
+    if (!f) return false;
+    f += strlen(needle);
+    while (*f == ' ') f++;
+    *out = atoi(f);
+    return true;
+}
+static bool _jGetFloat(const char* p, const char* key, float* out) {
+    char needle[64]; snprintf(needle, sizeof(needle), "\"%s\":", key);
+    const char* f = strstr(p, needle);
+    if (!f) return false;
+    f += strlen(needle);
+    while (*f == ' ') f++;
+    *out = (float)atof(f);
+    return true;
+}
+static bool _jGetBool(const char* p, const char* key, bool* out) {
+    char needle[64]; snprintf(needle, sizeof(needle), "\"%s\":", key);
+    const char* f = strstr(p, needle);
+    if (!f) return false;
+    f += strlen(needle);
+    while (*f == ' ') f++;
+    *out = (*f == 't');
+    return true;
+}
+// Returns pointer to the value string content (in-place) and its length.
+static bool _jGetStr(const char* p, const char* key, const char** start, size_t* len) {
+    char needle[64]; snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    const char* f = strstr(p, needle);
+    if (!f) return false;
+    f += strlen(needle);
+    const char* end = strchr(f, '"');
+    if (!end) return false;
+    *start = f; *len = (size_t)(end - f);
+    return true;
+}
+
+static void _applyBootstrap(const char* json) {
+    // Quick existence check
+    if (!strstr(json, "\"exists\":true")) return;
+
+    // Find the "fish":[ array
+    const char* arrStart = strstr(json, "\"fish\":[");
+    if (!arrStart) return;
+    arrStart += 8; // skip past "fish":[
+
+    const char* p = arrStart;
+    while ((p = strchr(p, '{')) != nullptr) {
+        // Find matching closing brace for this fish object
+        int depth = 0; const char* end = p;
+        while (*end) {
+            if (*end == '{') depth++;
+            else if (*end == '}') { if (--depth == 0) { end++; break; } }
+            end++;
+        }
+        // Null-terminate a local copy of this fish object
+        size_t objLen = (size_t)(end - p);
+        if (objLen >= 512) { p = end; continue; }
+        char obj[512]; memcpy(obj, p, objLen); obj[objLen] = '\0';
+
+        int id = -1;
+        if (!_jGetInt(obj, "id", &id) || id < 0 || id >= MAX_FISH || !isFishActive(id)) {
+            p = end; continue;
+        }
+        Fish& f = fish[id];
+
+        int iv; float fv; bool bv;
+        if (_jGetInt(obj, "x",         &iv)) f.x        = (float)iv;
+        if (_jGetInt(obj, "y",         &iv)) f.y        = (float)iv;
+        if (_jGetFloat(obj, "vx",      &fv)) f.vx       = fv;
+        if (_jGetFloat(obj, "vy",      &fv)) f.vy       = fv;
+        if (_jGetInt(obj, "tx",        &iv)) f.tx       = (float)iv;
+        if (_jGetInt(obj, "ty",        &iv)) f.ty       = (float)iv;
+        if (_jGetInt(obj, "wander_cd", &iv)) f.wanderCD = (float)iv;
+        if (_jGetBool(obj, "chasing",  &bv)) f.chasing  = bv;
+
+        const char* ns; size_t nl;
+        if (_jGetStr(obj, "name", &ns, &nl) && nl > 0) {
+            std::lock_guard<std::mutex> lk(_telemetryNameMutex);
+            if (nl >= TELEMETRY_NAME_LEN) nl = TELEMETRY_NAME_LEN - 1;
+            memcpy(telemetryFishName[id], ns, nl);
+            telemetryFishName[id][nl] = '\0';
+        }
+        p = end;
+    }
+    printf("Telemetry: aquarium state restored from server\n");
+}
+
+static void telemetryBootstrap() {
+    if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
+
+    std::string url = std::string(TELEMETRY_HOST)
+        + "/api/aquariums/" + TELEMETRY_AQUARIUM_ID + "/bootstrap";
+    std::string keyHeader = std::string("X-Api-Key: ") + TELEMETRY_API_KEY;
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return;
+
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, keyHeader.c_str());
+
+    _BootstrapResp resp = {};
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, _bootstrapCapture);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 8L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+    CURLcode res = curl_easy_perform(curl);
+    long httpCode = 0;
+    if (res == CURLE_OK)
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+
+    if (res == CURLE_OK && httpCode == 200)
+        _applyBootstrap(resp.data);
+    else
+        printf("Telemetry: bootstrap skipped (%s)\n",
+               res != CURLE_OK ? curl_easy_strerror(res) : "no prior state");
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+}
+
 static void telemetryInit() {
     // curl_global_init must run once on the main thread before the worker uses
     // libcurl (the lazy init inside curl_easy_init is not thread-safe).
@@ -319,6 +464,8 @@ static void telemetryInit() {
     if (telemetryEnabled && TELEMETRY_HOST[0] != '\0')
         printf("Telemetry: enabled → %s/api/telemetry as '%s' every %d ms\n",
                TELEMETRY_HOST, TELEMETRY_AQUARIUM_ID, TELEMETRY_INTERVAL_MS);
+    // Restore last-known state from the server before the render loop starts.
+    telemetryBootstrap();
 }
 
 // Call once per loop(); rate-limited internally by TELEMETRY_INTERVAL_MS.
