@@ -53,7 +53,7 @@ jobs:
             "${{ secrets.WEATHER_API_KEY }}" \
             "${{ secrets.WEATHER_LAT }}" "${{ secrets.WEATHER_LON }}" \
             "${{ secrets.TIMEZONE_OFFSET_HOURS || '0' }}" \
-            "${{ secrets.TELEMETRY_HOST || 'http://107.214.184.24/aquarium' }}" \
+            "${{ secrets.TELEMETRY_HOST || 'http://107.214.184.24/aquarium/api/telemetry' }}" \
             > aquarium/wifi_config.h
 
       # PlatformIO's LDF only scans src/ — copy all headers there so it
