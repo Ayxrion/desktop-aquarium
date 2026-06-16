@@ -91,9 +91,18 @@ static void checkForOTAUpdate() {
         http.addHeader("User-Agent", "ESP32-Aquarium/" FIRMWARE_VERSION);
         http.addHeader("Accept",     "application/vnd.github.v3+json");
         http.setTimeout(10000);
+        http.collectHeaders((const char*[]){"Content-Type"}, 1);
 
         {
             int code = http.GET();
+
+            String ct = http.header("Content-Type");
+            if (code == 200 && !ct.startsWith("application/json") && ct.length() > 0) {
+                _otaStatus("OTA: Bad response (captive portal?)");
+                delay(1500);
+                http.end();
+                goto done;
+            }
 
             if (code == 404) {
                 _otaStatus("OTA: No releases published yet");
@@ -109,7 +118,7 @@ static void checkForOTAUpdate() {
                 goto done;
             }
 
-            StaticJsonDocument<96> filter;
+            StaticJsonDocument<256> filter;
             filter["tag_name"]                          = true;
             filter["assets"][0]["name"]                 = true;
             filter["assets"][0]["browser_download_url"] = true;
