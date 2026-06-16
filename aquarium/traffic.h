@@ -1,11 +1,11 @@
 #pragma once
 // Fetches real-time traffic congestion from the aquarium web server.
 // Returns a 0.0–1.0 congestion ratio (0 = free flow, 1 = gridlock).
-// Requires TRAFFIC_API_URL and TRAFFIC_ZIP in wifi_config.h.
+// ZIP code is configured server-side via the dashboard — not needed here.
+// Requires TRAFFIC_API_URL in wifi_config.h.
 //
-// Example wifi_config.h entries:
+// Example wifi_config.h entry:
 //   #define TRAFFIC_API_URL "http://107.214.184.24/aquarium/api/traffic"
-//   #define TRAFFIC_ZIP     "90210"
 
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -24,7 +24,7 @@ static bool _fetchTraffic(float& outCongestion) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   char url[256];
-  snprintf(url, sizeof(url), "%s?zip=%s", TRAFFIC_API_URL, TRAFFIC_ZIP);
+  snprintf(url, sizeof(url), "%s/current", TRAFFIC_API_URL);
 
   HTTPClient http;
   http.setTimeout(10000);

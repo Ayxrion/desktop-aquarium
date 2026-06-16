@@ -48,7 +48,7 @@ jobs:
       #   TELEMETRY_HOST   — e.g. "http://107.214.184.24/aquarium"
       - name: Create wifi_config.h from secrets
         run: |
-          printf '#pragma once\n#define WIFI_SSID "%s"\n#define WIFI_PASSWORD "%s"\n#define WEATHER_API_KEY "%s"\n#define WEATHER_LAT "%s"\n#define WEATHER_LON "%s"\n#define TIMEZONE_OFFSET_HOURS %s\n#define TELEMETRY_ENABLED 1\n#define TELEMETRY_HOST "%s"\n#define TELEMETRY_API_KEY "%s"\n#define TELEMETRY_AQUARIUM_ID "esp-aquarium"\n#define TELEMETRY_INTERVAL_MS 1000\n#define TRAFFIC_API_URL "%s"\n#define TRAFFIC_ZIP "%s"\n' \
+          printf '#pragma once\n#define WIFI_SSID "%s"\n#define WIFI_PASSWORD "%s"\n#define WEATHER_API_KEY "%s"\n#define WEATHER_LAT "%s"\n#define WEATHER_LON "%s"\n#define TIMEZONE_OFFSET_HOURS %s\n#define TELEMETRY_ENABLED 1\n#define TELEMETRY_HOST "%s"\n#define TELEMETRY_API_KEY "%s"\n#define TELEMETRY_AQUARIUM_ID "esp-aquarium"\n#define TELEMETRY_INTERVAL_MS 1000\n#define TRAFFIC_API_URL "%s"\n' \
             "${{ secrets.WIFI_SSID }}" "${{ secrets.WIFI_PASSWORD }}" \
             "${{ secrets.WEATHER_API_KEY }}" \
             "${{ secrets.WEATHER_LAT }}" "${{ secrets.WEATHER_LON }}" \
@@ -56,7 +56,6 @@ jobs:
             "${{ secrets.TELEMETRY_HOST || 'http://107.214.184.24/aquarium/api/telemetry' }}" \
             "${{ secrets.TELEMETRY_API_KEY || 'change-me' }}" \
             "${{ secrets.TRAFFIC_API_URL || 'http://107.214.184.24/aquarium/api/traffic' }}" \
-            "${{ secrets.TRAFFIC_ZIP || '90210' }}" \
             > aquarium/wifi_config.h
 
       # PlatformIO's LDF only scans src/ — copy all headers there so it

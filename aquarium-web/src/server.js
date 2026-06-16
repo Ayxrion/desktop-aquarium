@@ -66,7 +66,47 @@ app.post('/api/aquariums/:id/fish/:fishId/name', (req, res) => {
   return res.json(result);
 });
 
-// ─── Traffic ────────────────────────────────────────────────────────────────
+// ─── Traffic ZIP config (persisted to disk across restarts) ──────────────────
+const ZIP_FILE = path.join(__dirname, '..', 'data', 'traffic_zip.json');
+
+function _loadZip() {
+  try { return JSON.parse(fs.readFileSync(ZIP_FILE, 'utf8')).zip || ''; } catch { return ''; }
+}
+function _saveZip(zip) {
+  try {
+    fs.mkdirSync(path.dirname(ZIP_FILE), { recursive: true });
+    fs.writeFileSync(ZIP_FILE, JSON.stringify({ zip }));
+  } catch (e) { console.warn('Could not persist traffic ZIP:', e.message); }
+}
+
+let activeZip = _loadZip() || (process.env.TRAFFIC_ZIP || '');
+
+app.get('/api/traffic/zip', (_req, res) => res.json({ ok: true, zip: activeZip }));
+
+app.post('/api/traffic/zip', (req, res) => {
+  const zip = typeof req.body?.zip === 'string' ? req.body.zip.trim() : '';
+  if (!/^\d{5}$/.test(zip)) {
+    return res.status(400).json({ ok: false, error: 'zip must be a 5-digit US zip code' });
+  }
+  activeZip = zip;
+  _saveZip(zip);
+  return res.json({ ok: true, zip });
+});
+
+// Used by the ESP — returns congestion for the server-configured ZIP.
+app.get('/api/traffic/current', async (_req, res) => {
+  if (!activeZip) return res.status(404).json({ ok: false, error: 'no zip configured' });
+  if (!traffic.hasKey()) return res.status(503).json({ ok: false, error: 'TOMTOM_API_KEY not configured' });
+  try {
+    const result = await traffic.fetchFlow(activeZip);
+    return res.json({ ok: true, zip: activeZip, ...result });
+  } catch (err) {
+    console.error('traffic fetch error:', err.message);
+    return res.status(502).json({ ok: false, error: err.message });
+  }
+});
+
+// ─── Traffic (browser — explicit zip) ────────────────────────────────────────
 app.get('/api/traffic', async (req, res) => {
   const zip = typeof req.query.zip === 'string' ? req.query.zip.trim() : '';
   if (!/^\d{5}$/.test(zip)) {
