@@ -1,96 +1,90 @@
 #pragma once
 // Fetches real-time traffic congestion from the aquarium web server.
-// Returns a 0.0–1.0 congestion ratio (0 = free flow, 1 = gridlock).
-// ZIP code is configured server-side via the dashboard — not needed here.
+// Runs on a background FreeRTOS task (core 0) so the main render loop
+// (core 1) is never blocked by the HTTP fetch.
 // Requires TRAFFIC_API_URL in wifi_config.h.
 
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "wifi_config.h"
 
-static float    _trafficCongestion  = 0.0f;
-static uint32_t _lastTrafficMs      = 0;
-static bool     _lastTrafficOk      = false;
+static volatile float _trafficCongestion = 0.0f;
+static TaskHandle_t   _trafficTaskHandle = nullptr;
 
-static const uint32_t _TRAFFIC_INTERVAL       = 90UL  * 1000UL;  // 90 s on success
-static const uint32_t _TRAFFIC_RETRY_INTERVAL = 60UL  * 1000UL;  // 60 s on failure
+static const uint32_t _TRAFFIC_FETCH_INTERVAL_MS = 90UL * 1000UL;  // 90 s between fetches
+static const uint32_t _TRAFFIC_RETRY_MS           = 60UL * 1000UL;  // 60 s on failure
 
-static bool _fetchTraffic(float& outCongestion) {
-  // Reuse the WiFi connection already established by weather.h — reconnect if needed.
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[traffic] WiFi not connected, skipping fetch");
-    return false;
-  }
+static bool _doFetchTraffic(float& outCongestion) {
+  if (WiFi.status() != WL_CONNECTED) return false;
 
   char url[256];
   snprintf(url, sizeof(url), "%s/current", TRAFFIC_API_URL);
-  Serial.printf("[traffic] GET %s  (heap free: %u)\n", url, ESP.getFreeHeap());
 
   WiFiClient client;
   HTTPClient http;
-  http.setTimeout(12000);  // 12 s — matches weather timeout
+  http.setTimeout(10000);
 
   if (!http.begin(client, url)) {
-    Serial.println("[traffic] http.begin() failed");
+    http.end();
     return false;
   }
 
   bool success = false;
   int  code    = http.GET();
-  Serial.printf("[traffic] HTTP %d\n", code);
 
   if (code == HTTP_CODE_OK) {
     String body = http.getString();
-    Serial.printf("[traffic] body: %s\n", body.c_str());
-
     DynamicJsonDocument doc(512);
-    DeserializationError err = deserializeJson(doc, body);
-    if (err) {
-      Serial.printf("[traffic] JSON parse error: %s\n", err.c_str());
-    } else {
+    if (!deserializeJson(doc, body)) {
       bool ok = doc["ok"] | false;
       if (ok) {
         float c = doc["congestion"] | -1.0f;
-        Serial.printf("[traffic] congestion=%.3f\n", c);
         if (c >= 0.0f && c <= 1.0f) {
           outCongestion = c;
           success = true;
         }
-      } else {
-        const char* error = doc["error"] | "unknown";
-        Serial.printf("[traffic] server error: %s\n", error);
       }
     }
-  } else if (code < 0) {
-    Serial.printf("[traffic] connection error: %s\n", HTTPClient::errorToString(code).c_str());
   }
 
   http.end();
-  Serial.printf("[traffic] done, heap free: %u\n", ESP.getFreeHeap());
   return success;
 }
 
-static void initTraffic() {
-  Serial.println("[traffic] initTraffic()");
-  float c = 0.0f;
-  _lastTrafficOk = _fetchTraffic(c);
-  if (_lastTrafficOk) _trafficCongestion = c;
-  _lastTrafficMs = millis();
-  Serial.printf("[traffic] init done — ok=%d congestion=%.3f\n", _lastTrafficOk, _trafficCongestion);
-}
+static void _trafficTask(void*) {
+  // Give WiFi time to settle before first fetch
+  vTaskDelay(pdMS_TO_TICKS(8000));
 
-static void updateTraffic() {
-  uint32_t interval = _lastTrafficOk ? _TRAFFIC_INTERVAL : _TRAFFIC_RETRY_INTERVAL;
-  if (millis() - _lastTrafficMs >= interval) {
+  for (;;) {
     float c = _trafficCongestion;
-    _lastTrafficOk = _fetchTraffic(c);
-    if (_lastTrafficOk) _trafficCongestion = c;
-    _lastTrafficMs = millis();
+    bool  ok = _doFetchTraffic(c);
+    if (ok) _trafficCongestion = c;
+
+    vTaskDelay(pdMS_TO_TICKS(ok ? _TRAFFIC_FETCH_INTERVAL_MS : _TRAFFIC_RETRY_MS));
   }
 }
 
-// Returns the latest congestion value (0.0 = free flow, 1.0 = gridlock).
+// Call once from setup() after WiFi is up.
+static void initTraffic() {
+  xTaskCreatePinnedToCore(
+    _trafficTask,
+    "traffic_fetch",
+    8192,       // stack — enough for HTTPClient + JSON
+    nullptr,
+    1,          // priority (same as loop)
+    &_trafficTaskHandle,
+    0           // core 0; Arduino loop runs on core 1
+  );
+}
+
+// No-op — timing is handled inside the task.
+static void updateTraffic() {}
+
+// Returns latest congestion (0.0 = free flow, 1.0 = gridlock).
+// Safe to call from core 1 — float reads are atomic on Cortex-M.
 static float trafficCongestion() { return _trafficCongestion; }
