@@ -49,6 +49,12 @@ let rafId = null;
 let highlightedFishId = null; // legend row → highlight on the canvas
 const legendRows = new Map(); // fishId -> { el, nameInput, ageEl, swatchEl }
 
+// Dead-reckoning blend: when a new snapshot arrives, fish positions snap from the
+// old extrapolation to the new one. We lerp over BLEND_MS to hide the discontinuity.
+const BLEND_MS = 250;
+let _blendFrom = new Map(); // fishId → {x, y} at the moment the new snapshot arrived
+let _blendStartMs = 0;
+
 const els = {
   list: document.getElementById('aquarium-list'),
   emptyHint: document.getElementById('empty-hint'),
@@ -103,6 +109,8 @@ function select(id) {
   selectedId = id;
   latestSnapshot = null;
   snapshotReceivedAt = 0;
+  _blendFrom.clear();
+  _blendStartMs = 0;
   highlightedFishId = null;
   legendRows.clear();
   els.legend.innerHTML = '';
@@ -113,8 +121,21 @@ function select(id) {
 }
 
 function applySnapshot(snap) {
+  const now = Date.now();
+  // Capture each fish's current predicted position before replacing the snapshot,
+  // so we can blend smoothly from there to the new snapshot's trajectory.
+  if (latestSnapshot) {
+    const oldElapsed = now - snapshotReceivedAt;
+    const oldFm = latestSnapshot.frame_ms || 50;
+    _blendFrom.clear();
+    for (const f of (latestSnapshot.fish || [])) {
+      const p = _extrapolateFish(f, oldElapsed, oldFm);
+      _blendFrom.set(f.id, { x: p.x, y: p.y });
+    }
+    _blendStartMs = now;
+  }
   latestSnapshot = snap;
-  snapshotReceivedAt = Date.now();
+  snapshotReceivedAt = now;
   // Legend, stats, and title update at telemetry rate (≤1 Hz) — cheap DOM work.
   drawTitle(snap);
   drawStats(snap);
@@ -124,12 +145,35 @@ function applySnapshot(snap) {
   if (!rafId) rafId = requestAnimationFrame(_rafDraw);
 }
 
-// 60fps canvas-only loop — extrapolates fish positions between telemetry frames.
+// 60fps canvas-only loop — extrapolates fish positions between telemetry frames
+// and blends out the discontinuity at each snapshot boundary.
 function _rafDraw() {
   rafId = requestAnimationFrame(_rafDraw);
   if (!latestSnapshot) return;
-  const elapsed = Date.now() - snapshotReceivedAt;
-  drawTank(_extrapolateSnapshot(latestSnapshot, elapsed));
+  const now = Date.now();
+  const elapsed = now - snapshotReceivedAt;
+  const fm = latestSnapshot.frame_ms || 50;
+
+  // Build extrapolated snapshot, then smooth any blend in progress.
+  const blendAge = _blendStartMs ? now - _blendStartMs : BLEND_MS;
+  if (blendAge >= BLEND_MS) {
+    // No active blend — straight extrapolation.
+    drawTank(_extrapolateSnapshot(latestSnapshot, elapsed));
+    return;
+  }
+  // Smooth step: s goes 0→1 over BLEND_MS with ease-in-out curve.
+  const s = (blendAge / BLEND_MS) ** 2 * (3 - 2 * (blendAge / BLEND_MS));
+  const fish = latestSnapshot.fish.map((f) => {
+    const ext = _extrapolateFish(f, elapsed, fm);
+    const prev = _blendFrom.get(f.id);
+    if (!prev) return ext;
+    return {
+      ...ext,
+      x: Math.round(prev.x + (ext.x - prev.x) * s),
+      y: Math.round(prev.y + (ext.y - prev.y) * s),
+    };
+  });
+  drawTank({ ...latestSnapshot, fish });
 }
 
 // ─── SSE stream for the selected aquarium ────────────────────────────────────
