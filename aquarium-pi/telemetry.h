@@ -172,11 +172,13 @@ static std::string _buildTelemetryJson() {
         snprintf(tmp, sizeof(tmp),
             "%s{\"id\":%d,\"x\":%d,\"y\":%d,\"z\":%.3f,"
             "\"vx\":%.2f,\"vy\":%.2f,\"vz\":%.4f,"
+            "\"tx\":%d,\"ty\":%d,\"wander_cd\":%d,"
             "\"type\":%d,\"facing_right\":%s,"
             "\"color\":%u,\"going_for_food\":%s,\"chasing\":%s}",
             first ? "" : ",", i,
             (int)f.x, (int)f.y, f.z,
             f.vx, f.vy, f.vz,
+            (int)f.tx, (int)f.ty, (int)f.wanderCD,
             (int)f.type,
             f.facingRight ? "true" : "false",
             (unsigned)fishColor(i),

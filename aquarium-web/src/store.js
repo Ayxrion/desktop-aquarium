@@ -14,28 +14,46 @@ const MAX_AQUARIUMS = parseInt(process.env.MAX_AQUARIUMS || '64', 10);
 const FISH_GAP_MS = parseInt(process.env.FISH_GAP_MS || '10000', 10); // absence => new fish
 const MAX_NAME_LEN = 24;
 
-// Physics constants matching the device (aquarium.ino / main.cpp):
-//   vx *= 0.85 per FRAME_MS-tick; vy same; vz *= 0.88
-// Integral of decaying velocity: x(t) = x0 + vx * fm * (1 - d^(t/fm)) / (-ln d)
-const _DAMP_XY = 0.85;
-const _DAMP_Z  = 0.88;
-const _LOG_D_XY = Math.log(_DAMP_XY); // ≈ -0.1625
-const _LOG_D_Z  = Math.log(_DAMP_Z);  // ≈ -0.1278
+// Physics simulation matching the device (aquarium.ino / main.cpp).
+// Seek strengths and max velocities by fish type (0=pair,1=school,2=school2,3=angel).
+const _SEEK  = [0.018, 0.012, 0.012, 0.020];
+const _MAXV  = [7.0,   5.5,   5.5,   7.0  ];
+const _DAMP  = 0.85;
+const _DAMPZ = 0.88;
+const TANK_TOP = 72, SCREEN_W = 800, SCREEN_H = 480;
+
+function _bound(v, lo, hi, k) {
+  if (v < lo) return (lo - v) * k;
+  if (v > hi) return (hi - v) * k;
+  return 0;
+}
 
 function _extrapolateFish(f, elapsedMs, frameMs) {
-  const vx = f.vx || 0, vy = f.vy || 0, vz = f.vz || 0;
-  if (!vx && !vy && !vz) return f;
-  const fm = frameMs || 50;
-  // Cap at 3 seconds to avoid runaway drift if a snapshot is very stale.
-  const t = Math.min(elapsedMs, 3000);
-  const sXY = (1 - Math.pow(_DAMP_XY, t / fm)) / (-_LOG_D_XY);
-  const sZ  = (1 - Math.pow(_DAMP_Z,  t / fm)) / (-_LOG_D_Z);
-  return {
-    ...f,
-    x: Math.round(f.x + vx * sXY),
-    y: Math.round(f.y + vy * sXY),
-    z: f.z + vz * sZ,
-  };
+  const fm  = frameMs || 50;
+  const n   = Math.round(Math.min(elapsedMs, 3000) / fm);
+  if (n === 0) return f;
+  const type = f.type || 0;
+  const seek = _SEEK[type] ?? 0.012;
+  const maxV = f.going_for_food ? 8.0 : (_MAXV[type] ?? 5.5);
+  const maxVy = maxV * 0.5;
+  const tx = f.tx ?? f.x, ty = f.ty ?? f.y;
+  // wander_cd: frames until fish picks a new random target — seek only while valid.
+  const wcd = typeof f.wander_cd === 'number' ? f.wander_cd : n;
+  let x = f.x, y = f.y, z = f.z || 0;
+  let vx = f.vx || 0, vy = f.vy || 0, vz = f.vz || 0;
+  for (let i = 0; i < n; i++) {
+    const seeking = f.going_for_food || i < wcd;
+    let ax = (seeking ? (tx - x) * seek : 0) + _bound(x, 30, SCREEN_W - 30, 0.30);
+    let ay = (seeking ? (ty - y) * seek : 0) + _bound(y, TANK_TOP + 20, SCREEN_H - 80, 0.30);
+    let az = _bound(z, 0.0, 0.75, 0.08);
+    vx = Math.max(-maxV,  Math.min(maxV,  vx + ax)) * _DAMP;
+    vy = Math.max(-maxVy, Math.min(maxVy, vy + ay)) * _DAMP;
+    vz = Math.max(-0.015, Math.min(0.015, vz + az)) * _DAMPZ;
+    x  = Math.max(5,            Math.min(SCREEN_W - 5,  x + vx));
+    y  = Math.max(TANK_TOP + 5, Math.min(SCREEN_H - 60, y + vy));
+    z  = Math.max(0,            Math.min(0.78,           z + vz));
+  }
+  return { ...f, x: Math.round(x), y: Math.round(y), z };
 }
 
 /**
