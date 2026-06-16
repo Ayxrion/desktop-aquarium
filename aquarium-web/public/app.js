@@ -169,6 +169,81 @@ function startWatchdog() {
   }, 2000);
 }
 
+// ─── EAC silhouette fish ─────────────────────────────────────────────────────
+// Horizontal current band across the mid-tank. Fish drift left to right.
+const EAC_Y1 = 180, EAC_Y2 = 270;   // horizontal band (mid-tank)
+const EAC_MAX_FISH = 12;
+
+let eacFish = [];
+let eacTargetCount = 0;
+
+function eacSpawnFish(startX) {
+  const bandH = EAC_Y2 - EAC_Y1;
+  return {
+    x: startX ?? Math.random() * SCREEN_W,
+    y: EAC_Y1 + bandH * 0.1 + Math.random() * bandH * 0.8,
+    speed: 0.35 + Math.random() * 0.55,
+    size: 7 + Math.random() * 8,
+    wobbleOff: Math.random() * Math.PI * 2,
+  };
+}
+
+function updateEacCount(congestion) {
+  eacTargetCount = Math.round(congestion * EAC_MAX_FISH);
+}
+
+function tickEac(frameCount) {
+  while (eacFish.length < eacTargetCount) eacFish.push(eacSpawnFish(0));
+  if (eacFish.length > eacTargetCount) eacFish.splice(eacTargetCount);
+
+  const bandH = EAC_Y2 - EAC_Y1;
+  for (const f of eacFish) {
+    f.x += f.speed;
+    // gentle vertical wobble within the band
+    f.y = EAC_Y1 + bandH * 0.5 + Math.sin(frameCount * 0.018 + f.wobbleOff) * bandH * 0.3;
+    if (f.x > SCREEN_W + 20) f.x = -20;  // loop left
+  }
+}
+
+function drawEacZone(bright) {
+  // No zone tint — silhouettes only
+  ctx.save();
+  ctx.globalAlpha = 0.13 * bright + 0.04;  // very faint, brightest at noon
+  ctx.fillStyle = '#061c2e';
+  for (const f of eacFish) {
+    drawSilhouetteFish(f.x, f.y, f.size);
+  }
+  ctx.restore();
+}
+
+function drawSilhouetteFish(x, y, size) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.beginPath();
+  ctx.ellipse(0, 0, size, size * 0.5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(-size, 0);
+  ctx.lineTo(-size - size * 0.7, -size * 0.45);
+  ctx.lineTo(-size - size * 0.7,  size * 0.45);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+// RAF loop — runs independently of snapshot delivery
+let _frameCount = 0;
+function eacLoop() {
+  eacBright = latest ? dayTint(latest.time && latest.time.day_progress) : 0.5;
+  tickEac(_frameCount++);
+  if (latest) {
+    // Redraw only the tank layer (title/stats don't need per-frame updates)
+    drawTank(latest);
+  }
+  requestAnimationFrame(eacLoop);
+}
+requestAnimationFrame(eacLoop);
+
 // ─── Rendering ───────────────────────────────────────────────────────────────
 // Full re-render (called on highlight toggle, etc.) — extrapolates fish to now.
 function render() {
@@ -334,6 +409,9 @@ function drawTank(s) {
     }
   }
 
+  // EAC silhouette fish (background layer, before foreground fish)
+  drawEacZone(bright);
+
   // Fish
   if (Array.isArray(s.fish)) {
     for (const f of s.fish) drawFish(f);
@@ -468,6 +546,77 @@ function escapeHtml(str) {
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
   );
 }
+
+// ─── Traffic monitor ─────────────────────────────────────────────────────────
+let trafficZip = localStorage.getItem('traffic_zip') || '';
+let trafficTimer = null;
+
+const zipInput = document.getElementById('zip-input');
+const zipGo = document.getElementById('zip-go');
+const trafficStatus = document.getElementById('traffic-status');
+
+if (trafficZip) zipInput.value = trafficZip;
+
+function congestionLabel(c) {
+  if (c < 0.15) return 'Free flow';
+  if (c < 0.35) return 'Light';
+  if (c < 0.55) return 'Moderate';
+  if (c < 0.75) return 'Heavy';
+  return 'Gridlock';
+}
+
+function congestionColor(c) {
+  if (c < 0.25) return '#36d36b';
+  if (c < 0.5)  return '#f0c040';
+  if (c < 0.75) return '#f07830';
+  return '#e03030';
+}
+
+async function fetchTraffic(zip) {
+  trafficStatus.textContent = `Fetching traffic for ${zip}…`;
+  trafficStatus.className = 'traffic-status hint';
+  try {
+    const res = await fetch('api/traffic?zip=' + encodeURIComponent(zip));
+    const data = await res.json();
+    if (!data.ok) {
+      trafficStatus.textContent = `Error: ${data.error}`;
+      return;
+    }
+    updateEacCount(data.congestion);
+    const pct = Math.round(data.congestion * 100);
+    const label = congestionLabel(data.congestion);
+    const color = congestionColor(data.congestion);
+    trafficStatus.className = 'traffic-status';
+    trafficStatus.innerHTML =
+      `<strong style="color:${color}">${label}</strong> &mdash; ${pct}% congested<br>` +
+      `<span style="font-size:12px;color:var(--muted)">${data.speed} / ${data.freeFlow} MPH &nbsp;·&nbsp; ZIP ${zip}</span>` +
+      `<div class="traffic-bar-wrap"><div class="traffic-bar" style="width:${pct}%;background:${color}"></div></div>`;
+  } catch {
+    trafficStatus.textContent = 'Could not reach traffic API.';
+  }
+}
+
+function startTrafficPolling(zip) {
+  if (trafficTimer) clearInterval(trafficTimer);
+  fetchTraffic(zip);
+  trafficTimer = setInterval(() => fetchTraffic(zip), 60_000);
+}
+
+function applyZip() {
+  const zip = zipInput.value.trim();
+  if (!/^\d{5}$/.test(zip)) {
+    trafficStatus.textContent = 'Enter a valid 5-digit ZIP code.';
+    return;
+  }
+  trafficZip = zip;
+  localStorage.setItem('traffic_zip', zip);
+  startTrafficPolling(zip);
+}
+
+zipGo.addEventListener('click', applyZip);
+zipInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyZip(); });
+
+if (trafficZip) startTrafficPolling(trafficZip);
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
 refreshList();

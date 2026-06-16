@@ -16,6 +16,7 @@
 #include "ota_update.h"
 #include "weather.h"
 #include "daynight.h"
+#include "traffic.h"
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  LGFX — Elecrow CrowPanel 7.0" (16-bit parallel RGB, GT911 touch)
@@ -252,6 +253,18 @@ struct Boat {
   uint32_t lastLaunchMs;
 };
 static Boat boat = { (float)(SCREEN_W + BOAT_W), false, 0UL };
+
+// ─── EAC silhouette fish (traffic-driven) ────────────────────────────────────
+#define EAC_Y1          180     // top of horizontal current band (mid-tank)
+#define EAC_Y2          270     // bottom of horizontal current band
+#define EAC_MAX_FISH     12
+
+struct EacFish {
+  float x, y, spd, size, wobbleOff;
+  bool  active;
+};
+static EacFish eacFish[EAC_MAX_FISH];
+static int     eacActiveCount = 0;
 
 // ─── Food flakes ─────────────────────────────────────────────────────────────
 #define MAX_FLAKES 10
@@ -849,6 +862,18 @@ void setup() {
 
   for (int i = 0; i < MAX_FLAKES; i++) flakes[i].active = false;
 
+  // EAC fish — staggered horizontally across full tank width
+  for (int i = 0; i < EAC_MAX_FISH; i++) {
+    float bandH = EAC_Y2 - EAC_Y1;
+    eacFish[i].x        = (float)i / EAC_MAX_FISH * SCREEN_W;
+    eacFish[i].y        = EAC_Y1 + bandH * 0.1f + frandr(0, (int)(bandH * 0.8f));
+    eacFish[i].spd      = frandr(0.3f, 0.8f);
+    eacFish[i].size     = frandr(6.0f, 13.0f);
+    eacFish[i].wobbleOff = frandr(0.0f, 6.28f);
+    eacFish[i].active   = false;
+  }
+  initTraffic();
+
   initWeatherEffects();   // set up clouds / rain / snow based on fetched weather
   initStars();            // random star positions for the night sky
 
@@ -1151,6 +1176,49 @@ void updateFish() {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Draw helpers
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── EAC silhouette fish ─────────────────────────────────────────────────────
+
+void updateEacFish() {
+  int target = (int)(trafficCongestion() * EAC_MAX_FISH + 0.5f);
+  eacActiveCount = constrain(target, 0, EAC_MAX_FISH);
+
+  float bandH = EAC_Y2 - EAC_Y1;
+  float midY  = (EAC_Y1 + EAC_Y2) * 0.5f;
+
+  for (int i = 0; i < EAC_MAX_FISH; i++) {
+    eacFish[i].active = (i < eacActiveCount);
+    if (!eacFish[i].active) continue;
+
+    // Drift left to right across the tank
+    eacFish[i].x += eacFish[i].spd;
+    // Gentle vertical wobble within the band
+    eacFish[i].y = midY + sinf(tick * 0.018f + eacFish[i].wobbleOff) * bandH * 0.3f;
+
+    // Loop back to left edge
+    if (eacFish[i].x > SCREEN_W + 20) eacFish[i].x = -20.0f;
+  }
+}
+
+void drawEacSilhouette(float x, float y, float size) {
+  // Just slightly darker than deep water — barely perceptible silhouette
+  const uint32_t COL = 0x021428UL;
+  int ix = (int)x, iy = (int)y, sz = (int)size;
+  canvas.fillEllipse(ix, iy, sz, (int)(size * 0.5f), COL);
+  int tx = (int)(size * 0.7f);
+  canvas.fillTriangle(ix - sz,      iy,
+                      ix - sz - tx, iy - (int)(size * 0.45f),
+                      ix - sz - tx, iy + (int)(size * 0.45f),
+                      COL);
+}
+
+void drawEacFish() {
+  // No zone tint — silhouettes only
+  for (int i = 0; i < EAC_MAX_FISH; i++) {
+    if (!eacFish[i].active) continue;
+    drawEacSilhouette(eacFish[i].x, eacFish[i].y, eacFish[i].size);
+  }
+}
 
 void drawSnail() {
   int   bx = (int)snail.x;
@@ -1880,6 +1948,8 @@ void loop() {
   updateWeatherEffects();
   telemetryUpdate();
 
+  updateTraffic();
+  updateEacFish();
   updateBoat();
   updateSnail();
   updateStarfish();
@@ -1891,6 +1961,7 @@ void loop() {
   drawWeatherSky();   // overwrites the top TANK_TOP px with sky + weather effects
   drawBoat();         // floats on the waterline above the tank rim
   drawBgPlants();     // behind everything — dark far-away silhouettes
+  drawEacFish();      // EAC silhouettes behind foreground fish
   drawFishShadows();
   drawSnail();
   drawStarfish();
