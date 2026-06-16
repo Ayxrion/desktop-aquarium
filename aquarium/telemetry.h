@@ -13,7 +13,7 @@
 //
 // Configure in wifi_config.h (all optional; telemetry is off unless enabled):
 //   #define TELEMETRY_ENABLED      1
-//   #define TELEMETRY_HOST         "http://192.168.1.215/aquarium"
+//   #define TELEMETRY_HOST         "http://107.214.184.24/aquarium/api/telemetry"
 //   #define TELEMETRY_API_KEY      "change-me"
 //   #define TELEMETRY_AQUARIUM_ID  "living-room"
 //   #define TELEMETRY_INTERVAL_MS  1000
