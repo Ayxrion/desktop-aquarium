@@ -5,6 +5,9 @@
 
 const WEATHER_NAMES = ['Sunny', 'Partly Cloudy', 'Cloudy', 'Rainy', 'Stormy', 'Snowy', 'Foggy'];
 const FISH_TYPE_NAMES = ['Pair', 'School', 'School 2', 'Angel'];
+// Per-type caps + snapshot count keys, mirroring the firmware (main.cpp / aquarium.ino).
+const FISH_MAX = [8, 16, 20, 12];
+const FISH_COUNT_KEYS = ['pair', 'school', 'school2', 'angel'];
 const TANK_TOP = 72;
 const SCREEN_W = 800;
 const SCREEN_H = 480;
@@ -454,10 +457,13 @@ const bubbles = Array.from({ length: 20 }, () => ({
   r: 3 + Math.floor(Math.random() * 6),
   ph: Math.random() * Math.PI * 2,
 }));
-function tickBubbles() {
+// The device steps bubbles once per 50ms frame (FRAME_MS); the browser rAF runs
+// at ~60fps, so applying the per-frame delta every rAF made bubbles rise ~3x too
+// fast. Drive them by elapsed device-frames (df) instead so they match the device.
+function tickBubbles(df) {
   for (const b of bubbles) {
-    b.y -= b.spd;
-    b.x = clamp(b.x + Math.sin(animTick * 0.06 + b.ph) * 0.8, 2, SCREEN_W - 2);
+    b.y -= b.spd * df;
+    b.x = clamp(b.x + Math.sin(animTick * 0.06 + b.ph) * 0.8 * df, 2, SCREEN_W - 2);
     if (b.y < TANK_TOP) {
       b.y = SCREEN_H + 10; b.x = Math.random() * SCREEN_W;
       b.spd = 0.8 + Math.random() * 1.7; b.r = 3 + Math.floor(Math.random() * 6);
@@ -575,6 +581,11 @@ const legendRows = new Map(); // fishId -> { el, nameInput, ageEl, swatchEl }
 const BLEND_MS = 250;
 let _blendFrom = new Map(); // fishId → {x, y} at the moment the new snapshot arrived
 let _blendStartMs = 0;
+// The boat's telemetry is sparse (≤1 Hz) and dead-reckoned between snapshots, so
+// it snaps when a new snapshot lands. Capture its predicted x at that moment and
+// lerp to the new trajectory over BLEND_MS, exactly like the fish. null = no blend
+// (first snapshot, or a relaunch teleport where sliding across would look wrong).
+let _blendBoatFrom = null;
 
 const els = {
   list: document.getElementById('aquarium-list'),
@@ -592,6 +603,12 @@ const els = {
   conflictDetail: document.getElementById('conflict-detail'),
   conflictServer: document.getElementById('conflict-server'),
   conflictLocal: document.getElementById('conflict-local'),
+  controls: document.getElementById('controls'),
+  ctrlWeather: document.getElementById('ctrl-weather'),
+  ctrlTime: document.getElementById('ctrl-time'),
+  ctrlFish: document.getElementById('ctrl-fish'),
+  ctrlFeed: document.getElementById('ctrl-feed'),
+  ctrlStatus: document.getElementById('ctrl-status'),
 };
 const ctx = els.canvas.getContext('2d');
 
@@ -612,23 +629,70 @@ function setConn(online) {
   els.conn.className = 'conn ' + (online ? 'online' : 'offline');
 }
 
+// ─── URL routing ─────────────────────────────────────────────────────────────
+// The selected aquarium lives in the hash (#/<id>) so the view survives reloads
+// and is shareable. Hash routing is reverse-proxy-safe (independent of the
+// injected <base href>) and needs no server-side catch-all route.
+function routeId() {
+  return decodeURIComponent(location.hash.replace(/^#\/?/, '')) || null;
+}
+function setRoute(id) {
+  if (id) {
+    const target = '#/' + encodeURIComponent(id);
+    if (location.hash !== target) location.hash = target;
+  } else if (location.hash) {
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+}
+
+// Forget an aquarium (stale device gone for good, or just decluttering). A live
+// device re-appears on its next telemetry post.
+async function removeAquarium(id, stale) {
+  const msg = `Remove aquarium "${id}"?` + (stale
+    ? '\n\nIt appears to be offline (stale).'
+    : '\n\nIt is still reporting and will reappear on its next update.');
+  if (!window.confirm(msg)) return;
+  try {
+    await fetch('api/aquariums/' + encodeURIComponent(id), { method: 'DELETE' });
+  } catch { /* ignore — the list refresh below reflects reality */ }
+  if (selectedId === id) {
+    if (stream) { stream.close(); stream = null; }
+    selectedId = null;
+    latestSnapshot = null;
+    els.viewContent.hidden = true;
+    els.viewEmpty.hidden = false;
+    setRoute(null);
+  }
+  refreshList();
+}
+
 function renderList(items) {
   els.emptyHint.hidden = items.length > 0;
   els.list.innerHTML = '';
   for (const a of items) {
     const li = document.createElement('li');
-    if (a.aquarium_id === selectedId) li.className = 'active';
+    li.className = (a.aquarium_id === selectedId ? 'active' : '') + (a.stale ? ' stale-row' : '');
     const weather = a.weather ? (WEATHER_NAMES[a.weather.condition] || '?') : '—';
     li.innerHTML = `
+      <button class="aq-del" title="Remove this aquarium" aria-label="Remove aquarium">×</button>
       <div class="aq-name">
         <span class="dot ${a.stale ? 'stale' : 'live'}"></span>${escapeHtml(a.aquarium_id)}${a.conflict ? '<span class="aq-conflict">⚠ mismatch</span>' : ''}
       </div>
       <div class="aq-meta">${escapeHtml(a.platform)} · ${a.fishCount} fish · ${weather}</div>`;
-    li.onclick = () => select(a.aquarium_id);
+    li.addEventListener('click', () => select(a.aquarium_id));
+    li.querySelector('.aq-del').addEventListener('click', (e) => {
+      e.stopPropagation();
+      removeAquarium(a.aquarium_id, a.stale);
+    });
     els.list.appendChild(li);
   }
-  // Highlight the first aquarium by default so the view is never empty.
-  if (!selectedId && items.length) select(items[0].aquarium_id);
+  // Default selection: honour the URL hash if it names a known aquarium, else the
+  // first one so the view is never empty.
+  if (!selectedId && items.length) {
+    const want = routeId();
+    const match = want && items.some((a) => a.aquarium_id === want);
+    select(match ? want : items[0].aquarium_id);
+  }
 }
 
 function select(id) {
@@ -638,13 +702,17 @@ function select(id) {
   snapshotReceivedAt = 0;
   _blendFrom.clear();
   _blendStartMs = 0;
+  _blendBoatFrom = null;
   highlightedFishId = null;
   legendRows.clear();
   els.legend.innerHTML = '';
   els.conflictBar.hidden = true;
+  els.controls.hidden = true;
+  _ctrlHold.weather = _ctrlHold.time = 0;
   els.viewEmpty.hidden = true;
   els.viewContent.hidden = false;
   openStream(id);
+  setRoute(id);
   refreshList();
 }
 
@@ -672,6 +740,17 @@ function applySnapshot(snap) {
       boat: (latestSnapshot.boat && snap.boat && latestSnapshot.boat.active && snap.boat.active)
         ? _obsVel(latestSnapshot.boat, snap.boat, dt) : 0,
     };
+
+    // Capture the boat's predicted x to blend from. Only when it was (and stays)
+    // active and the new position is close to the prediction — a large gap means
+    // a relaunch from the far edge, where sliding across the tank looks worse than
+    // a clean snap.
+    _blendBoatFrom = null;
+    if (prev.boat && snap.boat && prev.boat.active && snap.boat.active &&
+        typeof prev.boat.x === 'number' && typeof snap.boat.x === 'number' &&
+        Math.abs(prev.boat.x - snap.boat.x) < 120) {
+      _blendBoatFrom = prev.boat.x;
+    }
   }
   latestSnapshot = snap;
   snapshotReceivedAt = serverRx;
@@ -680,6 +759,7 @@ function applySnapshot(snap) {
   drawStats(snap);
   renderLegend(snap);
   renderConflict(snap);
+  renderControls(snap);
   setConn(true);
   // Ensure the 60fps canvas loop is running.
   if (!rafId) rafId = requestAnimationFrame(_rafDraw);
@@ -731,15 +811,14 @@ const EAC_MAX_FISH = 12;
 let eacFish = [];
 let eacTargetCount = 0;
 let eacBright = 0.5;
-let _frameCount = 0;
 
 function eacSpawnFish(startX) {
   const bandH = EAC_Y2 - EAC_Y1;
   return {
     x: startX ?? Math.random() * SCREEN_W,
     y: EAC_Y1 + bandH * 0.1 + Math.random() * bandH * 0.8,
-    speed: 0.35 + Math.random() * 0.55,
-    size: 7 + Math.random() * 8,
+    speed: 0.3 + Math.random() * 0.5,   // device spd range (0.3..0.8 px/device-frame)
+    size: 6 + Math.random() * 7,        // device size range (6..13)
     wobbleOff: Math.random() * Math.PI * 2,
   };
 }
@@ -748,15 +827,18 @@ function updateEacCount(congestion) {
   eacTargetCount = Math.round(congestion * EAC_MAX_FISH);
 }
 
-function tickEac(frameCount) {
+// Drift the traffic silhouettes at the device's 20fps cadence: advance by `df`
+// device-frames per call (not once per rAF) and phase the wobble off animTick
+// (device tick units), exactly like the device's updateEacFish().
+function tickEac(df) {
   while (eacFish.length < eacTargetCount) eacFish.push(eacSpawnFish(0));
   if (eacFish.length > eacTargetCount) eacFish.splice(eacTargetCount);
 
   const bandH = EAC_Y2 - EAC_Y1;
   for (const f of eacFish) {
-    f.x += f.speed;
+    f.x += f.speed * df;
     // gentle vertical wobble within the band
-    f.y = EAC_Y1 + bandH * 0.5 + Math.sin(frameCount * 0.018 + f.wobbleOff) * bandH * 0.3;
+    f.y = EAC_Y1 + bandH * 0.5 + Math.sin(animTick * 0.018 + f.wobbleOff) * bandH * 0.3;
     if (f.x > SCREEN_W + 20) f.x = -20;  // loop left
   }
 }
@@ -795,10 +877,14 @@ function drawSilhouetteFish(x, y, size) {
 function _rafDraw() {
   rafId = requestAnimationFrame(_rafDraw);
   const now = Date.now();
+  const prevTick = animTick;
   animTick = now / 50;            // device "tick" units (one per frame at 50ms)
-  _frameCount++;
-  tickEac(_frameCount);
-  tickBubbles();
+  // Device-frames elapsed since the last rAF. Clamp so a backgrounded tab (large
+  // gap) doesn't teleport the local sims when it resumes. All local animations are
+  // advanced by this so they run at the device's 20fps cadence, not the browser's.
+  const dframes = prevTick ? clamp(animTick - prevTick, 0, 5) : 1;
+  tickEac(dframes);
+  tickBubbles(dframes);
   eacBright = latestSnapshot
     ? dayTint(latestSnapshot.time && latestSnapshot.time.day_progress)
     : 0.5;
@@ -818,7 +904,10 @@ function _rafDraw() {
     if (!prev) return f;
     return { ...f, x: prev.x + (f.x - prev.x) * sFac, y: prev.y + (f.y - prev.y) * sFac };
   });
-  drawTank({ ...ext, fish });
+  let boat = ext.boat;
+  if (boat && _blendBoatFrom != null)
+    boat = { ...boat, x: _blendBoatFrom + (boat.x - _blendBoatFrom) * sFac };
+  drawTank({ ...ext, fish, boat });
 }
 
 // Full re-render (called on highlight toggle, etc.) — extrapolates fish to now.
@@ -952,6 +1041,125 @@ async function resolveConflict(choice) {
 els.conflictServer.addEventListener('click', () => resolveConflict('server'));
 els.conflictLocal.addEventListener('click', () => resolveConflict('local'));
 
+// ─── Device controls (weather / timescale / fish / feed) ─────────────────────
+// POST a directive to the server, which forwards it to the device in the reply
+// to that device's next telemetry POST. State is reflected back from snapshots,
+// but the device takes a cycle or two to apply, so we briefly "hold" the user's
+// own weather/timescale choice to avoid the control snapping back meanwhile.
+const CTRL_HOLD_MS = 4000;
+const _ctrlHold = { weather: 0, time: 0 };
+let _ctrlStatusTimer = null;
+let _fishRowsBuilt = false;
+const fishCountEls = [];
+const fishBtns = [];
+
+function setCtrlStatus(msg, kind) {
+  els.ctrlStatus.textContent = msg;
+  els.ctrlStatus.className = 'ctrl-status' + (kind ? ' ' + kind : '');
+  clearTimeout(_ctrlStatusTimer);
+  _ctrlStatusTimer = setTimeout(() => {
+    els.ctrlStatus.textContent = '';
+    els.ctrlStatus.className = 'ctrl-status';
+  }, 2500);
+}
+
+async function sendControl(cmd, okMsg) {
+  if (!selectedId) return false;
+  try {
+    const res = await fetch(`api/aquariums/${encodeURIComponent(selectedId)}/control`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cmd),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) { setCtrlStatus(data.error || 'Failed', 'err'); return false; }
+    setCtrlStatus(okMsg || 'Sent ✓', 'ok');
+    return true;
+  } catch {
+    setCtrlStatus('Network error', 'err');
+    return false;
+  }
+}
+
+function buildFishControls() {
+  els.ctrlFish.innerHTML = '';
+  for (let t = 0; t < 4; t++) {
+    const row = document.createElement('div');
+    row.className = 'ctrl-fish-row';
+    const name = document.createElement('span');
+    name.className = 'fish-name';
+    name.textContent = FISH_TYPE_NAMES[t];
+    const minus = document.createElement('button');
+    minus.className = 'fish-btn';
+    minus.textContent = '−';
+    minus.title = `Remove a ${FISH_TYPE_NAMES[t]}`;
+    minus.addEventListener('click', () => changeFish(t, 'remove'));
+    const count = document.createElement('span');
+    count.className = 'fish-count';
+    const plus = document.createElement('button');
+    plus.className = 'fish-btn';
+    plus.textContent = '+';
+    plus.title = `Add a ${FISH_TYPE_NAMES[t]}`;
+    plus.addEventListener('click', () => changeFish(t, 'add'));
+    row.append(name, minus, count, plus);
+    els.ctrlFish.appendChild(row);
+    fishCountEls[t] = count;
+    fishBtns[t] = { minus, plus };
+  }
+  _fishRowsBuilt = true;
+}
+
+function changeFish(t, action) {
+  sendControl(
+    { type: 'fish', action, fishType: t, count: 1 },
+    `${action === 'add' ? 'Added' : 'Removed'} ${FISH_TYPE_NAMES[t]} ✓`
+  );
+}
+
+function renderControls(snap) {
+  if (!snap) { els.controls.hidden = true; return; }
+  els.controls.hidden = false;
+  const now = Date.now();
+
+  // Weather: value -1 (auto) when not overridden, else the forced condition.
+  const w = snap.weather || {};
+  const wv = w.override ? (w.condition | 0) : -1;
+  if (document.activeElement !== els.ctrlWeather && now - _ctrlHold.weather > CTRL_HOLD_MS) {
+    els.ctrlWeather.value = String(wv);
+  }
+
+  // Timescale active button.
+  if (now - _ctrlHold.time > CTRL_HOLD_MS) {
+    const mode = (snap.time && snap.time.mode) || 'REAL';
+    for (const b of els.ctrlTime.querySelectorAll('button')) {
+      b.classList.toggle('active', b.dataset.mode === mode);
+    }
+  }
+
+  // Fish counts + cap-aware enabling.
+  if (!_fishRowsBuilt) buildFishControls();
+  const counts = snap.counts || {};
+  for (let t = 0; t < 4; t++) {
+    const c = counts[FISH_COUNT_KEYS[t]] || 0;
+    fishCountEls[t].textContent = `${c}/${FISH_MAX[t]}`;
+    fishBtns[t].minus.disabled = c <= 0;
+    fishBtns[t].plus.disabled = c >= FISH_MAX[t];
+  }
+}
+
+els.ctrlWeather.addEventListener('change', () => {
+  _ctrlHold.weather = Date.now();
+  sendControl({ type: 'weather', value: parseInt(els.ctrlWeather.value, 10) }, 'Weather set ✓');
+});
+els.ctrlTime.addEventListener('click', (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  _ctrlHold.time = Date.now();
+  for (const b of els.ctrlTime.querySelectorAll('button')) b.classList.toggle('active', b === btn);
+  sendControl({ type: 'time', value: btn.dataset.mode }, `Timescale: ${btn.dataset.mode} ✓`);
+});
+els.ctrlFeed.addEventListener('click', () => sendControl({ type: 'feed', count: 1 }, 'Fed the fish 🐟'));
+
 function drawTitle(s) {
   els.viewName.textContent = s.aquarium_id || selectedId || '—';
   const weather = s.weather ? (WEATHER_NAMES[s.weather.condition] || '') : '';
@@ -980,8 +1188,10 @@ function drawTank(s) {
 
   drawSky(top, bright, cond, s);   // gradient + sun/moon + stars + clouds
   drawWater(top, bright);          // shimmering light bands
+  drawBubbles(top);                // behind the sand bed → bubbles rise out of the substrate
   drawSand(bright);                // bumpy terrain bed
-  drawRim(top, bright);            // metal frame + glass over the waterline
+  if (s.boat && s.boat.active) drawBoat(s.boat.x, top); // behind the rim → sits slightly submerged
+  drawRim(top, bright);            // metal frame + glass over the waterline (drawn over the boat)
 
   if (s.plants) {                  // back-to-front plant layers, each swaying
     drawBgPlants(s.plants, bright);
@@ -998,11 +1208,9 @@ function drawTank(s) {
     for (const f of ordered) drawFish(f);
   }
 
-  drawBubbles(top);
   if (Array.isArray(s.flakes)) for (const f of s.flakes) drawFlake(f);
   if (s.snail) drawSnail(s.snail);
   if (s.starfish) drawStarfish(s.starfish);
-  if (s.boat && s.boat.active) drawBoat(s.boat.x, top);
 
   if (cond === 3 || cond === 4) drawRain(cond, bright);
   else if (cond === 5) drawSnow(bright);
@@ -1205,6 +1413,11 @@ zipInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyZip();
 if (trafficZip) startTrafficPolling(trafficZip);
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
-refreshList();
+// Back/forward or a manually edited hash switches the viewed aquarium.
+window.addEventListener('hashchange', () => {
+  const id = routeId();
+  if (id && id !== selectedId) select(id);
+});
+refreshList(); // first load honours the hash via renderList's default selection
 setInterval(refreshList, 5000);
 startWatchdog();

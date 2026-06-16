@@ -67,6 +67,11 @@ function saveSnapshot(aquariumId, snapshot, lastSeenMs, createdAt, names) {
   });
 }
 
+/** Delete an aquarium's persisted file (no-op if it was never saved). */
+function deleteAquarium(aquariumId) {
+  try { fs.unlinkSync(_filePath(aquariumId)); } catch { /* already absent */ }
+}
+
 /** Persist a fish name change (empty string removes the entry). */
 function saveName(aquariumId, fishId, name) {
   const data = _read(aquariumId);
@@ -121,4 +126,4 @@ function loadOne(aquariumId) {
   };
 }
 
-module.exports = { saveSnapshot, saveName, loadAll, loadOne };
+module.exports = { saveSnapshot, saveName, deleteAquarium, loadAll, loadOne };

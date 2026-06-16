@@ -150,6 +150,24 @@ app.post('/api/aquariums/:id/resolve', (req, res) => {
   return res.json(result);
 });
 
+// Dashboard control: buffer a directive for the device's next telemetry response.
+// Open like the other dashboard APIs (the dashboard holds no API key). Body:
+//   { type:'weather', value:-1..6 }
+//   { type:'time', value:'REAL'|'FAST' }
+//   { type:'fish', action:'add'|'remove', fishType:0..3, count?:1 }
+//   { type:'feed', count?:1 }
+app.post('/api/aquariums/:id/control', (req, res) => {
+  const result = store.queueControl(req.params.id, req.body || {});
+  if (!result.ok) return res.status(400).json(result);
+  return res.json(result);
+});
+
+// Remove an aquarium from the dashboard (open like the other dashboard APIs). A
+// live device re-creates it on its next POST; a stale one stays gone.
+app.delete('/api/aquariums/:id', (req, res) => {
+  return res.json(store.remove(req.params.id));
+});
+
 // ─── Read APIs ───────────────────────────────────────────────────────────────
 app.get('/api/aquariums', (_req, res) => res.json(store.list()));
 

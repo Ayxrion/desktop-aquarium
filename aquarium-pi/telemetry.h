@@ -95,6 +95,35 @@ static std::atomic<bool> _telemetryConflictHint{false};   // worker→main: re-c
 static int telemetrySrvPair = 0, telemetrySrvSchool = 0,
            telemetrySrvSchool2 = 0, telemetrySrvAngel = 0; // server counts (modal)
 
+// ── Dashboard control directives (pushed via the telemetry POST response) ─────
+// The web dashboard can't reach the device directly, so the server forwards its
+// control actions as `!`-prefixed lines in the POST response. They're parsed here
+// on the POST worker into atomic request state, and applied on the main thread by
+// telemetryApplyControls() (defined in main.cpp, where dropFood()/addFish()/the
+// weather + time globals are all in scope).
+static std::atomic<int> _ctrlWeatherReq{-2};      // -2 none, -1 auto, 0..6 condition
+static std::atomic<int> _ctrlTimeReq{-1};         // -1 none, 0 REAL, 1 FAST
+static std::atomic<int> _ctrlFeedReq{0};          // pending food drops
+static std::atomic<int> _ctrlFishAddReq[4];       // pending adds per fish type 0..3
+static std::atomic<int> _ctrlFishDelReq[4];       // pending removes per fish type 0..3
+
+// Parse the control directives out of a POST response body into the atomics above.
+// Each command type appears at most once per response (the server collapses them),
+// so a single substring match per token is sufficient.
+static void _telemetryParseControls(const char* body) {
+    const char* d;
+    if ((d = strstr(body, "!WEATHER:")) != nullptr) _ctrlWeatherReq.store(atoi(d + 9));
+    if ((d = strstr(body, "!TIME:"))    != nullptr) _ctrlTimeReq.store(atoi(d + 6));
+    if ((d = strstr(body, "!FEED:"))    != nullptr) _ctrlFeedReq.fetch_add(atoi(d + 6));
+    for (int t = 0; t < 4; t++) {
+        char tok[16];
+        snprintf(tok, sizeof(tok), "!FISHADD:%d:", t);
+        if ((d = strstr(body, tok)) != nullptr) _ctrlFishAddReq[t].fetch_add(atoi(d + strlen(tok)));
+        snprintf(tok, sizeof(tok), "!FISHDEL:%d:", t);
+        if ((d = strstr(body, tok)) != nullptr) _ctrlFishDelReq[t].fetch_add(atoi(d + strlen(tok)));
+    }
+}
+
 static size_t _telemetryDiscard(void*, size_t sz, size_t n, void*) { return sz * n; }
 
 // ── Fish names (pushed down via the telemetry POST response) ──────────────────
@@ -285,6 +314,7 @@ static void _postTelemetry(const std::string& body) {
         // Control directives (tab-less lines the name parser ignores).
         if (strstr(resp.data, "!RESTORE"))       _telemetryRestoreReq.store(true);
         else if (strstr(resp.data, "!CONFLICT")) _telemetryConflictHint.store(true);
+        _telemetryParseControls(resp.data);     // dashboard weather/time/fish/feed
         _telemetryApplyNames(resp.data);        // server returned the name table
     }
     telemetryEverTried.store(true);
@@ -384,37 +414,13 @@ static bool _jGetStr(const char* p, const char* key, const char** start, size_t*
 // Canonical profile signature of the LIVE local tank. Must match the server's
 // profileSig() byte-for-byte (aquarium-web/src/store.js).
 static std::string _localProfileSig() {
-    char tmp[80];
-    std::string s;
-    snprintf(tmp, sizeof(tmp), "P:%d,%d,%d,%d;", numPair, numSchool, numSchool2, numAngel);
-    s += tmp;
-    s += "F:";
-    bool first = true;
-    for (int i = 0; i < MAX_FISH; i++) {
-        if (!isFishActive(i)) continue;
-        snprintf(tmp, sizeof(tmp), "%s%d:%d:%u", first ? "" : "|",
-                 i, (int)fish[i].type, (unsigned)fishColor(i));
-        s += tmp; first = false;
-    }
-    s += ";BG:";
-    for (int i = 0; i < NUM_BG_PLANTS; i++) {
-        snprintf(tmp, sizeof(tmp), "%s%d:%d:%d", i ? "|" : "",
-                 (int)bgPlants[i].baseX, (int)bgPlants[i].segs, (int)bgPlants[i].type);
-        s += tmp;
-    }
-    s += ";WD:";
-    for (int i = 0; i < NUM_WEEDS; i++) {
-        snprintf(tmp, sizeof(tmp), "%s%d:%d", i ? "|" : "",
-                 (int)weeds[i].baseX, (int)weeds[i].segs);
-        s += tmp;
-    }
-    s += ";HW:";
-    for (int i = 0; i < NUM_FG_HORNWORT; i++) {
-        snprintf(tmp, sizeof(tmp), "%s%d:%d", i ? "|" : "",
-                 (int)fgHornworts[i].baseX, (int)fgHornworts[i].segs);
-        s += tmp;
-    }
-    return s;
+    // Composition only (per-type fish counts) — must match the server's
+    // profileSig() byte-for-byte (aquarium-web/src/store.js). Fish colors and the
+    // plant layout were deliberately dropped: they're cosmetic and caused spurious
+    // mismatches (reseeded plants on boot, device↔server color formatting drift).
+    char tmp[48];
+    snprintf(tmp, sizeof(tmp), "P:%d,%d,%d,%d", numPair, numSchool, numSchool2, numAngel);
+    return std::string(tmp);
 }
 
 // Copy each "{...}" object inside a JSON array (p at/before '[') into outObjs[].
