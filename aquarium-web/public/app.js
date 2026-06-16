@@ -630,14 +630,12 @@ function escapeHtml(str) {
 }
 
 // ─── Traffic monitor ─────────────────────────────────────────────────────────
-let trafficZip = localStorage.getItem('traffic_zip') || '';
+let trafficZip = '';
 let trafficTimer = null;
 
 const zipInput = document.getElementById('zip-input');
 const zipGo = document.getElementById('zip-go');
 const trafficStatus = document.getElementById('traffic-status');
-
-if (trafficZip) zipInput.value = trafficZip;
 
 function congestionLabel(c) {
   if (c < 0.15) return 'Free flow';
@@ -684,23 +682,42 @@ function startTrafficPolling(zip) {
   trafficTimer = setInterval(() => fetchTraffic(zip), 60_000);
 }
 
-function applyZip() {
+async function applyZip() {
   const zip = zipInput.value.trim();
   if (!/^\d{5}$/.test(zip)) {
     trafficStatus.textContent = 'Enter a valid 5-digit ZIP code.';
     return;
   }
+  // Save to server so the ESP picks it up
+  try {
+    await fetch('api/traffic/zip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ zip }),
+    });
+  } catch { /* non-fatal — still poll traffic below */ }
   trafficZip = zip;
-  localStorage.setItem('traffic_zip', zip);
   startTrafficPolling(zip);
 }
 
 zipGo.addEventListener('click', applyZip);
 zipInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyZip(); });
 
-if (trafficZip) startTrafficPolling(trafficZip);
+// Load ZIP from server on startup
+async function initTrafficZip() {
+  try {
+    const res = await fetch('api/traffic/zip');
+    const data = await res.json();
+    if (data.ok && /^\d{5}$/.test(data.zip)) {
+      trafficZip = data.zip;
+      zipInput.value = data.zip;
+      startTrafficPolling(data.zip);
+    }
+  } catch { /* no zip configured yet */ }
+}
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
 refreshList();
 setInterval(refreshList, 5000);
 startWatchdog();
+initTrafficZip();
