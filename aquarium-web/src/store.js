@@ -180,26 +180,19 @@ function getOrCreate(id) {
   return entry;
 }
 
-// Canonical profile signature: the aquarium's *composition* (not positions) —
-// per-type counts, each fish's id/type/color, and the plant layout. The device
-// builds the identical string so the two can be compared byte-for-byte. Changing
-// fish counts/types/colors or the plant set changes the signature; fish merely
-// swimming does not.
+// Canonical profile signature: the aquarium's *composition* — the per-type fish
+// census. A "profile mismatch" means the device's tank holds a different number of
+// each fish type than the server's saved baseline. The device builds the identical
+// string (_localProfileSig) so the two compare byte-for-byte.
+//
+// Deliberately NOT included: fish positions (change every frame), fish colors
+// (deterministic from slot, but a source of device↔server formatting drift), and
+// the plant layout (reseeded randomly on a fresh boot). Those are cosmetic and
+// caused permanent false mismatches; counts are the stable, meaningful identity.
 function profileSig(s) {
   if (!s) return '';
   const c = s.counts || {};
-  const fish = (Array.isArray(s.fish) ? s.fish.slice() : []).sort((a, b) => (a.id || 0) - (b.id || 0));
-  const pl = s.plants || {};
-  const bg = Array.isArray(pl.bg) ? pl.bg : [];
-  const wd = Array.isArray(pl.weeds) ? pl.weeds : [];
-  const hw = Array.isArray(pl.hornwort) ? pl.hornwort : [];
-  return [
-    `P:${c.pair || 0},${c.school || 0},${c.school2 || 0},${c.angel || 0}`,
-    'F:' + fish.map((f) => `${f.id | 0}:${f.type || 0}:${(f.color >>> 0) || 0}`).join('|'),
-    'BG:' + bg.map((p) => `${p.x | 0}:${p.segs | 0}:${p.type || 0}`).join('|'),
-    'WD:' + wd.map((p) => `${p.x | 0}:${p.segs | 0}`).join('|'),
-    'HW:' + hw.map((p) => `${p.x | 0}:${p.segs | 0}`).join('|'),
-  ].join(';');
+  return `P:${c.pair || 0},${c.school || 0},${c.school2 || 0},${c.angel || 0}`;
 }
 
 // Update per-fish age metadata from a snapshot's fish list.
@@ -493,6 +486,15 @@ function resolveConflict(id, choice) {
   return { ok: false, error: 'bad_choice' };
 }
 
+// Forget an aquarium: drop it from memory and delete its persisted file. A device
+// that is still alive will simply re-create it on its next telemetry POST; for a
+// stale (gone) device this is a permanent removal. Returns whether it existed.
+function remove(id) {
+  const existed = aquariums.delete(id);
+  db.deleteAquarium(id);
+  return { ok: true, existed };
+}
+
 function subscribe(fn) {
   subscribers.add(fn);
   return () => subscribers.delete(fn);
@@ -500,6 +502,6 @@ function subscribe(fn) {
 
 module.exports = {
   upsert, list, get, bootstrap, resolveConflict, subscribe, setName, getNamesText,
-  queueControl, FISH_MAX,
+  queueControl, remove, FISH_MAX,
   STALE_MS, MAX_AQUARIUMS,
 };

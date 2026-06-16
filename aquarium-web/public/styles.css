@@ -11,6 +11,11 @@
 
 * { box-sizing: border-box; }
 
+/* The `hidden` attribute must win over author display rules. Without this, a rule
+   like `.conflict-bar { display: flex }` overrides the UA `[hidden]{display:none}`,
+   leaving "hidden" elements (e.g. the profile-mismatch bar) permanently visible. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
@@ -54,6 +59,7 @@ main {
 
 #aquarium-list { list-style: none; margin: 0; padding: 0; }
 #aquarium-list li {
+  position: relative;
   padding: 10px 12px;
   margin-bottom: 8px;
   background: var(--panel-2);
@@ -63,7 +69,30 @@ main {
 }
 #aquarium-list li:hover { border-color: var(--accent); }
 #aquarium-list li.active { border-color: var(--accent); background: #24486a; }
-.aq-name { font-weight: 600; display: flex; align-items: center; gap: 7px; }
+
+/* Per-row remove (×) button — appears on hover, always faintly shown for stale rows. */
+.aq-del {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s, background 0.12s, color 0.12s;
+}
+#aquarium-list li:hover .aq-del { opacity: 1; }
+#aquarium-list li.stale-row .aq-del { opacity: 0.55; }
+.aq-del:hover { background: #c8593f33; color: var(--stale); opacity: 1; }
+
+.aq-name { font-weight: 600; display: flex; align-items: center; gap: 7px; padding-right: 20px; }
 .aq-meta { font-size: 12px; color: var(--muted); margin-top: 3px; }
 .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
 .dot.live { background: var(--live); box-shadow: 0 0 6px var(--live); }

@@ -414,37 +414,13 @@ static bool _jGetStr(const char* p, const char* key, const char** start, size_t*
 // Canonical profile signature of the LIVE local tank. Must match the server's
 // profileSig() byte-for-byte (aquarium-web/src/store.js).
 static std::string _localProfileSig() {
-    char tmp[80];
-    std::string s;
-    snprintf(tmp, sizeof(tmp), "P:%d,%d,%d,%d;", numPair, numSchool, numSchool2, numAngel);
-    s += tmp;
-    s += "F:";
-    bool first = true;
-    for (int i = 0; i < MAX_FISH; i++) {
-        if (!isFishActive(i)) continue;
-        snprintf(tmp, sizeof(tmp), "%s%d:%d:%u", first ? "" : "|",
-                 i, (int)fish[i].type, (unsigned)fishColor(i));
-        s += tmp; first = false;
-    }
-    s += ";BG:";
-    for (int i = 0; i < NUM_BG_PLANTS; i++) {
-        snprintf(tmp, sizeof(tmp), "%s%d:%d:%d", i ? "|" : "",
-                 (int)bgPlants[i].baseX, (int)bgPlants[i].segs, (int)bgPlants[i].type);
-        s += tmp;
-    }
-    s += ";WD:";
-    for (int i = 0; i < NUM_WEEDS; i++) {
-        snprintf(tmp, sizeof(tmp), "%s%d:%d", i ? "|" : "",
-                 (int)weeds[i].baseX, (int)weeds[i].segs);
-        s += tmp;
-    }
-    s += ";HW:";
-    for (int i = 0; i < NUM_FG_HORNWORT; i++) {
-        snprintf(tmp, sizeof(tmp), "%s%d:%d", i ? "|" : "",
-                 (int)fgHornworts[i].baseX, (int)fgHornworts[i].segs);
-        s += tmp;
-    }
-    return s;
+    // Composition only (per-type fish counts) — must match the server's
+    // profileSig() byte-for-byte (aquarium-web/src/store.js). Fish colors and the
+    // plant layout were deliberately dropped: they're cosmetic and caused spurious
+    // mismatches (reseeded plants on boot, device↔server color formatting drift).
+    char tmp[48];
+    snprintf(tmp, sizeof(tmp), "P:%d,%d,%d,%d", numPair, numSchool, numSchool2, numAngel);
+    return std::string(tmp);
 }
 
 // Copy each "{...}" object inside a JSON array (p at/before '[') into outObjs[].

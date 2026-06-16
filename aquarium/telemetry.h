@@ -330,31 +330,12 @@ static void _telemetryTask(void*) {
 // Canonical profile signature of the LIVE local tank. Must match the server's
 // profileSig() byte-for-byte (aquarium-web/src/store.js).
 static String _localProfileSig() {
-    String s = "P:" + String(numPair) + "," + String(numSchool) + "," +
-               String(numSchool2) + "," + String(numAngel) + ";F:";
-    bool first = true;
-    for (int i = 0; i < MAX_FISH; i++) {
-        if (!isFishActive(i)) continue;
-        if (!first) s += "|";
-        s += String(i) + ":" + String((int)fish[i].type) + ":" + String((unsigned)fishColor(i));
-        first = false;
-    }
-    s += ";BG:";
-    for (int i = 0; i < NUM_BG_PLANTS; i++) {
-        if (i) s += "|";
-        s += String((int)bgPlants[i].baseX) + ":" + String((int)bgPlants[i].segs) + ":" + String((int)bgPlants[i].type);
-    }
-    s += ";WD:";
-    for (int i = 0; i < NUM_WEEDS; i++) {
-        if (i) s += "|";
-        s += String((int)weeds[i].baseX) + ":" + String((int)weeds[i].segs);
-    }
-    s += ";HW:";
-    for (int i = 0; i < NUM_FG_HORNWORT; i++) {
-        if (i) s += "|";
-        s += String((int)fgHornworts[i].baseX) + ":" + String((int)fgHornworts[i].segs);
-    }
-    return s;
+    // Composition only (per-type fish counts) — must match the server's
+    // profileSig() byte-for-byte (aquarium-web/src/store.js). Fish colors and the
+    // plant layout were deliberately dropped: they're cosmetic and caused spurious
+    // mismatches (reseeded plants on boot, device↔server color formatting drift).
+    return "P:" + String(numPair) + "," + String(numSchool) + "," +
+           String(numSchool2) + "," + String(numAngel);
 }
 
 // GET /bootstrap into doc. Returns true on HTTP 200 + valid JSON.

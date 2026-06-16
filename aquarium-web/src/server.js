@@ -162,6 +162,12 @@ app.post('/api/aquariums/:id/control', (req, res) => {
   return res.json(result);
 });
 
+// Remove an aquarium from the dashboard (open like the other dashboard APIs). A
+// live device re-creates it on its next POST; a stale one stays gone.
+app.delete('/api/aquariums/:id', (req, res) => {
+  return res.json(store.remove(req.params.id));
+});
+
 // ─── Read APIs ───────────────────────────────────────────────────────────────
 app.get('/api/aquariums', (_req, res) => res.json(store.list()));
 

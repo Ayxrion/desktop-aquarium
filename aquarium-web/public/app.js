@@ -629,23 +629,70 @@ function setConn(online) {
   els.conn.className = 'conn ' + (online ? 'online' : 'offline');
 }
 
+// ─── URL routing ─────────────────────────────────────────────────────────────
+// The selected aquarium lives in the hash (#/<id>) so the view survives reloads
+// and is shareable. Hash routing is reverse-proxy-safe (independent of the
+// injected <base href>) and needs no server-side catch-all route.
+function routeId() {
+  return decodeURIComponent(location.hash.replace(/^#\/?/, '')) || null;
+}
+function setRoute(id) {
+  if (id) {
+    const target = '#/' + encodeURIComponent(id);
+    if (location.hash !== target) location.hash = target;
+  } else if (location.hash) {
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+}
+
+// Forget an aquarium (stale device gone for good, or just decluttering). A live
+// device re-appears on its next telemetry post.
+async function removeAquarium(id, stale) {
+  const msg = `Remove aquarium "${id}"?` + (stale
+    ? '\n\nIt appears to be offline (stale).'
+    : '\n\nIt is still reporting and will reappear on its next update.');
+  if (!window.confirm(msg)) return;
+  try {
+    await fetch('api/aquariums/' + encodeURIComponent(id), { method: 'DELETE' });
+  } catch { /* ignore — the list refresh below reflects reality */ }
+  if (selectedId === id) {
+    if (stream) { stream.close(); stream = null; }
+    selectedId = null;
+    latestSnapshot = null;
+    els.viewContent.hidden = true;
+    els.viewEmpty.hidden = false;
+    setRoute(null);
+  }
+  refreshList();
+}
+
 function renderList(items) {
   els.emptyHint.hidden = items.length > 0;
   els.list.innerHTML = '';
   for (const a of items) {
     const li = document.createElement('li');
-    if (a.aquarium_id === selectedId) li.className = 'active';
+    li.className = (a.aquarium_id === selectedId ? 'active' : '') + (a.stale ? ' stale-row' : '');
     const weather = a.weather ? (WEATHER_NAMES[a.weather.condition] || '?') : '—';
     li.innerHTML = `
+      <button class="aq-del" title="Remove this aquarium" aria-label="Remove aquarium">×</button>
       <div class="aq-name">
         <span class="dot ${a.stale ? 'stale' : 'live'}"></span>${escapeHtml(a.aquarium_id)}${a.conflict ? '<span class="aq-conflict">⚠ mismatch</span>' : ''}
       </div>
       <div class="aq-meta">${escapeHtml(a.platform)} · ${a.fishCount} fish · ${weather}</div>`;
-    li.onclick = () => select(a.aquarium_id);
+    li.addEventListener('click', () => select(a.aquarium_id));
+    li.querySelector('.aq-del').addEventListener('click', (e) => {
+      e.stopPropagation();
+      removeAquarium(a.aquarium_id, a.stale);
+    });
     els.list.appendChild(li);
   }
-  // Highlight the first aquarium by default so the view is never empty.
-  if (!selectedId && items.length) select(items[0].aquarium_id);
+  // Default selection: honour the URL hash if it names a known aquarium, else the
+  // first one so the view is never empty.
+  if (!selectedId && items.length) {
+    const want = routeId();
+    const match = want && items.some((a) => a.aquarium_id === want);
+    select(match ? want : items[0].aquarium_id);
+  }
 }
 
 function select(id) {
@@ -665,6 +712,7 @@ function select(id) {
   els.viewEmpty.hidden = true;
   els.viewContent.hidden = false;
   openStream(id);
+  setRoute(id);
   refreshList();
 }
 
@@ -1365,6 +1413,11 @@ zipInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyZip();
 if (trafficZip) startTrafficPolling(trafficZip);
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
-refreshList();
+// Back/forward or a manually edited hash switches the viewed aquarium.
+window.addEventListener('hashchange', () => {
+  const id = routeId();
+  if (id && id !== selectedId) select(id);
+});
+refreshList(); // first load honours the hash via renderList's default selection
 setInterval(refreshList, 5000);
 startWatchdog();
