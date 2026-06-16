@@ -8,13 +8,18 @@ const store = require('./store');
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const INDEX_HTML = fs.readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
 
+const traffic = require('./traffic');
+
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const API_KEY = process.env.API_KEY || '';
 
 if (!API_KEY) {
-  // Refuse to run wide open — a publicly-routed ingest endpoint must have a key.
   console.error('FATAL: API_KEY env var is required (shared secret for telemetry ingest).');
   process.exit(1);
+}
+
+if (!traffic.hasKey()) {
+  console.warn('WARN: TOMTOM_API_KEY not set — /api/traffic will return 503.');
 }
 
 const app = express();
@@ -44,6 +49,24 @@ app.post('/api/telemetry', (req, res) => {
   const result = store.upsert(body);
   if (!result.ok) return res.status(429).json(result);
   return res.json({ ok: true });
+});
+
+// ─── Traffic ────────────────────────────────────────────────────────────────
+app.get('/api/traffic', async (req, res) => {
+  const zip = typeof req.query.zip === 'string' ? req.query.zip.trim() : '';
+  if (!/^\d{5}$/.test(zip)) {
+    return res.status(400).json({ ok: false, error: 'zip must be a 5-digit US zip code' });
+  }
+  if (!traffic.hasKey()) {
+    return res.status(503).json({ ok: false, error: 'TOMTOM_API_KEY not configured' });
+  }
+  try {
+    const result = await traffic.fetchFlow(zip);
+    return res.json({ ok: true, zip, ...result });
+  } catch (err) {
+    console.error('traffic fetch error:', err.message);
+    return res.status(502).json({ ok: false, error: err.message });
+  }
 });
 
 // ─── Read APIs ───────────────────────────────────────────────────────────────

@@ -110,6 +110,56 @@ main {
 .stat .value { font-size: 20px; font-weight: 600; margin-top: 4px; }
 .stat .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
 
+.traffic-section {
+  margin-top: 20px;
+  border-top: 1px solid #ffffff14;
+  padding-top: 14px;
+}
+.traffic-section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+
+.zip-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.zip-row input {
+  flex: 1;
+  background: var(--panel-2);
+  border: 1px solid #ffffff18;
+  border-radius: 6px;
+  color: var(--text);
+  padding: 6px 10px;
+  font-size: 14px;
+  outline: none;
+}
+.zip-row input:focus { border-color: var(--accent); }
+.zip-row button {
+  background: var(--accent);
+  color: #000;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 14px;
+}
+.zip-row button:hover { opacity: 0.85; }
+
+.traffic-status { font-size: 13px; }
+
+.traffic-bar-wrap {
+  margin-top: 8px;
+  background: #ffffff12;
+  border-radius: 999px;
+  height: 8px;
+  overflow: hidden;
+}
+.traffic-bar {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.6s ease, background 0.6s ease;
+}
+
 /* Responsive: stack the sidebar above the view on narrow screens. */
 @media (max-width: 720px) {
   main { flex-direction: column; height: auto; }

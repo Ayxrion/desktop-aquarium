@@ -118,6 +118,91 @@ function startWatchdog() {
   }, 2000);
 }
 
+// ─── EAC silhouette fish ─────────────────────────────────────────────────────
+const EAC_X1 = 560, EAC_X2 = 720;   // horizontal band (right side of tank)
+const EAC_MAX_FISH = 12;
+
+let eacFish = [];        // { x, y, speed, size, wobble, wobbleOff }
+let eacTargetCount = 0;  // set by traffic fetch
+let eacBright = 0.5;     // mirrors latest day-brightness so silhouettes dim at night
+
+function eacSpawnFish(y) {
+  return {
+    x: EAC_X1 + Math.random() * (EAC_X2 - EAC_X1),
+    y: y ?? (TANK_TOP + Math.random() * (SCREEN_H - TANK_TOP - 40)),
+    speed: 0.4 + Math.random() * 0.6,  // px per frame
+    size: 6 + Math.random() * 7,
+    wobble: 0.5 + Math.random() * 1.5, // lateral wobble amplitude
+    wobbleOff: Math.random() * Math.PI * 2,
+  };
+}
+
+function updateEacCount(congestion) {
+  eacTargetCount = Math.round(congestion * EAC_MAX_FISH);
+}
+
+function tickEac(frameCount) {
+  // Grow or shrink pool toward target
+  while (eacFish.length < eacTargetCount) eacFish.push(eacSpawnFish(TANK_TOP));
+  if (eacFish.length > eacTargetCount) eacFish.splice(eacTargetCount);
+
+  for (const f of eacFish) {
+    f.y += f.speed;
+    f.x = EAC_X1 + (EAC_X2 - EAC_X1) * 0.5 +
+          Math.sin(frameCount * 0.03 + f.wobbleOff) * f.wobble * (EAC_X2 - EAC_X1) * 0.35;
+    if (f.y > SCREEN_H - 40) f.y = TANK_TOP;  // loop back to top
+  }
+}
+
+function drawEacZone(bright) {
+  // Subtle current shimmer — faint vertical gradient tint
+  const grd = ctx.createLinearGradient(EAC_X1, 0, EAC_X2, 0);
+  grd.addColorStop(0,   'rgba(30,120,200,0)');
+  grd.addColorStop(0.5, `rgba(30,120,200,${(0.04 * bright).toFixed(3)})`);
+  grd.addColorStop(1,   'rgba(30,120,200,0)');
+  ctx.fillStyle = grd;
+  ctx.fillRect(EAC_X1, TANK_TOP, EAC_X2 - EAC_X1, SCREEN_H - TANK_TOP);
+
+  // Silhouette fish
+  ctx.save();
+  ctx.globalAlpha = 0.22 * bright + 0.06;
+  for (const f of eacFish) {
+    drawSilhouetteFish(f.x, f.y, f.size);
+  }
+  ctx.restore();
+}
+
+function drawSilhouetteFish(x, y, size) {
+  ctx.fillStyle = '#0a2a44';
+  ctx.save();
+  ctx.translate(x, y);
+  // body
+  ctx.beginPath();
+  ctx.ellipse(0, 0, size, size * 0.5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // tail (pointing left — fish face right, swimming downstream/south)
+  ctx.beginPath();
+  ctx.moveTo(-size, 0);
+  ctx.lineTo(-size - size * 0.7, -size * 0.45);
+  ctx.lineTo(-size - size * 0.7,  size * 0.45);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+// RAF loop — runs independently of snapshot delivery
+let _frameCount = 0;
+function eacLoop() {
+  eacBright = latest ? dayTint(latest.time && latest.time.day_progress) : 0.5;
+  tickEac(_frameCount++);
+  if (latest) {
+    // Redraw only the tank layer (title/stats don't need per-frame updates)
+    drawTank(latest);
+  }
+  requestAnimationFrame(eacLoop);
+}
+requestAnimationFrame(eacLoop);
+
 // ─── Rendering ───────────────────────────────────────────────────────────────
 function render() {
   if (!latest) return;
@@ -193,6 +278,9 @@ function drawTank(s) {
       ctx.fill();
     }
   }
+
+  // EAC silhouette fish (background layer, before foreground fish)
+  drawEacZone(bright);
 
   // Fish
   if (Array.isArray(s.fish)) {
@@ -307,6 +395,77 @@ function escapeHtml(str) {
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
   );
 }
+
+// ─── Traffic monitor ─────────────────────────────────────────────────────────
+let trafficZip = localStorage.getItem('traffic_zip') || '';
+let trafficTimer = null;
+
+const zipInput = document.getElementById('zip-input');
+const zipGo = document.getElementById('zip-go');
+const trafficStatus = document.getElementById('traffic-status');
+
+if (trafficZip) zipInput.value = trafficZip;
+
+function congestionLabel(c) {
+  if (c < 0.15) return 'Free flow';
+  if (c < 0.35) return 'Light';
+  if (c < 0.55) return 'Moderate';
+  if (c < 0.75) return 'Heavy';
+  return 'Gridlock';
+}
+
+function congestionColor(c) {
+  if (c < 0.25) return '#36d36b';
+  if (c < 0.5)  return '#f0c040';
+  if (c < 0.75) return '#f07830';
+  return '#e03030';
+}
+
+async function fetchTraffic(zip) {
+  trafficStatus.textContent = `Fetching traffic for ${zip}…`;
+  trafficStatus.className = 'traffic-status hint';
+  try {
+    const res = await fetch('api/traffic?zip=' + encodeURIComponent(zip));
+    const data = await res.json();
+    if (!data.ok) {
+      trafficStatus.textContent = `Error: ${data.error}`;
+      return;
+    }
+    updateEacCount(data.congestion);
+    const pct = Math.round(data.congestion * 100);
+    const label = congestionLabel(data.congestion);
+    const color = congestionColor(data.congestion);
+    trafficStatus.className = 'traffic-status';
+    trafficStatus.innerHTML =
+      `<strong style="color:${color}">${label}</strong> &mdash; ${pct}% congested<br>` +
+      `<span style="font-size:12px;color:var(--muted)">${data.speed} / ${data.freeFlow} MPH &nbsp;·&nbsp; ZIP ${zip}</span>` +
+      `<div class="traffic-bar-wrap"><div class="traffic-bar" style="width:${pct}%;background:${color}"></div></div>`;
+  } catch {
+    trafficStatus.textContent = 'Could not reach traffic API.';
+  }
+}
+
+function startTrafficPolling(zip) {
+  if (trafficTimer) clearInterval(trafficTimer);
+  fetchTraffic(zip);
+  trafficTimer = setInterval(() => fetchTraffic(zip), 60_000);
+}
+
+function applyZip() {
+  const zip = zipInput.value.trim();
+  if (!/^\d{5}$/.test(zip)) {
+    trafficStatus.textContent = 'Enter a valid 5-digit ZIP code.';
+    return;
+  }
+  trafficZip = zip;
+  localStorage.setItem('traffic_zip', zip);
+  startTrafficPolling(zip);
+}
+
+zipGo.addEventListener('click', applyZip);
+zipInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyZip(); });
+
+if (trafficZip) startTrafficPolling(trafficZip);
 
 // ─── Boot ────────────────────────────────────────────────────────────────────
 refreshList();
