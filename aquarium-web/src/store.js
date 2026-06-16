@@ -11,6 +11,23 @@
 
 const db = require('./db');
 
+// Fresh per-aquarium downstream-command state. The server can only talk to a
+// device in the response to that device's telemetry POST, so dashboard control
+// actions are buffered here and drained by getNamesText() into `!`-directive
+// lines. Each command type is collapsed to a single line per response (latest
+// weather/time wins; fish/feed counts accumulate) so the firmware can parse each
+// with one substring match.
+function freshPending() {
+  return {
+    restore: false,            // !RESTORE — re-fetch + adopt the server profile
+    weather: null,             // !WEATHER:<-1..6>  (null = nothing queued)
+    time: null,                // !TIME:<0|1>       (0 REAL, 1 FAST)
+    fishAdd: [0, 0, 0, 0],     // !FISHADD:<type>:<count>  per type 0..3
+    fishDel: [0, 0, 0, 0],     // !FISHDEL:<type>:<count>
+    feed: 0,                   // !FEED:<count>
+  };
+}
+
 const STALE_MS = parseInt(process.env.STALE_MS || '15000', 10);
 const MAX_AQUARIUMS = parseInt(process.env.MAX_AQUARIUMS || '64', 10);
 const FISH_GAP_MS = parseInt(process.env.FISH_GAP_MS || '10000', 10); // absence => new fish
@@ -106,7 +123,9 @@ const aquariums = new Map();
       saved: row.snapshot,                  // persisted snapshot is the baseline
       savedSig: profileSig(row.snapshot),
       conflict: null,
-      pendingDirective: null,
+      awaitingRestore: false,
+      adoptNext: false,
+      pending: freshPending(),
       lastSeenMs: row.lastSeenMs,
       createdAt: row.createdAt,
       names: row.names,           // Map<fishId, name> from DB
@@ -151,8 +170,10 @@ function getOrCreate(id) {
       saved: null,            // source-of-truth snapshot (profile baseline)
       savedSig: null,         // profileSig(saved)
       conflict: null,         // { savedSig, deviceSig, savedCounts, deviceCounts, since }
-      pendingDirective: null, // one-shot line for the device's next POST response
       awaitingRestore: false, // user chose 'server'; suppress conflict until device restores
+      adoptNext: false,       // a dashboard profile change is in flight; adopt the next
+                              //   diverged profile as the baseline instead of flagging it
+      pending: freshPending(),// buffered downstream control directives
     };
     aquariums.set(id, entry);
   }
@@ -274,6 +295,15 @@ function upsert(snapshot) {
     entry.conflict = null;
     entry.awaitingRestore = false;
     db.saveSnapshot(id, snapshot, t, entry.createdAt);
+  } else if (entry.adoptNext) {
+    // The dashboard issued a profile-changing control (add/remove fish) and the
+    // device has now applied it. Adopt the new composition as the baseline rather
+    // than treating the dashboard's own change as a conflict.
+    entry.saved = snapshot;
+    entry.savedSig = sig;
+    entry.conflict = null;
+    entry.adoptNext = false;
+    db.saveSnapshot(id, snapshot, t, entry.createdAt);
   } else if (entry.awaitingRestore) {
     // User chose 'server'; the restore directive is in flight but the device is
     // still reporting its old profile. Don't re-raise the conflict — wait for it
@@ -301,16 +331,71 @@ function getNamesText(id) {
   const entry = aquariums.get(id);
   if (!entry) return '';
   const lines = [];
-  // Control directives (no tab → the device's name parser skips them, but the
-  // device scans for them explicitly). One-shot: cleared once delivered.
-  if (entry.pendingDirective) {
-    lines.push(`!${entry.pendingDirective.toUpperCase()}`);
-    entry.pendingDirective = null;
-  } else if (entry.conflict) {
-    lines.push('!CONFLICT'); // device shows its on-screen prompt
+  // Control directives (tab-less lines the device's name parser skips, but the
+  // device scans for them explicitly). Drained here: one-shot per response.
+  const p = entry.pending || (entry.pending = freshPending());
+  let restoreEmitted = false;
+  if (p.restore) { lines.push('!RESTORE'); p.restore = false; restoreEmitted = true; }
+  if (p.weather !== null) { lines.push(`!WEATHER:${p.weather}`); p.weather = null; }
+  if (p.time !== null) { lines.push(`!TIME:${p.time}`); p.time = null; }
+  for (let t = 0; t < 4; t++) {
+    if (p.fishAdd[t] > 0) { lines.push(`!FISHADD:${t}:${p.fishAdd[t]}`); p.fishAdd[t] = 0; }
   }
+  for (let t = 0; t < 4; t++) {
+    if (p.fishDel[t] > 0) { lines.push(`!FISHDEL:${t}:${p.fishDel[t]}`); p.fishDel[t] = 0; }
+  }
+  if (p.feed > 0) { lines.push(`!FEED:${p.feed}`); p.feed = 0; }
+  // Only nudge the device's on-screen conflict prompt when we're not already
+  // telling it to restore (restore resolves the conflict on its own).
+  if (!restoreEmitted && entry.conflict) lines.push('!CONFLICT');
   for (const [fishId, name] of entry.names) lines.push(`${fishId}\t${name}`);
   return lines.join('\n');
+}
+
+// Fish-type caps mirror the firmware (main.cpp / aquarium.ino) so the dashboard
+// and server can validate without a round-trip.
+const FISH_MAX = [8, 16, 20, 12]; // pair, school, school2, angel
+
+// Buffer a downstream control directive for the device's next telemetry response.
+// Returns { ok } or { ok:false, error } on bad input.
+function queueControl(id, cmd) {
+  if (!cmd || typeof cmd !== 'object') return { ok: false, error: 'bad_command' };
+  const entry = getOrCreate(id);
+  const p = entry.pending || (entry.pending = freshPending());
+  switch (cmd.type) {
+    case 'weather': {
+      const v = Number(cmd.value);
+      if (!Number.isInteger(v) || v < -1 || v > 6) return { ok: false, error: 'bad_weather' };
+      p.weather = v;
+      break;
+    }
+    case 'time': {
+      const v = String(cmd.value).toUpperCase();
+      if (v !== 'REAL' && v !== 'FAST') return { ok: false, error: 'bad_time' };
+      p.time = v === 'FAST' ? 1 : 0;
+      break;
+    }
+    case 'fish': {
+      const ft = Number(cmd.fishType);
+      const n = Math.max(1, Math.min(64, Number(cmd.count) || 1));
+      if (!Number.isInteger(ft) || ft < 0 || ft > 3) return { ok: false, error: 'bad_fish_type' };
+      if (cmd.action === 'add') p.fishAdd[ft] += n;
+      else if (cmd.action === 'remove') p.fishDel[ft] += n;
+      else return { ok: false, error: 'bad_fish_action' };
+      // The device will change its composition → next snapshot diverges from the
+      // saved baseline. Pre-arm adoption so that change isn't flagged as a conflict.
+      entry.adoptNext = true;
+      break;
+    }
+    case 'feed': {
+      const n = Math.max(1, Math.min(20, Number(cmd.count) || 1));
+      p.feed += n;
+      break;
+    }
+    default:
+      return { ok: false, error: 'unknown_type' };
+  }
+  return { ok: true };
 }
 
 function setName(aquariumId, fishId, rawName) {
@@ -392,7 +477,7 @@ function resolveConflict(id, choice) {
     entry.saved = entry.snapshot;
     entry.savedSig = profileSig(entry.snapshot);
     entry.conflict = null;
-    entry.pendingDirective = null;
+    entry.pending.restore = false;
     entry.awaitingRestore = false;
     db.saveSnapshot(id, entry.saved, entry.lastSeenMs, entry.createdAt);
     broadcast(entry);
@@ -401,7 +486,7 @@ function resolveConflict(id, choice) {
   if (choice === 'server') {
     entry.conflict = null;
     entry.awaitingRestore = true;       // suppress re-flagging until the device restores
-    entry.pendingDirective = 'restore'; // delivered in the next POST response
+    entry.pending.restore = true;       // !RESTORE delivered in the next POST response
     broadcast(entry);
     return { ok: true, choice };
   }
@@ -415,5 +500,6 @@ function subscribe(fn) {
 
 module.exports = {
   upsert, list, get, bootstrap, resolveConflict, subscribe, setName, getNamesText,
+  queueControl, FISH_MAX,
   STALE_MS, MAX_AQUARIUMS,
 };

@@ -677,6 +677,27 @@ void dropFood(int touchX = -1, int touchY = -1) {
     }
 }
 
+// Apply dashboard control directives queued by the telemetry POST worker. Runs on
+// the main/render thread so it can safely mutate fish[], weather, time, and flakes.
+// Defined here (not in telemetry.h) because dropFood() is declared further down.
+void telemetryApplyControls() {
+    int w = _ctrlWeatherReq.exchange(-2);
+    if (w != -2) {
+        weatherOverrideIdx = (int8_t)w;                       // -1 = back to auto
+        if (w >= 0) { currentWeather = (WeatherCondition)w; initWeatherEffects(); }
+    }
+    int tm = _ctrlTimeReq.exchange(-1);
+    if      (tm == 0) currentTimeMode = TIME_REAL;
+    else if (tm == 1) currentTimeMode = TIME_FAST;
+
+    const FishType T[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
+    for (int t = 0; t < 4; t++) {
+        for (int n = _ctrlFishAddReq[t].exchange(0); n > 0; n--) addFish(T[t]);
+        for (int n = _ctrlFishDelReq[t].exchange(0); n > 0; n--) removeFish(T[t]);
+    }
+    for (int n = _ctrlFeedReq.exchange(0); n > 0; n--) dropFood();
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Update — snail / starfish / bubbles / flakes
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1450,6 +1471,7 @@ void loop() {
     updateWeatherEffects();
     telemetryUpdate();
     telemetryProcessFlags();   // act on server directives (rebuild / re-check)
+    telemetryApplyControls();  // apply dashboard weather/time/fish/feed directives
     updateBoat();
     updateSnail();
     updateStarfish();

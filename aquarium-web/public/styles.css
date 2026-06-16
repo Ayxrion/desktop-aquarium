@@ -232,6 +232,117 @@ main {
 .stat .value { font-size: 20px; font-weight: 600; margin-top: 4px; }
 .stat .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
 
+/* Device control panel (weather / timescale / fish / feed). */
+.controls {
+  margin-top: 14px;
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.controls h3 {
+  margin: 0 0 10px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--muted);
+}
+.ctrl-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.ctrl-label {
+  font-size: 13px;
+  color: var(--muted);
+  width: 78px;
+  flex-shrink: 0;
+}
+.ctrl-select {
+  flex: 1;
+  background: var(--panel-2);
+  border: 1px solid #ffffff18;
+  border-radius: 6px;
+  color: var(--text);
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+  cursor: pointer;
+}
+.ctrl-select:focus { border-color: var(--accent); }
+
+.seg {
+  display: flex;
+  flex: 1;
+  border: 1px solid #ffffff18;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.seg button {
+  flex: 1;
+  background: var(--panel-2);
+  border: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 0;
+  cursor: pointer;
+}
+.seg button + button { border-left: 1px solid #ffffff18; }
+.seg button:hover { color: var(--text); }
+.seg button.active { background: var(--accent); color: #00131f; font-weight: 600; }
+
+.ctrl-fish { flex: 1; display: flex; flex-direction: column; gap: 5px; }
+.ctrl-fish-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+.ctrl-fish-row .fish-name { flex: 1; min-width: 0; }
+.ctrl-fish-row .fish-count {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  min-width: 38px;
+  text-align: right;
+}
+.ctrl-fish-row .fish-btn {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  background: var(--panel-2);
+  border: 1px solid #ffffff18;
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+.ctrl-fish-row .fish-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.ctrl-fish-row .fish-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.ctrl-feed {
+  width: 100%;
+  margin-top: 2px;
+  background: var(--accent);
+  color: #00131f;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 0;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ctrl-feed:hover { opacity: 0.88; }
+.ctrl-feed:active { transform: translateY(1px); }
+
+.ctrl-status { font-size: 12px; color: var(--muted); margin-top: 8px; min-height: 16px; }
+.ctrl-status.err { color: var(--stale); }
+.ctrl-status.ok { color: var(--live); }
+
 .traffic-section {
   margin-top: 20px;
   border-top: 1px solid #ffffff14;

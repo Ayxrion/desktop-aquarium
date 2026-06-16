@@ -54,6 +54,35 @@
           </div>
           <aside class="tank-info">
             <div id="stats" class="stats"></div>
+            <div id="controls" class="controls" hidden>
+              <h3>Controls</h3>
+              <div class="ctrl-group">
+                <label class="ctrl-label" for="ctrl-weather">Weather</label>
+                <select id="ctrl-weather" class="ctrl-select">
+                  <option value="-1">Auto</option>
+                  <option value="0">Sunny</option>
+                  <option value="1">Partly Cloudy</option>
+                  <option value="2">Cloudy</option>
+                  <option value="3">Rainy</option>
+                  <option value="4">Stormy</option>
+                  <option value="5">Snowy</option>
+                  <option value="6">Foggy</option>
+                </select>
+              </div>
+              <div class="ctrl-group">
+                <span class="ctrl-label">Timescale</span>
+                <div class="seg" id="ctrl-time">
+                  <button type="button" data-mode="REAL">Real</button>
+                  <button type="button" data-mode="FAST">Fast</button>
+                </div>
+              </div>
+              <div class="ctrl-group">
+                <span class="ctrl-label">Fish</span>
+                <div id="ctrl-fish" class="ctrl-fish"></div>
+              </div>
+              <button type="button" id="ctrl-feed" class="ctrl-feed">🍤 Feed the fish</button>
+              <div id="ctrl-status" class="ctrl-status" aria-live="polite"></div>
+            </div>
           </aside>
         </div>
         <div class="legend-head">

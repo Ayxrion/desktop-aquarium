@@ -5,6 +5,9 @@
 
 const WEATHER_NAMES = ['Sunny', 'Partly Cloudy', 'Cloudy', 'Rainy', 'Stormy', 'Snowy', 'Foggy'];
 const FISH_TYPE_NAMES = ['Pair', 'School', 'School 2', 'Angel'];
+// Per-type caps + snapshot count keys, mirroring the firmware (main.cpp / aquarium.ino).
+const FISH_MAX = [8, 16, 20, 12];
+const FISH_COUNT_KEYS = ['pair', 'school', 'school2', 'angel'];
 const TANK_TOP = 72;
 const SCREEN_W = 800;
 const SCREEN_H = 480;
@@ -454,10 +457,13 @@ const bubbles = Array.from({ length: 20 }, () => ({
   r: 3 + Math.floor(Math.random() * 6),
   ph: Math.random() * Math.PI * 2,
 }));
-function tickBubbles() {
+// The device steps bubbles once per 50ms frame (FRAME_MS); the browser rAF runs
+// at ~60fps, so applying the per-frame delta every rAF made bubbles rise ~3x too
+// fast. Drive them by elapsed device-frames (df) instead so they match the device.
+function tickBubbles(df) {
   for (const b of bubbles) {
-    b.y -= b.spd;
-    b.x = clamp(b.x + Math.sin(animTick * 0.06 + b.ph) * 0.8, 2, SCREEN_W - 2);
+    b.y -= b.spd * df;
+    b.x = clamp(b.x + Math.sin(animTick * 0.06 + b.ph) * 0.8 * df, 2, SCREEN_W - 2);
     if (b.y < TANK_TOP) {
       b.y = SCREEN_H + 10; b.x = Math.random() * SCREEN_W;
       b.spd = 0.8 + Math.random() * 1.7; b.r = 3 + Math.floor(Math.random() * 6);
@@ -597,6 +603,12 @@ const els = {
   conflictDetail: document.getElementById('conflict-detail'),
   conflictServer: document.getElementById('conflict-server'),
   conflictLocal: document.getElementById('conflict-local'),
+  controls: document.getElementById('controls'),
+  ctrlWeather: document.getElementById('ctrl-weather'),
+  ctrlTime: document.getElementById('ctrl-time'),
+  ctrlFish: document.getElementById('ctrl-fish'),
+  ctrlFeed: document.getElementById('ctrl-feed'),
+  ctrlStatus: document.getElementById('ctrl-status'),
 };
 const ctx = els.canvas.getContext('2d');
 
@@ -648,6 +660,8 @@ function select(id) {
   legendRows.clear();
   els.legend.innerHTML = '';
   els.conflictBar.hidden = true;
+  els.controls.hidden = true;
+  _ctrlHold.weather = _ctrlHold.time = 0;
   els.viewEmpty.hidden = true;
   els.viewContent.hidden = false;
   openStream(id);
@@ -697,6 +711,7 @@ function applySnapshot(snap) {
   drawStats(snap);
   renderLegend(snap);
   renderConflict(snap);
+  renderControls(snap);
   setConn(true);
   // Ensure the 60fps canvas loop is running.
   if (!rafId) rafId = requestAnimationFrame(_rafDraw);
@@ -748,15 +763,14 @@ const EAC_MAX_FISH = 12;
 let eacFish = [];
 let eacTargetCount = 0;
 let eacBright = 0.5;
-let _frameCount = 0;
 
 function eacSpawnFish(startX) {
   const bandH = EAC_Y2 - EAC_Y1;
   return {
     x: startX ?? Math.random() * SCREEN_W,
     y: EAC_Y1 + bandH * 0.1 + Math.random() * bandH * 0.8,
-    speed: 0.35 + Math.random() * 0.55,
-    size: 7 + Math.random() * 8,
+    speed: 0.3 + Math.random() * 0.5,   // device spd range (0.3..0.8 px/device-frame)
+    size: 6 + Math.random() * 7,        // device size range (6..13)
     wobbleOff: Math.random() * Math.PI * 2,
   };
 }
@@ -765,15 +779,18 @@ function updateEacCount(congestion) {
   eacTargetCount = Math.round(congestion * EAC_MAX_FISH);
 }
 
-function tickEac(frameCount) {
+// Drift the traffic silhouettes at the device's 20fps cadence: advance by `df`
+// device-frames per call (not once per rAF) and phase the wobble off animTick
+// (device tick units), exactly like the device's updateEacFish().
+function tickEac(df) {
   while (eacFish.length < eacTargetCount) eacFish.push(eacSpawnFish(0));
   if (eacFish.length > eacTargetCount) eacFish.splice(eacTargetCount);
 
   const bandH = EAC_Y2 - EAC_Y1;
   for (const f of eacFish) {
-    f.x += f.speed;
+    f.x += f.speed * df;
     // gentle vertical wobble within the band
-    f.y = EAC_Y1 + bandH * 0.5 + Math.sin(frameCount * 0.018 + f.wobbleOff) * bandH * 0.3;
+    f.y = EAC_Y1 + bandH * 0.5 + Math.sin(animTick * 0.018 + f.wobbleOff) * bandH * 0.3;
     if (f.x > SCREEN_W + 20) f.x = -20;  // loop left
   }
 }
@@ -812,10 +829,14 @@ function drawSilhouetteFish(x, y, size) {
 function _rafDraw() {
   rafId = requestAnimationFrame(_rafDraw);
   const now = Date.now();
+  const prevTick = animTick;
   animTick = now / 50;            // device "tick" units (one per frame at 50ms)
-  _frameCount++;
-  tickEac(_frameCount);
-  tickBubbles();
+  // Device-frames elapsed since the last rAF. Clamp so a backgrounded tab (large
+  // gap) doesn't teleport the local sims when it resumes. All local animations are
+  // advanced by this so they run at the device's 20fps cadence, not the browser's.
+  const dframes = prevTick ? clamp(animTick - prevTick, 0, 5) : 1;
+  tickEac(dframes);
+  tickBubbles(dframes);
   eacBright = latestSnapshot
     ? dayTint(latestSnapshot.time && latestSnapshot.time.day_progress)
     : 0.5;
@@ -971,6 +992,125 @@ async function resolveConflict(choice) {
 
 els.conflictServer.addEventListener('click', () => resolveConflict('server'));
 els.conflictLocal.addEventListener('click', () => resolveConflict('local'));
+
+// ─── Device controls (weather / timescale / fish / feed) ─────────────────────
+// POST a directive to the server, which forwards it to the device in the reply
+// to that device's next telemetry POST. State is reflected back from snapshots,
+// but the device takes a cycle or two to apply, so we briefly "hold" the user's
+// own weather/timescale choice to avoid the control snapping back meanwhile.
+const CTRL_HOLD_MS = 4000;
+const _ctrlHold = { weather: 0, time: 0 };
+let _ctrlStatusTimer = null;
+let _fishRowsBuilt = false;
+const fishCountEls = [];
+const fishBtns = [];
+
+function setCtrlStatus(msg, kind) {
+  els.ctrlStatus.textContent = msg;
+  els.ctrlStatus.className = 'ctrl-status' + (kind ? ' ' + kind : '');
+  clearTimeout(_ctrlStatusTimer);
+  _ctrlStatusTimer = setTimeout(() => {
+    els.ctrlStatus.textContent = '';
+    els.ctrlStatus.className = 'ctrl-status';
+  }, 2500);
+}
+
+async function sendControl(cmd, okMsg) {
+  if (!selectedId) return false;
+  try {
+    const res = await fetch(`api/aquariums/${encodeURIComponent(selectedId)}/control`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cmd),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) { setCtrlStatus(data.error || 'Failed', 'err'); return false; }
+    setCtrlStatus(okMsg || 'Sent ✓', 'ok');
+    return true;
+  } catch {
+    setCtrlStatus('Network error', 'err');
+    return false;
+  }
+}
+
+function buildFishControls() {
+  els.ctrlFish.innerHTML = '';
+  for (let t = 0; t < 4; t++) {
+    const row = document.createElement('div');
+    row.className = 'ctrl-fish-row';
+    const name = document.createElement('span');
+    name.className = 'fish-name';
+    name.textContent = FISH_TYPE_NAMES[t];
+    const minus = document.createElement('button');
+    minus.className = 'fish-btn';
+    minus.textContent = '−';
+    minus.title = `Remove a ${FISH_TYPE_NAMES[t]}`;
+    minus.addEventListener('click', () => changeFish(t, 'remove'));
+    const count = document.createElement('span');
+    count.className = 'fish-count';
+    const plus = document.createElement('button');
+    plus.className = 'fish-btn';
+    plus.textContent = '+';
+    plus.title = `Add a ${FISH_TYPE_NAMES[t]}`;
+    plus.addEventListener('click', () => changeFish(t, 'add'));
+    row.append(name, minus, count, plus);
+    els.ctrlFish.appendChild(row);
+    fishCountEls[t] = count;
+    fishBtns[t] = { minus, plus };
+  }
+  _fishRowsBuilt = true;
+}
+
+function changeFish(t, action) {
+  sendControl(
+    { type: 'fish', action, fishType: t, count: 1 },
+    `${action === 'add' ? 'Added' : 'Removed'} ${FISH_TYPE_NAMES[t]} ✓`
+  );
+}
+
+function renderControls(snap) {
+  if (!snap) { els.controls.hidden = true; return; }
+  els.controls.hidden = false;
+  const now = Date.now();
+
+  // Weather: value -1 (auto) when not overridden, else the forced condition.
+  const w = snap.weather || {};
+  const wv = w.override ? (w.condition | 0) : -1;
+  if (document.activeElement !== els.ctrlWeather && now - _ctrlHold.weather > CTRL_HOLD_MS) {
+    els.ctrlWeather.value = String(wv);
+  }
+
+  // Timescale active button.
+  if (now - _ctrlHold.time > CTRL_HOLD_MS) {
+    const mode = (snap.time && snap.time.mode) || 'REAL';
+    for (const b of els.ctrlTime.querySelectorAll('button')) {
+      b.classList.toggle('active', b.dataset.mode === mode);
+    }
+  }
+
+  // Fish counts + cap-aware enabling.
+  if (!_fishRowsBuilt) buildFishControls();
+  const counts = snap.counts || {};
+  for (let t = 0; t < 4; t++) {
+    const c = counts[FISH_COUNT_KEYS[t]] || 0;
+    fishCountEls[t].textContent = `${c}/${FISH_MAX[t]}`;
+    fishBtns[t].minus.disabled = c <= 0;
+    fishBtns[t].plus.disabled = c >= FISH_MAX[t];
+  }
+}
+
+els.ctrlWeather.addEventListener('change', () => {
+  _ctrlHold.weather = Date.now();
+  sendControl({ type: 'weather', value: parseInt(els.ctrlWeather.value, 10) }, 'Weather set ✓');
+});
+els.ctrlTime.addEventListener('click', (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  _ctrlHold.time = Date.now();
+  for (const b of els.ctrlTime.querySelectorAll('button')) b.classList.toggle('active', b === btn);
+  sendControl({ type: 'time', value: btn.dataset.mode }, `Timescale: ${btn.dataset.mode} ✓`);
+});
+els.ctrlFeed.addEventListener('click', () => sendControl({ type: 'feed', count: 1 }, 'Fed the fish 🐟'));
 
 function drawTitle(s) {
   els.viewName.textContent = s.aquarium_id || selectedId || '—';
