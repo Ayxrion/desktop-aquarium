@@ -167,7 +167,7 @@ int gameCoins = 0, gameShells = 0, gameFood = 0;
 #define WANDER_BASE_CD 7000             // wandering fish are very rare
 #define COIN_GRAV     0.2f              // coin sink acceleration (px/frame²) — gentle, water-like
 #define COIN_MAX_VY   2.8f              // terminal sink speed so coins drift down, not plummet
-#define COIN_REST     20                // frames a landed coin sits before vanishing (~1s)
+#define COIN_REST     80                // frames a landed coin sits before vanishing (~4s)
 #define SHELL_TTL     220               // shells linger on the sand a bit longer
 #define SAND_Y        (SCREEN_H - 20)   // resting line on the sea floor
 static const int FISH_PRICE[4] = { 10, 30, 45, 60 };
@@ -282,10 +282,9 @@ void drawPulses() {
         Pulse& p = pulses[i];
         float t = (float)p.age / (float)p.life;       // 0..1 progress
         int cx = (int)p.x, cy = (int)p.y;
-        if (p.kind == 0) {                            // glass tap: two expanding rings
-            int r = (int)(4 + t * 26);
-            canvas.drawCircle(cx, cy, r, pulseFade(0xCCF2FFUL, t));
-            if (r > 6) canvas.drawCircle(cx, cy, r - 5, pulseFade(0x88CCFFUL, t));
+        if (p.kind == 0) {                            // glass tap: a single soft ring
+            int r = (int)(3 + t * 16);
+            canvas.drawCircle(cx, cy, r, pulseFade(0x6FAAD0UL, t));
         } else {                                       // collect: ring + four sparks
             int r = (int)(6 + t * 22), s = (int)(3 + t * 16);
             uint32_t col = pulseFade(p.col, t);

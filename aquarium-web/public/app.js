@@ -729,18 +729,17 @@ function drawPulses() {
   ctx.save();
   for (let i = pulses.length - 1; i >= 0; i--) {
     const p = pulses[i];
-    const life = p.kind === 'tap' ? 480 : 620;
+    const life = p.kind === 'tap' ? 420 : 620;
     const t = (now - p.t0) / life;
     if (t >= 1) { pulses.splice(i, 1); continue; }
     const ease = 1 - (1 - t) * (1 - t);   // ease-out expansion
     const a = 1 - t;                        // linear fade
     if (p.kind === 'tap') {
-      const r = 6 + ease * 30;
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = rgbaFromHex('#c8f0ff', a * 0.9);
+      // A single faint ripple — just enough to register where you tapped.
+      const r = 5 + ease * 18;
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = rgbaFromHex('#bfe6ff', a * 0.38);
       ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.stroke();
-      ctx.strokeStyle = rgbaFromHex('#78c8ff', a * 0.5);
-      ctx.beginPath(); ctx.arc(p.x, p.y, r * 0.55, 0, Math.PI * 2); ctx.stroke();
     } else {
       const col = p.color || '#ffd23f';
       const r = 8 + ease * 26;

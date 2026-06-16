@@ -22,8 +22,6 @@ body {
   font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
   background: var(--bg);
   color: var(--text);
-  /* Everything is sized to fit the viewport — the page itself never scrolls. */
-  overflow: hidden;
 }
 
 header {
@@ -101,17 +99,10 @@ main {
 .dot.live { background: var(--live); box-shadow: 0 0 6px var(--live); }
 .dot.stale { background: var(--stale); }
 
-#view { flex: 1; padding: 18px; min-width: 0; overflow: hidden; display: flex; }
+#view { flex: 1; padding: 18px; overflow-y: auto; }
 .hint { color: var(--muted); font-size: 14px; }
 
-#view-content {
-  max-width: 1280px;
-  width: 100%;
-  margin: 0 auto;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;       /* allow children to shrink so the tank scales to fit */
-}
+#view-content { max-width: 1280px; margin: 0 auto; }
 /* The empty-state hint isn't a flex column; keep it simple. */
 #view-empty { margin: auto; }
 
@@ -157,18 +148,13 @@ main {
 .tank-row {
   display: flex;
   gap: 18px;
-  align-items: stretch;
-  flex: 1 1 auto;
-  min-height: 0;        /* take the remaining height; let the tank scale into it */
+  align-items: flex-start;
 }
 .tank-info {
   width: 312px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  min-height: 0;
-  overflow-y: auto;     /* side panel scrolls on its own if the tank is short */
-  gap: 0;
 }
 .tank-info .stats {
   grid-template-columns: 1fr 1fr;
@@ -186,7 +172,6 @@ main {
   align-items: baseline;
   gap: 10px;
   margin-bottom: 12px;
-  flex: 0 0 auto;
 }
 .view-title h2 { margin: 0; font-size: 20px; }
 .view-title .dot { align-self: center; }
@@ -194,34 +179,22 @@ main {
 
 .tank-wrap {
   flex: 1 1 auto;
+  width: auto;
   min-width: 0;
-  min-height: 0;
-  /* Center the canvas and let it scale to the largest size that fits both the
-     available width and height while keeping its 800×480 aspect ratio. */
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: #000;
-  border: 1px solid #ffffff14;
+  /* Lock the wrapper to the canvas aspect ratio so the canvas fills it
+     completely — no letterbox bars, no border around the visual. */
+  aspect-ratio: 800 / 480;
   border-radius: 12px;
   overflow: hidden;
   box-shadow: 0 8px 30px #0009;
 }
-#tank {
-  display: block;
-  max-width: 100%;
-  max-height: 100%;
-  width: auto;
-  height: auto;
-  image-rendering: auto;
-}
+#tank { width: 100%; height: 100%; display: block; image-rendering: auto; }
 
 .legend-head {
   display: flex;
   align-items: baseline;
   gap: 10px;
-  margin: 12px 0 8px;
-  flex: 0 0 auto;
+  margin: 18px 0 8px;
 }
 .legend-head h3 { margin: 0; font-size: 15px; }
 .legend-head .hint { font-size: 12px; }
@@ -230,11 +203,6 @@ main {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
   gap: 8px;
-  /* Cap the fish list and let it scroll internally so the page never grows. */
-  flex: 0 0 auto;
-  max-height: 24vh;
-  overflow-y: auto;
-  padding-right: 2px;
 }
 .legend-row {
   display: flex;
@@ -738,7 +706,6 @@ main {
 /* Responsive: stack the sidebar above the view on narrow screens. Fitting
    everything in a phone viewport isn't practical, so allow normal scrolling. */
 @media (max-width: 720px) {
-  body { overflow: auto; }
   main { flex-direction: column; height: auto; }
   #sidebar {
     width: 100%;
@@ -746,8 +713,5 @@ main {
     border-right: none;
     border-bottom: 1px solid #0006;
   }
-  #view { padding: 14px; overflow: visible; display: block; }
-  #view-content { min-height: 0; }
-  .tank-row { min-height: 0; }
-  .legend { max-height: none; overflow: visible; }
+  #view { padding: 14px; }
 }
