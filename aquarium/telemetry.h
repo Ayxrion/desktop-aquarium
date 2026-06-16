@@ -203,7 +203,7 @@ static void _telemetryOk() {
 static void _telemetryPost() {
     if (!_wifiEnsureConnected()) { _telemetryFail("WiFi not connected"); return; }
 
-    String url = String(TELEMETRY_HOST) + "/api/telemetry";
+    String url = String(TELEMETRY_HOST);
     WiFiClient client;
     HTTPClient http;
     if (!http.begin(client, url)) { _telemetryFail("begin() failed"); return; }
@@ -237,7 +237,7 @@ static void telemetryInit() {
                                 &_telemetryTaskHandle, 0);
     }
     if (telemetryEnabled && TELEMETRY_HOST[0] != '\0')
-        Serial.printf("Telemetry: enabled -> %s/api/telemetry as '%s' every %d ms\n",
+        Serial.printf("Telemetry: enabled -> %s as '%s' every %d ms\n",
                       TELEMETRY_HOST, TELEMETRY_AQUARIUM_ID, TELEMETRY_INTERVAL_MS);
 }
 
