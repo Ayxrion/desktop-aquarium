@@ -2,7 +2,7 @@ name: aquarium-web image
 
 on:
   push:
-    branches: [main]
+    branches: [RaspberryPi-WebServer]
     paths:
       - 'aquarium-web/**'
       - '.github/workflows/aquarium-web.yml'

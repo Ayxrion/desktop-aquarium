@@ -45,6 +45,7 @@ history) and pushes it to browsers over SSE. Unknown fields are ignored; only
 
   "fish": [
     {
+      "id": 3,                    // stable per-device fish slot — used for naming/age
       "x": 120, "y": 210, "z": 0.3,
       "type": 1,                  // 0 pair,1 school,2 school2,3 angel
       "facing_right": true,
@@ -70,9 +71,32 @@ history) and pushes it to browsers over SSE. Unknown fields are ignored; only
 
 ## Responses
 
+The `200` response body is **not JSON** — it's the downstream **fish-name channel**
+(`text/plain`), one `id<TAB>name` per named fish, e.g.:
+
+```
+0	Nemo
+5	Dory
+```
+
+This is how names set in the web app reach the device without any inbound
+connection (no firewall hole): the device's own POST carries them back. The
+device replaces its name table from this body and renders each name above the
+matching fish. Empty body = no names set.
+
 | Status | Meaning |
 |--------|---------|
-| `200 {ok:true}` | accepted |
+| `200` + `id\tname` lines | accepted; body is the current name table |
 | `400` | missing/invalid `aquarium_id` |
 | `401` | missing/wrong API key |
 | `429` | `MAX_AQUARIUMS` capacity reached for a new id |
+
+## Naming API (dashboard → server)
+
+```
+POST /api/aquariums/<id>/fish/<fishId>/name
+Content-Type: application/json
+{ "name": "Nemo" }          // empty string clears the name
+```
+Names are keyed by `(aquarium_id, fish_id)`, sanitized, capped at 24 chars. The
+enriched snapshot from `GET /api/aquariums/:id` and SSE adds `name` + `ageMs`.

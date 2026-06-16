@@ -9,10 +9,45 @@ const TANK_TOP = 72;
 const SCREEN_W = 800;
 const SCREEN_H = 480;
 
+// ─── Physics extrapolation constants (must match device) ─────────────────────
+// Device applies per-frame: vx *= 0.85; x += vx (at FRAME_MS intervals).
+// Continuous-time integral: x(t) = x₀ + vx·fm·(1 − d^(t/fm)) / (−ln d)
+const _DAMP_XY  = 0.85;
+const _DAMP_Z   = 0.88;
+const _LOG_D_XY = Math.log(_DAMP_XY); // ≈ -0.1625
+const _LOG_D_Z  = Math.log(_DAMP_Z);  // ≈ -0.1278
+
+function _extrapolateFish(f, elapsedMs, frameMs) {
+  const vx = f.vx || 0, vy = f.vy || 0, vz = f.vz || 0;
+  if (!vx && !vy && !vz) return f;
+  const fm = frameMs || 50;
+  const t = Math.min(elapsedMs, 2000); // cap drift at 2 s
+  // vx is px/frame, so scale = (1 − d^(t/fm)) / (−ln d) in frame units
+  const sXY = (1 - Math.pow(_DAMP_XY, t / fm)) / (-_LOG_D_XY);
+  const sZ  = (1 - Math.pow(_DAMP_Z,  t / fm)) / (-_LOG_D_Z);
+  return {
+    ...f,
+    x: Math.min(Math.max(Math.round(f.x + vx * sXY), 5), SCREEN_W - 5),
+    y: Math.min(Math.max(Math.round(f.y + vy * sXY), TANK_TOP + 5), SCREEN_H - 60),
+    z: Math.min(Math.max(f.z + vz * sZ, 0), 0.78),
+    // Update facing direction if velocity is strong enough (mirrors device logic)
+    facing_right: Math.abs(vx) > 0.4 ? vx > 0 : f.facing_right,
+  };
+}
+
+function _extrapolateSnapshot(snap, elapsedMs) {
+  if (!snap || !Array.isArray(snap.fish)) return snap;
+  const fm = snap.frame_ms || 50;
+  return { ...snap, fish: snap.fish.map((f) => _extrapolateFish(f, elapsedMs, fm)) };
+}
+
 let selectedId = null;
 let stream = null;
-let latest = null; // latest snapshot for the selected aquarium
-let lastSnapshotMs = 0; // when we last received any snapshot (SSE or poll)
+let latestSnapshot = null; // last received SSE/poll snapshot (raw, not extrapolated)
+let snapshotReceivedAt = 0; // wall-clock ms when we received it
+let rafId = null;
+let highlightedFishId = null; // legend row → highlight on the canvas
+const legendRows = new Map(); // fishId -> { el, nameInput, ageEl, swatchEl }
 
 const els = {
   list: document.getElementById('aquarium-list'),
@@ -25,6 +60,7 @@ const els = {
   viewName: document.getElementById('view-name'),
   viewSub: document.getElementById('view-sub'),
   viewDot: document.getElementById('view-dot'),
+  legend: document.getElementById('legend'),
 };
 const ctx = els.canvas.getContext('2d');
 
@@ -65,8 +101,11 @@ function renderList(items) {
 function select(id) {
   if (selectedId === id) return;
   selectedId = id;
-  latest = null;
-  lastSnapshotMs = 0;
+  latestSnapshot = null;
+  snapshotReceivedAt = 0;
+  highlightedFishId = null;
+  legendRows.clear();
+  els.legend.innerHTML = '';
   els.viewEmpty.hidden = true;
   els.viewContent.hidden = false;
   openStream(id);
@@ -74,10 +113,23 @@ function select(id) {
 }
 
 function applySnapshot(snap) {
-  latest = snap;
-  lastSnapshotMs = Date.now();
-  render();
+  latestSnapshot = snap;
+  snapshotReceivedAt = Date.now();
+  // Legend, stats, and title update at telemetry rate (≤1 Hz) — cheap DOM work.
+  drawTitle(snap);
+  drawStats(snap);
+  renderLegend(snap);
   setConn(true);
+  // Ensure the 60fps canvas loop is running.
+  if (!rafId) rafId = requestAnimationFrame(_rafDraw);
+}
+
+// 60fps canvas-only loop — extrapolates fish positions between telemetry frames.
+function _rafDraw() {
+  rafId = requestAnimationFrame(_rafDraw);
+  if (!latestSnapshot) return;
+  const elapsed = Date.now() - snapshotReceivedAt;
+  drawTank(_extrapolateSnapshot(latestSnapshot, elapsed));
 }
 
 // ─── SSE stream for the selected aquarium ────────────────────────────────────
@@ -114,7 +166,7 @@ async function pollSelected() {
 function startWatchdog() {
   setInterval(() => {
     if (!selectedId) return;
-    if (Date.now() - lastSnapshotMs > 4000) pollSelected();
+    if (Date.now() - snapshotReceivedAt > 4000) pollSelected();
   }, 2000);
 }
 
@@ -126,6 +178,8 @@ const EAC_MIN_FISH = 2;             // always visible even at 0 congestion
 
 let eacFish = [];
 let eacTargetCount = 0;
+let eacBright = 0.5;
+let _frameCount = 0;
 
 function eacSpawnFish(startX) {
   const bandH = EAC_Y2 - EAC_Y1;
@@ -180,25 +234,115 @@ function drawSilhouetteFish(x, y, size) {
   ctx.restore();
 }
 
-// RAF loop — runs independently of snapshot delivery
-let _frameCount = 0;
-function eacLoop() {
-  eacBright = latest ? dayTint(latest.time && latest.time.day_progress) : 0.5;
-  tickEac(_frameCount++);
-  if (latest) {
-    // Redraw only the tank layer (title/stats don't need per-frame updates)
-    drawTank(latest);
-  }
-  requestAnimationFrame(eacLoop);
-}
-requestAnimationFrame(eacLoop);
-
 // ─── Rendering ───────────────────────────────────────────────────────────────
+// Single 60fps rAF loop: ticks EAC animation and redraws the canvas with
+// physics-extrapolated fish positions. Title/stats/legend update at SSE rate
+// (≤1 Hz) from applySnapshot — no need to touch the DOM every frame.
+function _rafDraw() {
+  rafId = requestAnimationFrame(_rafDraw);
+  eacBright = latestSnapshot
+    ? dayTint(latestSnapshot.time && latestSnapshot.time.day_progress)
+    : 0.5;
+  tickEac(_frameCount++);
+  if (!latestSnapshot) return;
+  const elapsed = Date.now() - snapshotReceivedAt;
+  drawTank(_extrapolateSnapshot(latestSnapshot, elapsed));
+}
+
+// Full re-render (called on highlight toggle, etc.) — extrapolates fish to now.
 function render() {
-  if (!latest) return;
-  drawTitle(latest);
-  drawTank(latest);
-  drawStats(latest);
+  if (!latestSnapshot) return;
+  const elapsed = Date.now() - snapshotReceivedAt;
+  const snap = _extrapolateSnapshot(latestSnapshot, elapsed);
+  drawTitle(snap);
+  drawTank(snap);
+  drawStats(snap);
+  renderLegend(latestSnapshot); // legend uses raw snapshot (names/ages, not positions)
+}
+
+// Legend: one row per fish, color-matched, with editable name, age, and
+// click-to-highlight. Reconciled by fish id so live updates don't clobber a
+// rename in progress.
+function renderLegend(s) {
+  const fish = Array.isArray(s.fish) ? s.fish.filter((f) => typeof f.id === 'number') : [];
+  const seen = new Set();
+
+  for (const f of fish) {
+    seen.add(f.id);
+    let row = legendRows.get(f.id);
+    if (!row) {
+      row = buildLegendRow(f);
+      legendRows.set(f.id, row);
+      els.legend.appendChild(row.el);
+    }
+    const color = hex(f.color || 0x00ee66);
+    row.swatchEl.style.background = color;
+    row.el.style.borderLeftColor = color;
+    row.ageEl.textContent = formatAge(f.ageMs);
+    row.nameInput.placeholder = `${FISH_TYPE_NAMES[f.type] || 'Fish'} #${f.id}`;
+    if (document.activeElement !== row.nameInput) row.nameInput.value = f.name || '';
+    row.el.classList.toggle('active', f.id === highlightedFishId);
+  }
+
+  for (const [id, row] of legendRows) {
+    if (!seen.has(id)) {
+      row.el.remove();
+      legendRows.delete(id);
+    }
+  }
+}
+
+function buildLegendRow(f) {
+  const el = document.createElement('div');
+  el.className = 'legend-row';
+
+  const swatchEl = document.createElement('span');
+  swatchEl.className = 'legend-swatch';
+
+  const nameInput = document.createElement('input');
+  nameInput.className = 'legend-name';
+  nameInput.spellcheck = false;
+  nameInput.maxLength = 24;
+  nameInput.addEventListener('click', (e) => e.stopPropagation());
+  nameInput.addEventListener('blur', () => saveName(f.id, nameInput.value));
+  nameInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') nameInput.blur();
+    if (e.key === 'Escape') { nameInput.value = ''; nameInput.blur(); }
+  });
+
+  const ageEl = document.createElement('span');
+  ageEl.className = 'legend-age';
+
+  el.append(swatchEl, nameInput, ageEl);
+  el.addEventListener('click', () => {
+    highlightedFishId = highlightedFishId === f.id ? null : f.id;
+    render();
+  });
+  return { el, nameInput, ageEl, swatchEl };
+}
+
+async function saveName(fishId, value) {
+  if (!selectedId) return;
+  try {
+    await fetch(`api/aquariums/${encodeURIComponent(selectedId)}/fish/${fishId}/name`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: value }),
+    });
+  } catch {
+    /* leave the field as typed; it'll re-sync on the next snapshot */
+  }
+}
+
+function formatAge(ms) {
+  if (!ms || ms < 0) return '';
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + 'h ' + (m % 60) + 'm';
+  return Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
 }
 
 function drawTitle(s) {
@@ -207,7 +351,7 @@ function drawTitle(s) {
   els.viewSub.textContent = [s.platform, s.fw_version ? 'fw ' + s.fw_version : '', weather]
     .filter(Boolean)
     .join(' · ');
-  const stale = s._stale || Date.now() - lastSnapshotMs > 8000;
+  const stale = s._stale || Date.now() - snapshotReceivedAt > 8000;
   els.viewDot.className = 'dot ' + (stale ? 'stale' : 'live');
 }
 
@@ -290,6 +434,27 @@ function drawTank(s) {
 
 function drawFish(f) {
   const size = f.type === 3 ? 16 : f.type === 0 ? 13 : 10; // angel bigger, school smaller
+
+  // Highlight ring + name label for the legend-selected fish.
+  if (f.id === highlightedFishId) {
+    ctx.save();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, size + 9, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+  if (f.name) {
+    ctx.save();
+    ctx.font = '12px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = f.id === highlightedFishId ? '#ffffff' : 'rgba(230,240,255,0.85)';
+    ctx.fillText(f.name, f.x, f.y - size - 8);
+    ctx.restore();
+  }
+
   const dir = f.facing_right ? 1 : -1;
   ctx.save();
   ctx.translate(f.x, f.y);

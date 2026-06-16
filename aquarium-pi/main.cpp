@@ -12,6 +12,7 @@
  *   - fishHW() uses canvas.charW instead of hard-coded 6
  */
 
+#include <csignal>
 #include <ctime>
 #include <cstdlib>
 #include "compat.h"
@@ -1168,6 +1169,17 @@ void drawFish() {
             canvas.setCursor(sx - hw, sy - 4 * ts);
             canvas.print(f.facingRight ? "><>" : "<><");
         }
+
+        // Name pushed down from the web app (via the telemetry POST response).
+        char name[TELEMETRY_NAME_LEN];
+        telemetryGetFishName(i, name, sizeof(name));
+        if (name[0]) {
+            canvas.setTextSize(1);
+            canvas.setTextColor(0xCCE6FFUL);
+            int nameW = (int)strlen(name) * canvas.charW;
+            canvas.setCursor(sx - nameW / 2, sy - 4 * ts - 12);
+            canvas.print(name);
+        }
     }
 }
 
@@ -1411,16 +1423,21 @@ void loop() {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  main
 // ═══════════════════════════════════════════════════════════════════════════════
+static volatile sig_atomic_t _appRunning = 1;
+static void _handleStop(int) { _appRunning = 0; }
+
 int main(int /*argc*/, char* /*argv*/[]) {
+    signal(SIGTERM, _handleStop);
+    signal(SIGINT,  _handleStop);
+
     setup();
 
-    bool running = true;
-    while (running) {
+    while (_appRunning) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             switch (ev.type) {
                 case SDL_QUIT:
-                    running = false;
+                    _appRunning = 0;
                     break;
                 case SDL_MOUSEBUTTONDOWN:
                     if (ev.button.button == SDL_BUTTON_LEFT) {
@@ -1454,7 +1471,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     break;
                 case SDL_KEYDOWN:
                     if (ev.key.keysym.sym == SDLK_ESCAPE)
-                        running = false;
+                        _appRunning = 0;
                     else if (ev.key.keysym.sym == SDLK_SPACE)
                         dropFood();
                     break;

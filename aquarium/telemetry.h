@@ -21,6 +21,8 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <stdarg.h>
+#include <string.h>
+#include <stdlib.h>
 #include <atomic>
 #include <mutex>
 #include "freertos/FreeRTOS.h"
@@ -82,6 +84,42 @@ static inline void telemetryGetError(char* out, size_t n) {
     snprintf(out, n, "%s", telemetryLastError);
 }
 
+// ── Fish names (pushed down via the telemetry POST response) ──────────────────
+// The server can't reach the device (no inbound firewall), so it returns the
+// current names in the POST response body as `id\tname` lines. The worker task
+// applies them; the render loop draws them above each fish.
+#define TELEMETRY_NAME_LEN 24
+static char       telemetryFishName[MAX_FISH][TELEMETRY_NAME_LEN] = {};
+static std::mutex _telemetryNameMutex;
+
+static inline void telemetryGetFishName(int id, char* out, size_t n) {
+    out[0] = '\0';
+    if (id < 0 || id >= MAX_FISH) return;
+    std::lock_guard<std::mutex> lk(_telemetryNameMutex);
+    snprintf(out, n, "%s", telemetryFishName[id]);
+}
+
+// Replace the name table from the `id\tname` lines in the response body.
+static void _telemetryApplyNames(const char* body) {
+    std::lock_guard<std::mutex> lk(_telemetryNameMutex);
+    for (int i = 0; i < MAX_FISH; i++) telemetryFishName[i][0] = '\0';
+    const char* p = body;
+    while (p && *p) {
+        const char* tab = strchr(p, '\t');
+        const char* nl  = strchr(p, '\n');
+        if (!tab || (nl && tab > nl)) { p = nl ? nl + 1 : nullptr; continue; }
+        int id = atoi(p);
+        const char* nameStart = tab + 1;
+        size_t nameLen = nl ? (size_t)(nl - nameStart) : strlen(nameStart);
+        if (id >= 0 && id < MAX_FISH) {
+            if (nameLen >= TELEMETRY_NAME_LEN) nameLen = TELEMETRY_NAME_LEN - 1;
+            memcpy(telemetryFishName[id], nameStart, nameLen);
+            telemetryFishName[id][nameLen] = '\0';
+        }
+        p = nl ? nl + 1 : nullptr;
+    }
+}
+
 static const char* _telemetryWeatherName(int c) {
     static const char* N[] = { "SUNNY", "PARTLY_CLOUDY", "CLOUDY", "RAINY",
                                "STORMY", "SNOWY", "FOGGY" };
@@ -108,13 +146,13 @@ static int _buildTelemetryJson() {
 
     o = _tAppend(o,
         "{\"aquarium_id\":\"%s\",\"platform\":\"esp32\",\"fw_version\":\"%s\","
-        "\"uptime_ms\":%lu,\"tick\":%d,"
+        "\"uptime_ms\":%lu,\"tick\":%d,\"frame_ms\":%d,"
         "\"screen\":{\"w\":%d,\"h\":%d,\"tank_top\":%d},"
         "\"weather\":{\"condition\":%d,\"name\":\"%s\",\"override\":%s},"
         "\"time\":{\"day_progress\":%.4f,\"mode\":\"%s\"},"
         "\"counts\":{\"pair\":%d,\"school\":%d,\"school2\":%d,\"angel\":%d},",
         TELEMETRY_AQUARIUM_ID, FIRMWARE_VERSION,
-        (unsigned long)millis(), (int)tick,
+        (unsigned long)millis(), (int)tick, FRAME_MS,
         SCREEN_W, SCREEN_H, TANK_TOP,
         wc, _telemetryWeatherName(wc), (weatherOverrideIdx >= 0) ? "true" : "false",
         getDayProgress(), (currentTimeMode == TIME_FAST) ? "FAST" : "REAL",
@@ -127,10 +165,14 @@ static int _buildTelemetryJson() {
         if (!isFishActive(i)) continue;
         Fish& f = fish[i];
         o = _tAppend(o,
-            "%s{\"x\":%d,\"y\":%d,\"z\":%.3f,\"type\":%d,\"facing_right\":%s,"
+            "%s{\"id\":%d,\"x\":%d,\"y\":%d,\"z\":%.3f,"
+            "\"vx\":%.2f,\"vy\":%.2f,\"vz\":%.4f,"
+            "\"type\":%d,\"facing_right\":%s,"
             "\"color\":%u,\"going_for_food\":%s,\"chasing\":%s}",
-            first ? "" : ",",
-            (int)f.x, (int)f.y, f.z, (int)f.type,
+            first ? "" : ",", i,
+            (int)f.x, (int)f.y, f.z,
+            f.vx, f.vy, f.vz,
+            (int)f.type,
             f.facingRight ? "true" : "false",
             (unsigned)fishColor(i),
             f.goingForFood ? "true" : "false",
@@ -212,7 +254,11 @@ static void _telemetryPost() {
     http.setConnectTimeout(3000);
     http.setTimeout(5000);
     int code = http.POST((uint8_t*)_telemetryBuf, (size_t)_telemetryBufLen);
-    if (code >= 200 && code < 300) _telemetryOk();
+    if (code >= 200 && code < 300) {
+        String body = http.getString();          // `id\tname` lines from the server
+        _telemetryApplyNames(body.c_str());
+        _telemetryOk();
+    }
     else if (code <= 0)            _telemetryFail(http.errorToString(code).c_str());
     else { char b[24]; snprintf(b, sizeof(b), "HTTP %d", code); _telemetryFail(b); }
     http.end();

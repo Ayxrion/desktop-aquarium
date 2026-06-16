@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -84,6 +85,56 @@ static bool                     _telemetryStarted    = false;
 
 static size_t _telemetryDiscard(void*, size_t sz, size_t n, void*) { return sz * n; }
 
+// ── Fish names (pushed down via the telemetry POST response) ──────────────────
+// The server can't reach the device (no inbound firewall), so it returns the
+// current names in the POST response body as `id\tname` lines. We apply them
+// here (worker thread) and the renderer draws them above each fish.
+#define TELEMETRY_NAME_LEN 24
+static char        telemetryFishName[MAX_FISH][TELEMETRY_NAME_LEN] = {};
+static std::mutex  _telemetryNameMutex;
+
+// Copy a fish's name out under lock (for the render thread). Empty if unnamed.
+static inline void telemetryGetFishName(int id, char* out, size_t n) {
+    out[0] = '\0';
+    if (id < 0 || id >= MAX_FISH) return;
+    std::lock_guard<std::mutex> lk(_telemetryNameMutex);
+    snprintf(out, n, "%s", telemetryFishName[id]);
+}
+
+// Parse the `id\tname` response body and replace the name table.
+static void _telemetryApplyNames(const char* body) {
+    std::lock_guard<std::mutex> lk(_telemetryNameMutex);
+    for (int i = 0; i < MAX_FISH; i++) telemetryFishName[i][0] = '\0';
+    const char* p = body;
+    while (p && *p) {
+        const char* tab = strchr(p, '\t');
+        const char* nl  = strchr(p, '\n');
+        if (!tab || (nl && tab > nl)) { p = nl ? nl + 1 : nullptr; continue; }
+        int id = atoi(p);
+        const char* nameStart = tab + 1;
+        size_t nameLen = nl ? (size_t)(nl - nameStart) : strlen(nameStart);
+        if (id >= 0 && id < MAX_FISH) {
+            if (nameLen >= TELEMETRY_NAME_LEN) nameLen = TELEMETRY_NAME_LEN - 1;
+            memcpy(telemetryFishName[id], nameStart, nameLen);
+            telemetryFishName[id][nameLen] = '\0';
+        }
+        p = nl ? nl + 1 : nullptr;
+    }
+}
+
+// Capture the (small) response body so we can parse names from it.
+struct _TelemetryResp { char data[MAX_FISH * 40]; size_t len; };
+static size_t _telemetryCapture(void* ptr, size_t sz, size_t n, void* ud) {
+    _TelemetryResp* r = static_cast<_TelemetryResp*>(ud);
+    size_t bytes = sz * n;
+    if (r->len + bytes < sizeof(r->data) - 1) {
+        memcpy(r->data + r->len, ptr, bytes);
+        r->len += bytes;
+        r->data[r->len] = '\0';
+    }
+    return bytes;
+}
+
 static const char* _weatherName(int c) {
     static const char* N[] = { "SUNNY", "PARTLY_CLOUDY", "CLOUDY", "RAINY",
                                "STORMY", "SNOWY", "FOGGY" };
@@ -99,13 +150,13 @@ static std::string _buildTelemetryJson() {
     int wc = (int)currentWeather;
     snprintf(tmp, sizeof(tmp),
         "{\"aquarium_id\":\"%s\",\"platform\":\"pi\",\"fw_version\":\"%s\","
-        "\"uptime_ms\":%u,\"tick\":%d,"
+        "\"uptime_ms\":%u,\"tick\":%d,\"frame_ms\":%d,"
         "\"screen\":{\"w\":%d,\"h\":%d,\"tank_top\":%d},"
         "\"weather\":{\"condition\":%d,\"name\":\"%s\",\"override\":%s},"
         "\"time\":{\"day_progress\":%.4f,\"mode\":\"%s\"},"
         "\"counts\":{\"pair\":%d,\"school\":%d,\"school2\":%d,\"angel\":%d},",
         TELEMETRY_AQUARIUM_ID, FIRMWARE_VERSION,
-        (unsigned)millis(), (int)tick,
+        (unsigned)millis(), (int)tick, FRAME_MS,
         SCREEN_W, SCREEN_H, TANK_TOP,
         wc, _weatherName(wc), (weatherOverrideIdx >= 0) ? "true" : "false",
         getDayProgress(), (currentTimeMode == TIME_FAST) ? "FAST" : "REAL",
@@ -119,10 +170,14 @@ static std::string _buildTelemetryJson() {
         if (!isFishActive(i)) continue;
         Fish& f = fish[i];
         snprintf(tmp, sizeof(tmp),
-            "%s{\"x\":%d,\"y\":%d,\"z\":%.3f,\"type\":%d,\"facing_right\":%s,"
+            "%s{\"id\":%d,\"x\":%d,\"y\":%d,\"z\":%.3f,"
+            "\"vx\":%.2f,\"vy\":%.2f,\"vz\":%.4f,"
+            "\"type\":%d,\"facing_right\":%s,"
             "\"color\":%u,\"going_for_food\":%s,\"chasing\":%s}",
-            first ? "" : ",",
-            (int)f.x, (int)f.y, f.z, (int)f.type,
+            first ? "" : ",", i,
+            (int)f.x, (int)f.y, f.z,
+            f.vx, f.vy, f.vz,
+            (int)f.type,
             f.facingRight ? "true" : "false",
             (unsigned)fishColor(i),
             f.goingForFood ? "true" : "false",
@@ -201,7 +256,10 @@ static void _postTelemetry(const std::string& body) {
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);   // required for use off the main thread
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, _telemetryDiscard);
+
+    _TelemetryResp resp = {};
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, _telemetryCapture);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
 
     CURLcode res = curl_easy_perform(curl);
     long httpCode = 0;
@@ -209,6 +267,7 @@ static void _postTelemetry(const std::string& body) {
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
 
     bool ok = (res == CURLE_OK && httpCode >= 200 && httpCode < 300);
+    if (ok) _telemetryApplyNames(resp.data);   // server returned the name table
     telemetryEverTried.store(true);
     telemetryLastOk.store(ok);
     if (ok) {

@@ -48,7 +48,22 @@ app.post('/api/telemetry', (req, res) => {
   }
   const result = store.upsert(body);
   if (!result.ok) return res.status(429).json(result);
-  return res.json({ ok: true });
+  // Downstream channel (no inbound firewall needed): the device's own POST gets
+  // the current fish names back as a compact `id\tname` per line body. The
+  // device applies these and renders them above each fish.
+  res.type('text/plain').send(store.getNamesText(body.aquarium_id));
+});
+
+// Rename a fish (from the dashboard). Body: { name }. Empty name clears it.
+// Open like the read APIs — the dashboard has no API key.
+app.post('/api/aquariums/:id/fish/:fishId/name', (req, res) => {
+  const fishId = parseInt(req.params.fishId, 10);
+  if (!Number.isInteger(fishId) || fishId < 0) {
+    return res.status(400).json({ ok: false, error: 'bad_fish_id' });
+  }
+  const result = store.setName(req.params.id, fishId, (req.body && req.body.name) ?? '');
+  if (!result.ok) return res.status(400).json(result);
+  return res.json(result);
 });
 
 // ─── Traffic ────────────────────────────────────────────────────────────────
