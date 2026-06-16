@@ -1562,6 +1562,17 @@ void drawFish() {
       canvas.setCursor(sx - hw, sy - 4 * ts);
       canvas.print(f.facingRight ? "><>" : "<><");
     }
+
+    // Name pushed down from the web app (via the telemetry POST response).
+    char name[TELEMETRY_NAME_LEN];
+    telemetryGetFishName(i, name, sizeof(name));
+    if (name[0]) {
+      canvas.setTextSize(1);
+      canvas.setTextColor(0xCCE6FFUL);
+      int nameW = (int)strlen(name) * 6;   // ~6 px per char at size 1
+      canvas.setCursor(sx - nameW / 2, sy - 4 * ts - 12);
+      canvas.print(name);
+    }
   }
 }
 
