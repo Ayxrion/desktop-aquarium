@@ -189,10 +189,14 @@ for (let x = 0; x < SCREEN_W; x++) {
 function projX(x, z) { const cx = SCREEN_W * 0.5;  return cx + (x - cx) * (1 - z * 0.30); }
 function projY(y, z) { const cy = SCREEN_H * 0.45; return cy + (y - cy) * (1 - z * 0.38); }
 
+// Career growth: fish hatch small and grow to full size (no death). `scale` is
+// 0.45..1.0; absent (creative / pre-game telemetry) → full size.
+function growth(f) { return typeof f.scale === 'number' ? clamp(f.scale, 0.3, 1) : 1; }
+
 // Fish text size / half-width (device units) — drives shadow + glyph scale.
 function fishTS(f)    { return (f.type || 0) === 0 ? (f.z < 0.5 ? 3 : 2) : (f.z < 0.6 ? 2 : 1); }
 function fishChars(f) { return (f.type || 0) === 0 ? 5 : 3; }
-function fishHW(f)    { return (fishChars(f) * 6 * fishTS(f)) / 2; }
+function fishHW(f)    { return (fishChars(f) * 6 * fishTS(f) * growth(f)) / 2; }
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 
@@ -443,7 +447,7 @@ function drawShadows(fishArr) {
     const dist = gnd - fy;
     if (dist <= 0) continue;
     let scale = 1 - dist / 300; if (scale < 0.12) scale = 0.12;
-    const rx = Math.max(1, fishHW(f) * scale), ry = Math.max(1, 3 * fishTS(f) * scale);
+    const rx = Math.max(1, fishHW(f) * scale), ry = Math.max(1, 3 * fishTS(f) * growth(f) * scale);
     ctx.beginPath(); ctx.ellipse(sx, gnd - 1, rx, ry, 0, 0, Math.PI * 2); ctx.fill();
   }
   ctx.restore();
@@ -516,6 +520,46 @@ function drawStarfish(st) {
   for (let i = 0; i < 10; i++) {
     const j = (i + 1) % 10;
     ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(px[i], py[i]); ctx.lineTo(px[j], py[j]); ctx.closePath(); ctx.fill();
+  }
+}
+
+// ── Career: wandering fish (tap to keep) + loot (coins/shells, tap to collect) ──
+function drawWanderer(w) {
+  const sx = w.x, sy = w.y, right = w.facing_right;
+  const glyph = (w.type === 0) ? (right ? '><(o>' : '<o(><') : (right ? '><>' : '<><');
+  ctx.save();
+  const pulse = 0.5 + 0.5 * Math.sin(animTick * 0.12);
+  ctx.strokeStyle = `rgba(120,230,255,${(0.3 + 0.4 * pulse).toFixed(2)})`;
+  ctx.lineWidth = 2; ctx.setLineDash([3, 3]);
+  ctx.beginPath(); ctx.arc(sx, sy, 18, 0, Math.PI * 2); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = 'bold 16px "Courier New", monospace';
+  ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(0,18,34,0.6)';
+  ctx.strokeText(glyph, sx, sy);
+  ctx.fillStyle = hex(w.color || 0x88e0ff);
+  ctx.fillText(glyph, sx, sy);
+  ctx.restore();
+}
+
+function drawLoot(it) {
+  const x = it.x, y = it.y;
+  if (it.kind === 'coin') {
+    fcirc(x, y, 7, 0xFFD23F);
+    scirc(x, y, 7, 0xB8860B);
+    ctx.fillStyle = '#8a6508';
+    ctx.font = 'bold 9px system-ui, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('$', x, y + 0.5);
+  } else {
+    const tierCol = [0xE7C9A0, 0xFF9EC4, 0xFFD23F][it.tier || 0] || 0xE7C9A0;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.fillStyle = hex(tierCol);
+    ctx.beginPath(); ctx.arc(0, 2, 9, Math.PI, 0, false); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.lineWidth = 1;
+    for (let i = -2; i <= 2; i++) { ctx.beginPath(); ctx.moveTo(0, 2); ctx.lineTo(i * 4, -7); ctx.stroke(); }
+    ctx.restore();
   }
 }
 
@@ -610,8 +654,32 @@ const els = {
   ctrlFeed: document.getElementById('ctrl-feed'),
   ctrlPending: document.getElementById('ctrl-pending'),
   ctrlStatus: document.getElementById('ctrl-status'),
+  fishGroup: document.getElementById('ctrl-fish-group'),
+  gamePanel: document.getElementById('game-panel'),
+  hudMode: document.getElementById('hud-mode'),
+  hudCoins: document.getElementById('hud-coins'),
+  hudShells: document.getElementById('hud-shells'),
+  hudFood: document.getElementById('hud-food'),
+  hudSnails: document.getElementById('hud-snails'),
+  hudLuck: document.getElementById('hud-luck'),
+  modeSeg: document.getElementById('mode-seg'),
+  shop: document.getElementById('shop'),
+  shopFish: document.getElementById('shop-fish'),
+  shopFood: document.getElementById('shop-food'),
+  shopSnail: document.getElementById('shop-snail'),
+  modeConfirm: document.getElementById('mode-confirm'),
+  modeConfirmTitle: document.getElementById('mode-confirm-title'),
+  modeConfirmDetail: document.getElementById('mode-confirm-detail'),
+  modeConfirmOk: document.getElementById('mode-confirm-ok'),
+  modeConfirmCancel: document.getElementById('mode-confirm-cancel'),
 };
 const ctx = els.canvas.getContext('2d');
+
+// Shop prices (coins), mirroring the firmware/mock economy.
+const FISH_PRICE = [10, 30, 45, 60];
+const FOOD_PRICE = 5;
+const SNAIL_PRICE = 50;
+const MAX_SNAILS = 6;
 
 // ─── Sidebar / list polling ────────────────────────────────────────────────
 async function refreshList() {
@@ -709,6 +777,8 @@ function select(id) {
   els.legend.innerHTML = '';
   els.conflictBar.hidden = true;
   els.controls.hidden = true;
+  els.gamePanel.hidden = true;
+  els.modeConfirm.hidden = true;
   _ctrlHold.weather = _ctrlHold.time = 0;
   _pendingQueue.length = 0;
   clearTimeout(_pendingTimer); _pendingTimer = null;
@@ -764,6 +834,7 @@ function applySnapshot(snap) {
   renderLegend(snap);
   renderConflict(snap);
   renderControls(snap);
+  renderGame(snap);
   resolvePending(snap);
   setConn(true);
   // Ensure the 60fps canvas loop is running.
@@ -1259,6 +1330,123 @@ els.ctrlTime.addEventListener('click', (e) => {
 els.ctrlFeed.addEventListener('click', () =>
   sendControl({ type: 'feed', count: 1 }, 'Fed the fish 🐟', { label: 'Feed ×1' }));
 
+// ─── Career game panel: HUD, mode toggle, shop ────────────────────────────────
+let _shopBuilt = false;
+let _pendingMode = null;
+
+function renderGame(snap) {
+  const g = snap && snap.game;
+  if (!g) {                          // legacy device (no game) → free fish controls
+    els.gamePanel.hidden = true;
+    if (els.fishGroup) els.fishGroup.hidden = false;
+    return;
+  }
+  els.gamePanel.hidden = false;
+  const career = g.mode === 'career';
+  els.hudMode.textContent = career ? 'Career' : 'Creative';
+  els.hudMode.className = 'hud-mode' + (career ? '' : ' creative');
+  els.hudCoins.textContent = '🪙 ' + (g.coins || 0);
+  els.hudShells.textContent = '🐚 ' + (g.shells || 0);
+  els.hudFood.textContent = '🍤 ' + (g.food || 0);
+  els.hudSnails.textContent = '🐌 ' + ((snap.snails && snap.snails.length) || 0);
+  els.hudLuck.textContent = '🍀 ' + Math.round((g.luck || 0) * 100) + '%';
+  for (const el of [els.hudCoins, els.hudShells, els.hudFood, els.hudSnails, els.hudLuck])
+    el.style.display = career ? '' : 'none';
+
+  for (const b of els.modeSeg.querySelectorAll('button'))
+    b.classList.toggle('active', b.dataset.mode === g.mode);
+
+  // Career: fish are earned (shop + catching) → hide the free fish ± controls.
+  if (els.fishGroup) els.fishGroup.hidden = career;
+  els.shop.hidden = !career;
+  if (career) updateShop(snap);
+  els.ctrlFeed.textContent = career ? '🍤 Feed (uses 1 food)' : '🍤 Feed the fish';
+}
+
+function buildShop() {
+  els.shopFish.innerHTML = '';
+  for (let t = 0; t < 4; t++) {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'shop-buy'; b.dataset.type = String(t);
+    b.innerHTML = `<span>🐟 ${escapeHtml(FISH_TYPE_NAMES[t])}</span><span class="price">${FISH_PRICE[t]} 🪙</span>`;
+    b.addEventListener('click', () => buyFish(t));
+    els.shopFish.appendChild(b);
+  }
+  _shopBuilt = true;
+}
+
+function updateShop(snap) {
+  if (!_shopBuilt) buildShop();
+  const coins = (snap.game && snap.game.coins) || 0;
+  const c = snap.counts || {};
+  for (const b of els.shopFish.querySelectorAll('button')) {
+    const t = Number(b.dataset.type);
+    const atCap = (c[FISH_COUNT_KEYS[t]] || 0) >= FISH_MAX[t];
+    b.disabled = coins < FISH_PRICE[t] || atCap;
+    b.title = atCap ? `${FISH_TYPE_NAMES[t]} at capacity` : `Buy a ${FISH_TYPE_NAMES[t]} for ${FISH_PRICE[t]} coins`;
+  }
+  els.shopFood.disabled = coins < FOOD_PRICE;
+  const snailsAtCap = ((snap.snails && snap.snails.length) || 0) >= MAX_SNAILS;
+  els.shopSnail.disabled = coins < SNAIL_PRICE || snailsAtCap;
+  els.shopSnail.title = snailsAtCap ? 'Snails at capacity' : `Buy a coin-collector snail for ${SNAIL_PRICE} coins`;
+}
+
+function buyFish(t) {
+  sendControl({ type: 'buy', what: 'fish', fishType: t, count: 1 },
+    `Bought ${FISH_TYPE_NAMES[t]} ✓`, { label: `Buy ${FISH_TYPE_NAMES[t]}` });
+}
+els.shopFood.addEventListener('click', () =>
+  sendControl({ type: 'buy', what: 'food', count: 1 }, 'Bought food ✓', { label: 'Buy food' }));
+els.shopSnail.addEventListener('click', () =>
+  sendControl({ type: 'buy', what: 'snail', count: 1 }, 'Bought a snail 🐌', { label: 'Buy snail' }));
+
+// Mode switch: clicking the inactive mode opens an inline confirm bar.
+els.modeSeg.addEventListener('click', (e) => {
+  const btn = e.target.closest('button'); if (!btn) return;
+  const target = btn.dataset.mode;
+  const cur = (latestSnapshot && latestSnapshot.game && latestSnapshot.game.mode) || 'career';
+  if (target === cur) return;
+  _pendingMode = target;
+  els.modeConfirmTitle.textContent = target === 'career' ? 'Start a Career?' : 'Switch to Creative?';
+  els.modeConfirmDetail.textContent = target === 'career'
+    ? ' This RESETS the tank to a fresh 2-fish career — coins, shells, food and your current fish are cleared.'
+    : ' Keeps your current fish and unlocks the free fish controls. Earning pauses.';
+  els.modeConfirm.hidden = false;
+});
+els.modeConfirmCancel.addEventListener('click', () => { _pendingMode = null; els.modeConfirm.hidden = true; });
+els.modeConfirmOk.addEventListener('click', () => {
+  if (_pendingMode) {
+    sendControl({ type: 'mode', value: _pendingMode }, `Switching to ${_pendingMode} ✓`, { label: `Mode → ${_pendingMode}` });
+  }
+  _pendingMode = null; els.modeConfirm.hidden = true;
+});
+
+// ─── Catch: click a wandering fish or loot item on the canvas ─────────────────
+els.canvas.addEventListener('click', (e) => {
+  if (!latestSnapshot) return;
+  const rect = els.canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) / rect.width * SCREEN_W;
+  const y = (e.clientY - rect.top) / rect.height * SCREEN_H;
+  let best = null, bestD = Infinity, bestKind = null;
+  for (const w of (latestSnapshot.wanderers || [])) {
+    const d = (w.x - x) ** 2 + (w.y - y) ** 2;
+    if (d < bestD && d < 32 * 32) { bestD = d; best = w; bestKind = 'wanderer'; }
+  }
+  for (const it of (latestSnapshot.loot || [])) {
+    const d = (it.x - x) ** 2 + (it.y - y) ** 2;
+    if (d < bestD && d < 22 * 22) { bestD = d; best = it; bestKind = 'loot'; }
+  }
+  if (!best) return;
+  sendControl({ type: 'catch', itemId: best.id },
+    bestKind === 'wanderer' ? 'Caught a fish! 🎣'
+      : (best.kind === 'coin' ? 'Grabbed a coin 🪙' : 'Grabbed a shell 🐚'));
+  // Optimistic: remove locally so it vanishes at once; next snapshot reconciles.
+  if (bestKind === 'wanderer')
+    latestSnapshot.wanderers = (latestSnapshot.wanderers || []).filter((w) => w.id !== best.id);
+  else
+    latestSnapshot.loot = (latestSnapshot.loot || []).filter((it) => it.id !== best.id);
+});
+
 function drawTitle(s) {
   els.viewName.textContent = s.aquarium_id || selectedId || '—';
   const weather = s.weather ? (WEATHER_NAMES[s.weather.condition] || '') : '';
@@ -1309,7 +1497,12 @@ function drawTank(s) {
 
   if (Array.isArray(s.flakes)) for (const f of s.flakes) drawFlake(f);
   if (s.snail) drawSnail(s.snail);
+  if (Array.isArray(s.snails)) for (const sn of s.snails) drawSnail(sn); // purchased coin collectors
   if (s.starfish) drawStarfish(s.starfish);
+
+  // Career collectibles, drawn on top so they're clearly visible + tappable.
+  if (Array.isArray(s.loot)) for (const it of s.loot) drawLoot(it);
+  if (Array.isArray(s.wanderers)) for (const w of s.wanderers) drawWanderer(w);
 
   if (cond === 3 || cond === 4) drawRain(cond, bright);
   else if (cond === 5) drawSnow(bright);
@@ -1320,7 +1513,7 @@ function drawFish(f) {
   const type = f.type || 0, z = f.z || 0;
   const sx = projX(f.x, z), sy = projY(f.y, z);
   const ts = fishTS(f);
-  const fontPx = Math.max(8, Math.round(9 * ts));
+  const fontPx = Math.max(6, Math.round(9 * ts * growth(f)));
   const col = hex(f.color || 0x00ee66);
   const hw = fishHW(f);
 

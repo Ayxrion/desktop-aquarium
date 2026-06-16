@@ -25,6 +25,12 @@ function freshPending() {
     fishAdd: [0, 0, 0, 0],     // !FISHADD:<type>:<count>  per type 0..3
     fishDel: [0, 0, 0, 0],     // !FISHDEL:<type>:<count>
     feed: 0,                   // !FEED:<count>
+    // ── Career-mode game directives ──
+    mode: null,                // !MODE:<0|1>  (0 creative, 1 career; latest wins)
+    catch: [],                 // !CATCH:<id,id,…>  wanderer/loot item ids to grab
+    buyFish: [0, 0, 0, 0],     // !BUYFISH:<type>:<count>  shop purchase (device deducts)
+    buyFood: 0,                // !BUYFOOD:<count>
+    buySnail: 0,               // !BUYSNAIL:<count>  coin-collector snail
   };
 }
 
@@ -270,6 +276,11 @@ function upsert(snapshot) {
   const entry = getOrCreate(id);
   const t = now();
   const sig = profileSig(snapshot);
+  // In Career mode the fish census changes constantly through legitimate play
+  // (catching fish, buying from the shop, the career reset). Those are not
+  // "device drift", so we never raise a profile conflict — the latest career
+  // composition is always adopted as the baseline.
+  const career = !!(snapshot.game && snapshot.game.mode === 'career');
 
   entry.snapshot = snapshot;     // live view, always current
   entry.lastSeenMs = t;
@@ -288,10 +299,11 @@ function upsert(snapshot) {
     entry.conflict = null;
     entry.awaitingRestore = false;
     db.saveSnapshot(id, snapshot, t, entry.createdAt);
-  } else if (entry.adoptNext) {
-    // The dashboard issued a profile-changing control (add/remove fish) and the
-    // device has now applied it. Adopt the new composition as the baseline rather
-    // than treating the dashboard's own change as a conflict.
+  } else if (entry.adoptNext || career) {
+    // Either the dashboard issued a profile-changing control (add/remove fish)
+    // and the device applied it, or the tank is in Career mode where census
+    // changes are normal play. Adopt the new composition as the baseline rather
+    // than treating it as a conflict.
     entry.saved = snapshot;
     entry.savedSig = sig;
     entry.conflict = null;
@@ -338,6 +350,13 @@ function getNamesText(id) {
     if (p.fishDel[t] > 0) { lines.push(`!FISHDEL:${t}:${p.fishDel[t]}`); p.fishDel[t] = 0; }
   }
   if (p.feed > 0) { lines.push(`!FEED:${p.feed}`); p.feed = 0; }
+  if (p.mode !== null) { lines.push(`!MODE:${p.mode}`); p.mode = null; }
+  if (p.catch.length) { lines.push(`!CATCH:${p.catch.join(',')}`); p.catch = []; }
+  for (let t = 0; t < 4; t++) {
+    if (p.buyFish[t] > 0) { lines.push(`!BUYFISH:${t}:${p.buyFish[t]}`); p.buyFish[t] = 0; }
+  }
+  if (p.buyFood > 0) { lines.push(`!BUYFOOD:${p.buyFood}`); p.buyFood = 0; }
+  if (p.buySnail > 0) { lines.push(`!BUYSNAIL:${p.buySnail}`); p.buySnail = 0; }
   // Only nudge the device's on-screen conflict prompt when we're not already
   // telling it to restore (restore resolves the conflict on its own).
   if (!restoreEmitted && entry.conflict) lines.push('!CONFLICT');
@@ -383,6 +402,35 @@ function queueControl(id, cmd) {
     case 'feed': {
       const n = Math.max(1, Math.min(20, Number(cmd.count) || 1));
       p.feed += n;
+      break;
+    }
+    case 'mode': {
+      const v = String(cmd.value).toLowerCase();
+      if (v !== 'creative' && v !== 'career') return { ok: false, error: 'bad_mode' };
+      p.mode = v === 'career' ? 1 : 0;
+      // The device applies the switch (career resets to 2 fish); its next snapshot
+      // will report mode=career and be auto-adopted by upsert (no conflict).
+      break;
+    }
+    case 'catch': {
+      const itemId = Number(cmd.itemId);
+      if (!Number.isInteger(itemId) || itemId < 0) return { ok: false, error: 'bad_item_id' };
+      if (!p.catch.includes(itemId)) p.catch.push(itemId);
+      break;
+    }
+    case 'buy': {
+      const what = String(cmd.what);
+      if (what === 'fish') {
+        const ft = Number(cmd.fishType);
+        if (!Number.isInteger(ft) || ft < 0 || ft > 3) return { ok: false, error: 'bad_fish_type' };
+        p.buyFish[ft] += Math.max(1, Math.min(64, Number(cmd.count) || 1));
+      } else if (what === 'food') {
+        p.buyFood += Math.max(1, Math.min(99, Number(cmd.count) || 1));
+      } else if (what === 'snail') {
+        p.buySnail += Math.max(1, Math.min(16, Number(cmd.count) || 1));
+      } else {
+        return { ok: false, error: 'bad_buy_what' };
+      }
       break;
     }
     default:
@@ -454,7 +502,8 @@ function bootstrap(id) {
     counts: base.counts || null,
     screen: base.screen || null,
     plants: base.plants || null,
-    fish,
+    game: base.game || null,   // mode/coins/shells/food/luck — restore career state
+    fish,                      // each fish already carries age/xp/fish_luck via {...f}
   };
 }
 

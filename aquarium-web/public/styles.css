@@ -462,6 +462,64 @@ main {
   transition: width 0.6s ease, background 0.6s ease;
 }
 
+/* ─── Career game panel: HUD + mode toggle + shop ─────────────────────────── */
+.game-panel {
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.hud { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.hud-mode {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-weight: 700;
+  color: #00131f;
+  background: var(--accent);
+  border-radius: 999px;
+  padding: 3px 10px;
+}
+.hud-mode.creative { background: #b07cff; }
+.hud-item {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  background: var(--panel-2);
+  border-radius: 6px;
+  padding: 3px 8px;
+}
+.mode-row { display: flex; align-items: center; gap: 10px; }
+.mode-row .ctrl-label {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted);
+}
+.shop { border-top: 1px solid #ffffff10; padding-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.shop-head { font-size: 12px; font-weight: 600; }
+.shop-head .hint { font-weight: 400; margin-left: 6px; }
+.shop-fish { display: flex; flex-direction: column; gap: 5px; }
+.shop-buy {
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--panel-2);
+  border: 1px solid #ffffff18;
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 10px;
+  cursor: pointer;
+  text-align: left;
+}
+.shop-buy:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.shop-buy:disabled { opacity: 0.4; cursor: not-allowed; }
+.shop-buy .price { color: var(--muted); flex-shrink: 0; margin-left: 8px; }
+
+.mode-confirm strong { color: var(--accent); }
+
+/* The tank canvas is interactive in career mode (tap wanderers + loot). */
+#tank { cursor: crosshair; }
+
 /* Responsive: stack the sidebar above the view on narrow screens. */
 @media (max-width: 720px) {
   main { flex-direction: column; height: auto; }
