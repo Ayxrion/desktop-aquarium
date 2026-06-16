@@ -608,6 +608,7 @@ const els = {
   ctrlTime: document.getElementById('ctrl-time'),
   ctrlFish: document.getElementById('ctrl-fish'),
   ctrlFeed: document.getElementById('ctrl-feed'),
+  ctrlPending: document.getElementById('ctrl-pending'),
   ctrlStatus: document.getElementById('ctrl-status'),
 };
 const ctx = els.canvas.getContext('2d');
@@ -709,6 +710,9 @@ function select(id) {
   els.conflictBar.hidden = true;
   els.controls.hidden = true;
   _ctrlHold.weather = _ctrlHold.time = 0;
+  _pendingQueue.length = 0;
+  clearTimeout(_pendingTimer); _pendingTimer = null;
+  if (els.ctrlPending) els.ctrlPending.hidden = true;
   els.viewEmpty.hidden = true;
   els.viewContent.hidden = false;
   openStream(id);
@@ -760,6 +764,7 @@ function applySnapshot(snap) {
   renderLegend(snap);
   renderConflict(snap);
   renderControls(snap);
+  resolvePending(snap);
   setConn(true);
   // Ensure the 60fps canvas loop is running.
   if (!rafId) rafId = requestAnimationFrame(_rafDraw);
@@ -1053,6 +1058,93 @@ let _fishRowsBuilt = false;
 const fishCountEls = [];
 const fishBtns = [];
 
+// ─── Pending-command queue ────────────────────────────────────────────────────
+// Tracks directives that have been sent to the server but not yet reflected in a
+// device snapshot. Confirmed when the snapshot state matches; expired after 15s.
+const _pendingQueue = []; // [{cmd, label, baseline, sentAt, confirmed, expired}]
+let _pendingTimer = null;
+
+function addPending(cmd, label, baseline) {
+  _pendingQueue.push({ cmd, label, baseline: baseline || null, sentAt: Date.now(), confirmed: false, expired: false });
+  renderPending();
+  if (!_pendingTimer) _pendingTimer = setTimeout(_pendingTick, 1000);
+}
+
+function _pendingTick() {
+  _pendingTimer = null;
+  _prunePending();
+  renderPending();
+  if (_pendingQueue.some((p) => !p.confirmed)) _pendingTimer = setTimeout(_pendingTick, 1000);
+}
+
+function _prunePending() {
+  const now = Date.now();
+  for (const p of _pendingQueue) {
+    if (p.confirmed) continue;
+    if (now - p.sentAt > 15000) { p.confirmed = true; p.expired = true; }
+  }
+  // Discard items that have been confirmed/expired for 3+ seconds
+  const cutoff = now - 3000;
+  while (_pendingQueue.length && _pendingQueue[0].confirmed && _pendingQueue[0].sentAt < cutoff) {
+    _pendingQueue.shift();
+  }
+}
+
+function resolvePending(snap) {
+  let changed = false;
+  const now = Date.now();
+  for (const p of _pendingQueue) {
+    if (p.confirmed) continue;
+    if (now - p.sentAt > 15000) { p.confirmed = true; p.expired = true; changed = true; continue; }
+    switch (p.cmd.type) {
+      case 'weather': {
+        const w = snap.weather || {};
+        const wv = w.override ? (w.condition | 0) : -1;
+        if (wv === p.cmd.value) { p.confirmed = true; changed = true; }
+        break;
+      }
+      case 'time':
+        if (snap.time && snap.time.mode === p.cmd.value) { p.confirmed = true; changed = true; }
+        break;
+      case 'fish': {
+        if (p.baseline) {
+          const c = snap.counts || {};
+          const key = FISH_COUNT_KEYS[p.cmd.fishType];
+          const expected = (p.baseline[key] || 0) + (p.cmd.action === 'add' ? 1 : -1);
+          if ((c[key] || 0) === expected) { p.confirmed = true; changed = true; }
+        }
+        break;
+      }
+      case 'feed':
+        if (now - p.sentAt > 5000) { p.confirmed = true; changed = true; }
+        break;
+    }
+  }
+  _prunePending();
+  if (changed) renderPending();
+}
+
+function renderPending() {
+  const el = els.ctrlPending;
+  if (!el) return;
+  // Show unconfirmed + recently confirmed (still in queue after pruning)
+  if (!_pendingQueue.length) { el.hidden = true; return; }
+  el.hidden = false;
+  const now = Date.now();
+  el.innerHTML = '<div class="pending-head">Queued for device</div>' +
+    _pendingQueue.map((p) => {
+      const age = Math.round((now - p.sentAt) / 1000);
+      const ageStr = age < 2 ? 'just now' : age + 's ago';
+      const cls = 'pending-item' + (p.confirmed ? (p.expired ? ' expired' : ' confirmed') : '');
+      const icon = p.confirmed ? (p.expired ? '✕' : '✓') : '⟳';
+      return `<div class="${cls}">` +
+        `<span class="pending-icon">${icon}</span>` +
+        `<span class="pending-label">${escapeHtml(p.label)}</span>` +
+        `<span class="pending-age">${p.confirmed ? '' : ageStr}</span>` +
+        `</div>`;
+    }).join('');
+}
+
 function setCtrlStatus(msg, kind) {
   els.ctrlStatus.textContent = msg;
   els.ctrlStatus.className = 'ctrl-status' + (kind ? ' ' + kind : '');
@@ -1063,7 +1155,7 @@ function setCtrlStatus(msg, kind) {
   }, 2500);
 }
 
-async function sendControl(cmd, okMsg) {
+async function sendControl(cmd, okMsg, pendingInfo) {
   if (!selectedId) return false;
   try {
     const res = await fetch(`api/aquariums/${encodeURIComponent(selectedId)}/control`, {
@@ -1073,6 +1165,7 @@ async function sendControl(cmd, okMsg) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.ok) { setCtrlStatus(data.error || 'Failed', 'err'); return false; }
+    if (pendingInfo) addPending(cmd, pendingInfo.label, pendingInfo.baseline);
     setCtrlStatus(okMsg || 'Sent ✓', 'ok');
     return true;
   } catch {
@@ -1110,9 +1203,11 @@ function buildFishControls() {
 }
 
 function changeFish(t, action) {
+  const baseline = { ...((latestSnapshot && latestSnapshot.counts) || {}) };
   sendControl(
     { type: 'fish', action, fishType: t, count: 1 },
-    `${action === 'add' ? 'Added' : 'Removed'} ${FISH_TYPE_NAMES[t]} ✓`
+    `${action === 'add' ? 'Added' : 'Removed'} ${FISH_TYPE_NAMES[t]} ✓`,
+    { label: `${action === 'add' ? '+1' : '−1'} ${FISH_TYPE_NAMES[t]}`, baseline }
   );
 }
 
@@ -1149,16 +1244,20 @@ function renderControls(snap) {
 
 els.ctrlWeather.addEventListener('change', () => {
   _ctrlHold.weather = Date.now();
-  sendControl({ type: 'weather', value: parseInt(els.ctrlWeather.value, 10) }, 'Weather set ✓');
+  const wv = parseInt(els.ctrlWeather.value, 10);
+  const wLabel = wv === -1 ? 'Auto' : (WEATHER_NAMES[wv] || String(wv));
+  sendControl({ type: 'weather', value: wv }, 'Weather set ✓', { label: `Weather: ${wLabel}` });
 });
 els.ctrlTime.addEventListener('click', (e) => {
   const btn = e.target.closest('button');
   if (!btn) return;
   _ctrlHold.time = Date.now();
   for (const b of els.ctrlTime.querySelectorAll('button')) b.classList.toggle('active', b === btn);
-  sendControl({ type: 'time', value: btn.dataset.mode }, `Timescale: ${btn.dataset.mode} ✓`);
+  const mode = btn.dataset.mode;
+  sendControl({ type: 'time', value: mode }, `Timescale: ${mode} ✓`, { label: `Timescale: ${mode}` });
 });
-els.ctrlFeed.addEventListener('click', () => sendControl({ type: 'feed', count: 1 }, 'Fed the fish 🐟'));
+els.ctrlFeed.addEventListener('click', () =>
+  sendControl({ type: 'feed', count: 1 }, 'Fed the fish 🐟', { label: 'Feed ×1' }));
 
 function drawTitle(s) {
   els.viewName.textContent = s.aquarium_id || selectedId || '—';
