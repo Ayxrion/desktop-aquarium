@@ -22,8 +22,9 @@ function _extrapolateFish(f, elapsedMs, frameMs) {
   if (!vx && !vy && !vz) return f;
   const fm = frameMs || 50;
   const t = Math.min(elapsedMs, 2000); // cap drift at 2 s
-  const sXY = fm * (1 - Math.pow(_DAMP_XY, t / fm)) / (-_LOG_D_XY);
-  const sZ  = fm * (1 - Math.pow(_DAMP_Z,  t / fm)) / (-_LOG_D_Z);
+  // vx is px/frame, so scale = (1 − d^(t/fm)) / (−ln d) in frame units
+  const sXY = (1 - Math.pow(_DAMP_XY, t / fm)) / (-_LOG_D_XY);
+  const sZ  = (1 - Math.pow(_DAMP_Z,  t / fm)) / (-_LOG_D_Z);
   return {
     ...f,
     x: Math.min(Math.max(Math.round(f.x + vx * sXY), 5), SCREEN_W - 5),
@@ -176,6 +177,8 @@ const EAC_MAX_FISH = 12;
 
 let eacFish = [];
 let eacTargetCount = 0;
+let eacBright = 0.5;
+let _frameCount = 0;
 
 function eacSpawnFish(startX) {
   const bandH = EAC_Y2 - EAC_Y1;
@@ -231,20 +234,21 @@ function drawSilhouetteFish(x, y, size) {
   ctx.restore();
 }
 
-// RAF loop — runs independently of snapshot delivery
-let _frameCount = 0;
-function eacLoop() {
-  eacBright = latest ? dayTint(latest.time && latest.time.day_progress) : 0.5;
-  tickEac(_frameCount++);
-  if (latest) {
-    // Redraw only the tank layer (title/stats don't need per-frame updates)
-    drawTank(latest);
-  }
-  requestAnimationFrame(eacLoop);
-}
-requestAnimationFrame(eacLoop);
-
 // ─── Rendering ───────────────────────────────────────────────────────────────
+// Single 60fps rAF loop: ticks EAC animation and redraws the canvas with
+// physics-extrapolated fish positions. Title/stats/legend update at SSE rate
+// (≤1 Hz) from applySnapshot — no need to touch the DOM every frame.
+function _rafDraw() {
+  rafId = requestAnimationFrame(_rafDraw);
+  eacBright = latestSnapshot
+    ? dayTint(latestSnapshot.time && latestSnapshot.time.day_progress)
+    : 0.5;
+  tickEac(_frameCount++);
+  if (!latestSnapshot) return;
+  const elapsed = Date.now() - snapshotReceivedAt;
+  drawTank(_extrapolateSnapshot(latestSnapshot, elapsed));
+}
+
 // Full re-render (called on highlight toggle, etc.) — extrapolates fish to now.
 function render() {
   if (!latestSnapshot) return;

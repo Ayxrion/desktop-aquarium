@@ -28,8 +28,8 @@ function _extrapolateFish(f, elapsedMs, frameMs) {
   const fm = frameMs || 50;
   // Cap at 3 seconds to avoid runaway drift if a snapshot is very stale.
   const t = Math.min(elapsedMs, 3000);
-  const sXY = fm * (1 - Math.pow(_DAMP_XY, t / fm)) / (-_LOG_D_XY);
-  const sZ  = fm * (1 - Math.pow(_DAMP_Z,  t / fm)) / (-_LOG_D_Z);
+  const sXY = (1 - Math.pow(_DAMP_XY, t / fm)) / (-_LOG_D_XY);
+  const sZ  = (1 - Math.pow(_DAMP_Z,  t / fm)) / (-_LOG_D_Z);
   return {
     ...f,
     x: Math.round(f.x + vx * sXY),
@@ -87,27 +87,37 @@ function updateFishMeta(entry, fish) {
   }
 }
 
-// Return a snapshot copy with each fish augmented with name + ageMs + extrapolated position.
-// Positions are projected forward from lastSeenMs using the device's damped-velocity physics,
-// so REST-polling clients get a current estimate rather than a stale snapshot position.
+// Return a snapshot copy with each fish augmented with name + ageMs.
+// Raw positions and velocities are preserved so SSE/browser clients can do
+// their own 60fps extrapolation without double-applying it here.
 function enrich(entry) {
   const s = entry.snapshot;
   if (!s) return null;
   const t = now();
-  const elapsedMs = t - entry.lastSeenMs;
-  const frameMs = s.frame_ms || 50;
   const fish = Array.isArray(s.fish)
     ? s.fish.map((f) => {
         const m = entry.meta.get(f.id);
-        const enriched = {
+        return {
           ...f,
           name: entry.names.get(f.id) || null,
           ageMs: m ? t - m.firstSeenMs : 0,
         };
-        return _extrapolateFish(enriched, elapsedMs, frameMs);
       })
     : [];
   return { ...s, fish, _lastSeenMs: entry.lastSeenMs, _stale: isStale(entry.lastSeenMs) };
+}
+
+// Like enrich() but also extrapolates positions forward from lastSeenMs.
+// Used only by the REST GET endpoint so poll-only clients get a current estimate.
+function enrichExtrapolated(entry) {
+  const base = enrich(entry);
+  if (!base) return null;
+  const elapsedMs = now() - entry.lastSeenMs;
+  const frameMs = (entry.snapshot && entry.snapshot.frame_ms) || 50;
+  return {
+    ...base,
+    fish: base.fish.map((f) => _extrapolateFish(f, elapsedMs, frameMs)),
+  };
 }
 
 function broadcast(entry) {
@@ -183,7 +193,7 @@ function list() {
 function get(id) {
   const entry = aquariums.get(id);
   if (!entry || !entry.snapshot) return null;
-  return enrich(entry);
+  return enrichExtrapolated(entry);
 }
 
 function subscribe(fn) {
