@@ -83,6 +83,18 @@ static bool                     _telemetryHasPending = false;
 static bool                     _telemetryShutdown   = false;
 static bool                     _telemetryStarted    = false;
 
+// ── Profile-conflict state (server-vs-local composition) ──────────────────────
+// The server is the source of truth for the aquarium *profile* (fish counts/
+// types/colors + plant layout). If the local tank diverges, the device shows an
+// on-screen prompt to keep local or adopt the server's saved profile. Flags set
+// by the POST worker are consumed on the main (render) thread.
+static char              _bootstrapJson[16384] = "";    // last bootstrap body
+static std::atomic<bool> telemetryConflictPending{false}; // → draw the modal
+static std::atomic<bool> _telemetryRestoreReq{false};     // worker→main: rebuild
+static std::atomic<bool> _telemetryConflictHint{false};   // worker→main: re-check
+static int telemetrySrvPair = 0, telemetrySrvSchool = 0,
+           telemetrySrvSchool2 = 0, telemetrySrvAngel = 0; // server counts (modal)
+
 static size_t _telemetryDiscard(void*, size_t sz, size_t n, void*) { return sz * n; }
 
 // ── Fish names (pushed down via the telemetry POST response) ──────────────────
@@ -269,7 +281,12 @@ static void _postTelemetry(const std::string& body) {
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
 
     bool ok = (res == CURLE_OK && httpCode >= 200 && httpCode < 300);
-    if (ok) _telemetryApplyNames(resp.data);   // server returned the name table
+    if (ok) {
+        // Control directives (tab-less lines the name parser ignores).
+        if (strstr(resp.data, "!RESTORE"))       _telemetryRestoreReq.store(true);
+        else if (strstr(resp.data, "!CONFLICT")) _telemetryConflictHint.store(true);
+        _telemetryApplyNames(resp.data);        // server returned the name table
+    }
     telemetryEverTried.store(true);
     telemetryLastOk.store(ok);
     if (ok) {
@@ -364,6 +381,91 @@ static bool _jGetStr(const char* p, const char* key, const char** start, size_t*
     return true;
 }
 
+// Canonical profile signature of the LIVE local tank. Must match the server's
+// profileSig() byte-for-byte (aquarium-web/src/store.js).
+static std::string _localProfileSig() {
+    char tmp[80];
+    std::string s;
+    snprintf(tmp, sizeof(tmp), "P:%d,%d,%d,%d;", numPair, numSchool, numSchool2, numAngel);
+    s += tmp;
+    s += "F:";
+    bool first = true;
+    for (int i = 0; i < MAX_FISH; i++) {
+        if (!isFishActive(i)) continue;
+        snprintf(tmp, sizeof(tmp), "%s%d:%d:%u", first ? "" : "|",
+                 i, (int)fish[i].type, (unsigned)fishColor(i));
+        s += tmp; first = false;
+    }
+    s += ";BG:";
+    for (int i = 0; i < NUM_BG_PLANTS; i++) {
+        snprintf(tmp, sizeof(tmp), "%s%d:%d:%d", i ? "|" : "",
+                 (int)bgPlants[i].baseX, (int)bgPlants[i].segs, (int)bgPlants[i].type);
+        s += tmp;
+    }
+    s += ";WD:";
+    for (int i = 0; i < NUM_WEEDS; i++) {
+        snprintf(tmp, sizeof(tmp), "%s%d:%d", i ? "|" : "",
+                 (int)weeds[i].baseX, (int)weeds[i].segs);
+        s += tmp;
+    }
+    s += ";HW:";
+    for (int i = 0; i < NUM_FG_HORNWORT; i++) {
+        snprintf(tmp, sizeof(tmp), "%s%d:%d", i ? "|" : "",
+                 (int)fgHornworts[i].baseX, (int)fgHornworts[i].segs);
+        s += tmp;
+    }
+    return s;
+}
+
+// Copy each "{...}" object inside a JSON array (p at/before '[') into outObjs[].
+static int _parseObjArray(const char* p, char outObjs[][256], int maxObjs) {
+    const char* arr = strchr(p, '[');
+    if (!arr) return 0;
+    p = arr + 1;
+    int count = 0;
+    while (count < maxObjs) {
+        const char* o   = strchr(p, '{');
+        const char* end = strchr(p, ']');
+        if (!o || (end && o > end)) break;
+        int depth = 0; const char* e = o;
+        while (*e) { if (*e == '{') depth++; else if (*e == '}') { if (--depth == 0) { e++; break; } } e++; }
+        size_t len = (size_t)(e - o); if (len >= 256) len = 255;
+        memcpy(outObjs[count], o, len); outObjs[count][len] = '\0';
+        count++; p = e;
+    }
+    return count;
+}
+
+// Blocking GET of /bootstrap into _bootstrapJson. Returns true on HTTP 200.
+static bool _fetchBootstrap() {
+    if (TELEMETRY_HOST[0] == '\0') return false;
+    std::string url = std::string(TELEMETRY_HOST)
+        + "/api/aquariums/" + TELEMETRY_AQUARIUM_ID + "/bootstrap";
+    std::string keyHeader = std::string("X-Api-Key: ") + TELEMETRY_API_KEY;
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, keyHeader.c_str());
+    _BootstrapResp resp = {};
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, _bootstrapCapture);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 8L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    CURLcode res = curl_easy_perform(curl);
+    long httpCode = 0;
+    if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+    bool ok = (res == CURLE_OK && httpCode == 200);
+    if (ok) memcpy(_bootstrapJson, resp.data, resp.len + 1);
+    else printf("Telemetry: bootstrap fetch failed (%s)\n",
+                res != CURLE_OK ? curl_easy_strerror(res) : "non-200");
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return ok;
+}
+
 static void _applyBootstrap(const char* json) {
     // Quick existence check
     if (!strstr(json, "\"exists\":true")) return;
@@ -415,41 +517,151 @@ static void _applyBootstrap(const char* json) {
     printf("Telemetry: aquarium state restored from server\n");
 }
 
+// Rebuild the local tank to the server's saved profile (counts + plant layout),
+// then overlay the saved fish positions/names. Main-thread only (mutates fish[]
+// and the plant arrays that the render loop reads).
+static void _applyServerProfile(const char* json) {
+    if (!strstr(json, "\"exists\":true")) return;
+
+    // 1) Fish composition from saved counts — rebuild via addFish (handles slots
+    //    + pair partners), then positions get overlaid by _applyBootstrap below.
+    const char* cp = strstr(json, "\"counts\":");
+    int wantP = numPair, wantS = numSchool, wantS2 = numSchool2, wantA = numAngel;
+    if (cp) {
+        int v;
+        if (_jGetInt(cp, "pair",    &v)) wantP  = v;
+        if (_jGetInt(cp, "school",  &v)) wantS  = v;
+        if (_jGetInt(cp, "school2", &v)) wantS2 = v;
+        if (_jGetInt(cp, "angel",   &v)) wantA  = v;
+    }
+    numPair = numSchool = numSchool2 = numAngel = 0;
+    for (int i = 0; i < wantP  && numPair    < MAX_PAIR;    i++) addFish(FISH_PAIR);
+    for (int i = 0; i < wantS  && numSchool  < MAX_SCHOOL;  i++) addFish(FISH_SCHOOL);
+    for (int i = 0; i < wantS2 && numSchool2 < MAX_SCHOOL2; i++) addFish(FISH_SCHOOL2);
+    for (int i = 0; i < wantA  && numAngel   < MAX_ANGEL;   i++) addFish(FISH_ANGEL);
+
+    // 2) Plant layout from the server (regenerate seaweed branches locally —
+    //    they aren't part of the profile signature).
+    const char* pl = strstr(json, "\"plants\":");
+    if (pl) {
+        char objs[16][256];
+        const char* bg = strstr(pl, "\"bg\":");
+        if (bg) {
+            int nc = _parseObjArray(bg, objs, NUM_BG_PLANTS);
+            for (int i = 0; i < nc; i++) {
+                int x, sg, ty;
+                if (_jGetInt(objs[i], "x", &x))     bgPlants[i].baseX = (uint16_t)x;
+                if (_jGetInt(objs[i], "segs", &sg)) bgPlants[i].segs  = (uint8_t)sg;
+                if (_jGetInt(objs[i], "type", &ty)) bgPlants[i].type  = (uint8_t)ty;
+            }
+        }
+        const char* wd = strstr(pl, "\"weeds\":");
+        if (wd) {
+            int nc = _parseObjArray(wd, objs, NUM_WEEDS);
+            for (int i = 0; i < nc; i++) {
+                int x, sg;
+                if (_jGetInt(objs[i], "x", &x))     weeds[i].baseX = (uint16_t)x;
+                if (_jGetInt(objs[i], "segs", &sg)) weeds[i].segs  = (uint8_t)sg;
+                weeds[i].numBranches = (uint8_t)(1 + random(0, 2));
+                for (int b = 0; b < 2; b++) {
+                    int span = weeds[i].segs > 3 ? weeds[i].segs - 3 : 1;
+                    weeds[i].branchAt[b]   = (uint8_t)(2 + random(0, span));
+                    weeds[i].branchSide[b] = (random(0, 2) == 0) ? 1 : -1;
+                }
+            }
+        }
+        const char* hw = strstr(pl, "\"hornwort\":");
+        if (hw) {
+            int nc = _parseObjArray(hw, objs, NUM_FG_HORNWORT);
+            for (int i = 0; i < nc; i++) {
+                int x, sg;
+                if (_jGetInt(objs[i], "x", &x))     fgHornworts[i].baseX = (uint16_t)x;
+                if (_jGetInt(objs[i], "segs", &sg)) fgHornworts[i].segs  = (uint8_t)sg;
+            }
+        }
+    }
+
+    // 3) Overlay the saved fish positions + names.
+    _applyBootstrap(json);
+    printf("Telemetry: rebuilt tank to server profile (pair %d school %d/%d angel %d)\n",
+           numPair, numSchool, numSchool2, numAngel);
+}
+
+// Boot handshake: adopt the server's saved profile as the source of truth (so a
+// fresh random tank doesn't spuriously conflict). Silent — no prompt.
 static void telemetryBootstrap() {
     if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
+    if (_fetchBootstrap() && strstr(_bootstrapJson, "\"exists\":true"))
+        _applyServerProfile(_bootstrapJson);
+    else
+        printf("Telemetry: no saved profile on server (keeping local tank)\n");
+}
 
-    std::string url = std::string(TELEMETRY_HOST)
-        + "/api/aquariums/" + TELEMETRY_AQUARIUM_ID + "/bootstrap";
-    std::string keyHeader = std::string("X-Api-Key: ") + TELEMETRY_API_KEY;
+// Runtime re-enable: compare the local profile to the server's saved one and, if
+// they differ, raise the on-screen prompt instead of silently adopting either.
+static void telemetryReenableCheck() {
+    if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
+    if (!_fetchBootstrap() || !strstr(_bootstrapJson, "\"exists\":true")) return;
+    const char* ss; size_t sl;
+    if (!_jGetStr(_bootstrapJson, "profile_sig", &ss, &sl)) return;
+    std::string local = _localProfileSig();
+    if (local.size() == sl && memcmp(local.c_str(), ss, sl) == 0) return; // matches
+    const char* cp = strstr(_bootstrapJson, "\"counts\":");
+    if (cp) {
+        int v;
+        if (_jGetInt(cp, "pair",    &v)) telemetrySrvPair    = v;
+        if (_jGetInt(cp, "school",  &v)) telemetrySrvSchool  = v;
+        if (_jGetInt(cp, "school2", &v)) telemetrySrvSchool2 = v;
+        if (_jGetInt(cp, "angel",   &v)) telemetrySrvAngel   = v;
+    }
+    telemetryConflictPending.store(true);
+}
 
+// POST the user's conflict choice to the server (blocking; main thread).
+static void _postResolve(const char* choice) {
+    if (TELEMETRY_HOST[0] == '\0') return;
+    std::string url  = std::string(TELEMETRY_HOST)
+        + "/api/aquariums/" + TELEMETRY_AQUARIUM_ID + "/resolve";
+    std::string body = std::string("{\"choice\":\"") + choice + "\"}";
     CURL* curl = curl_easy_init();
     if (!curl) return;
-
     struct curl_slist* headers = nullptr;
-    headers = curl_slist_append(headers, keyHeader.c_str());
-
-    _BootstrapResp resp = {};
+    headers = curl_slist_append(headers, "Content-Type: application/json");
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, _bootstrapCapture);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 8L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-
-    CURLcode res = curl_easy_perform(curl);
-    long httpCode = 0;
-    if (res == CURLE_OK)
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
-
-    if (res == CURLE_OK && httpCode == 200)
-        _applyBootstrap(resp.data);
-    else
-        printf("Telemetry: bootstrap skipped (%s)\n",
-               res != CURLE_OK ? curl_easy_strerror(res) : "no prior state");
-
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, _telemetryDiscard);
+    curl_easy_perform(curl);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
+}
+
+// Conflict resolution entry points (called from the modal's button handlers).
+static void telemetryResolveUseServer() {
+    if (strstr(_bootstrapJson, "\"exists\":true")) _applyServerProfile(_bootstrapJson);
+    telemetryConflictPending.store(false);
+}
+static void telemetryResolveKeepLocal() {
+    telemetryConflictPending.store(false);
+    _postResolve("local"); // server adopts this device's profile as the baseline
+}
+
+// Run once per loop() on the main thread: act on directives flagged by the
+// POST worker (re-bootstrap-and-rebuild on RESTORE; re-check profile on CONFLICT).
+static void telemetryProcessFlags() {
+    if (_telemetryRestoreReq.exchange(false)) {
+        if (_fetchBootstrap() && strstr(_bootstrapJson, "\"exists\":true")) {
+            _applyServerProfile(_bootstrapJson);
+            telemetryConflictPending.store(false);
+        }
+    }
+    if (_telemetryConflictHint.exchange(false) && !telemetryConflictPending.load())
+        telemetryReenableCheck();
 }
 
 static void telemetryInit() {

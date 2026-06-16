@@ -138,6 +138,18 @@ app.get('/api/aquariums/:id/bootstrap', (req, res) => {
   return res.json(data);
 });
 
+// Resolve a profile conflict from the dashboard (open like the rename API).
+// Body: { choice: 'local' | 'server' }.
+app.post('/api/aquariums/:id/resolve', (req, res) => {
+  const choice = req.body && req.body.choice;
+  if (choice !== 'local' && choice !== 'server') {
+    return res.status(400).json({ ok: false, error: 'choice must be "local" or "server"' });
+  }
+  const result = store.resolveConflict(req.params.id, choice);
+  if (!result.ok) return res.status(404).json(result);
+  return res.json(result);
+});
+
 // ─── Read APIs ───────────────────────────────────────────────────────────────
 app.get('/api/aquariums', (_req, res) => res.json(store.list()));
 

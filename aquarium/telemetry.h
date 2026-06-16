@@ -72,6 +72,17 @@ static std::mutex            _telemetryErrMutex;
 static std::atomic<bool>     _telemetryBusy{false};
 static TaskHandle_t          _telemetryTaskHandle = nullptr;
 
+// ── Profile-conflict state (server-vs-local composition) ──────────────────────
+// The server is the source of truth for the aquarium profile (fish counts/types/
+// colors + plant layout). If the local tank diverges, the device shows an
+// on-screen prompt. Flags set by the POST worker (core 0) are consumed by the
+// render loop (core 1).
+static std::atomic<bool> telemetryConflictPending{false}; // → draw the modal
+static std::atomic<bool> _telemetryRestoreReq{false};     // worker→loop: rebuild
+static std::atomic<bool> _telemetryConflictHint{false};   // worker→loop: re-check
+static int telemetrySrvPair = 0, telemetrySrvSchool = 0,
+           telemetrySrvSchool2 = 0, telemetrySrvAngel = 0; // server counts (modal)
+
 // True when publishing is on but recent posts are failing — drives the failure
 // indicator in the tank view.
 static inline bool telemetryHasError() {
@@ -258,6 +269,8 @@ static void _telemetryPost() {
     int code = http.POST((uint8_t*)_telemetryBuf, (size_t)_telemetryBufLen);
     if (code >= 200 && code < 300) {
         String body = http.getString();          // `id\tname` lines from the server
+        if (body.indexOf("!RESTORE") >= 0)       _telemetryRestoreReq.store(true);
+        else if (body.indexOf("!CONFLICT") >= 0) _telemetryConflictHint.store(true);
         _telemetryApplyNames(body.c_str());
         _telemetryOk();
     }
@@ -284,39 +297,102 @@ static void _telemetryTask(void*) {
 
 #include <ArduinoJson.h>
 
-static void telemetryBootstrap() {
-    if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
-    if (!_wifiEnsureConnected()) return;
+// Canonical profile signature of the LIVE local tank. Must match the server's
+// profileSig() byte-for-byte (aquarium-web/src/store.js).
+static String _localProfileSig() {
+    String s = "P:" + String(numPair) + "," + String(numSchool) + "," +
+               String(numSchool2) + "," + String(numAngel) + ";F:";
+    bool first = true;
+    for (int i = 0; i < MAX_FISH; i++) {
+        if (!isFishActive(i)) continue;
+        if (!first) s += "|";
+        s += String(i) + ":" + String((int)fish[i].type) + ":" + String((unsigned)fishColor(i));
+        first = false;
+    }
+    s += ";BG:";
+    for (int i = 0; i < NUM_BG_PLANTS; i++) {
+        if (i) s += "|";
+        s += String((int)bgPlants[i].baseX) + ":" + String((int)bgPlants[i].segs) + ":" + String((int)bgPlants[i].type);
+    }
+    s += ";WD:";
+    for (int i = 0; i < NUM_WEEDS; i++) {
+        if (i) s += "|";
+        s += String((int)weeds[i].baseX) + ":" + String((int)weeds[i].segs);
+    }
+    s += ";HW:";
+    for (int i = 0; i < NUM_FG_HORNWORT; i++) {
+        if (i) s += "|";
+        s += String((int)fgHornworts[i].baseX) + ":" + String((int)fgHornworts[i].segs);
+    }
+    return s;
+}
 
-    // Build URL: strip /api/telemetry suffix if present, append bootstrap path.
+// GET /bootstrap into doc. Returns true on HTTP 200 + valid JSON.
+static bool _fetchBootstrapDoc(DynamicJsonDocument& doc) {
+    if (TELEMETRY_HOST[0] == '\0' || !_wifiEnsureConnected()) return false;
     String base = String(TELEMETRY_HOST);
     if (base.endsWith("/api/telemetry")) base = base.substring(0, base.length() - 14);
-
     String url = base + "/api/aquariums/" + TELEMETRY_AQUARIUM_ID + "/bootstrap";
-
     WiFiClient client;
     HTTPClient http;
-    if (!http.begin(client, url)) return;
+    if (!http.begin(client, url)) return false;
     http.addHeader("X-Api-Key", TELEMETRY_API_KEY);
     http.setConnectTimeout(5000);
     http.setTimeout(8000);
     int code = http.GET();
-    if (code != 200) {
-        Serial.printf("Telemetry: bootstrap skipped (HTTP %d)\n", code);
-        http.end(); return;
-    }
-
-    // ArduinoJson: 8 KB covers 14 fish × ~200 bytes each + overhead.
-    DynamicJsonDocument doc(8192);
+    if (code != 200) { http.end(); return false; }
     DeserializationError err = deserializeJson(doc, http.getStream());
     http.end();
-    if (err || !doc["exists"].as<bool>()) {
-        Serial.println("Telemetry: no prior aquarium state on server");
-        return;
+    return !err;
+}
+
+// Rebuild the local tank to the server's saved profile (counts + plant layout),
+// then overlay saved fish positions/names. Render-loop (core 1) only.
+static void _applyServerProfileDoc(DynamicJsonDocument& doc) {
+    if (!doc["exists"].as<bool>()) return;
+
+    JsonObject counts = doc["counts"];
+    int wantP = counts["pair"] | numPair, wantS = counts["school"] | numSchool;
+    int wantS2 = counts["school2"] | numSchool2, wantA = counts["angel"] | numAngel;
+    numPair = numSchool = numSchool2 = numAngel = 0;
+    for (int i = 0; i < wantP  && numPair    < MAX_PAIR;    i++) addFish(FISH_PAIR);
+    for (int i = 0; i < wantS  && numSchool  < MAX_SCHOOL;  i++) addFish(FISH_SCHOOL);
+    for (int i = 0; i < wantS2 && numSchool2 < MAX_SCHOOL2; i++) addFish(FISH_SCHOOL2);
+    for (int i = 0; i < wantA  && numAngel   < MAX_ANGEL;   i++) addFish(FISH_ANGEL);
+
+    JsonObject plants = doc["plants"];
+    if (!plants.isNull()) {
+        int i = 0;
+        for (JsonObject p : plants["bg"].as<JsonArray>()) {
+            if (i >= NUM_BG_PLANTS) break;
+            bgPlants[i].baseX = (uint16_t)(p["x"] | bgPlants[i].baseX);
+            bgPlants[i].segs  = (uint8_t)(p["segs"] | bgPlants[i].segs);
+            bgPlants[i].type  = (uint8_t)(p["type"] | bgPlants[i].type);
+            i++;
+        }
+        i = 0;
+        for (JsonObject p : plants["weeds"].as<JsonArray>()) {
+            if (i >= NUM_WEEDS) break;
+            weeds[i].baseX = (uint16_t)(p["x"] | weeds[i].baseX);
+            weeds[i].segs  = (uint8_t)(p["segs"] | weeds[i].segs);
+            weeds[i].numBranches = (uint8_t)(1 + random(0, 2));
+            for (int b = 0; b < 2; b++) {
+                int span = weeds[i].segs > 3 ? weeds[i].segs - 3 : 1;
+                weeds[i].branchAt[b]   = (uint8_t)(2 + random(0, span));
+                weeds[i].branchSide[b] = (random(0, 2) == 0) ? 1 : -1;
+            }
+            i++;
+        }
+        i = 0;
+        for (JsonObject p : plants["hornwort"].as<JsonArray>()) {
+            if (i >= NUM_FG_HORNWORT) break;
+            fgHornworts[i].baseX = (uint16_t)(p["x"] | fgHornworts[i].baseX);
+            fgHornworts[i].segs  = (uint8_t)(p["segs"] | fgHornworts[i].segs);
+            i++;
+        }
     }
 
-    JsonArray fishArr = doc["fish"].as<JsonArray>();
-    for (JsonObject jf : fishArr) {
+    for (JsonObject jf : doc["fish"].as<JsonArray>()) {
         int id = jf["id"] | -1;
         if (id < 0 || id >= MAX_FISH || !isFishActive(id)) continue;
         Fish& f = fish[id];
@@ -335,7 +411,72 @@ static void telemetryBootstrap() {
             telemetryFishName[id][TELEMETRY_NAME_LEN - 1] = '\0';
         }
     }
-    Serial.println("Telemetry: aquarium state restored from server");
+    Serial.printf("Telemetry: rebuilt tank to server profile (pair %d school %d/%d angel %d)\n",
+                  numPair, numSchool, numSchool2, numAngel);
+}
+
+static bool telemetryFetchAndApplyProfile() {
+    DynamicJsonDocument doc(8192);
+    if (!_fetchBootstrapDoc(doc) || !doc["exists"].as<bool>()) return false;
+    _applyServerProfileDoc(doc);
+    return true;
+}
+
+// Boot handshake: adopt the server's saved profile as the source of truth.
+static void telemetryBootstrap() {
+    if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
+    if (!telemetryFetchAndApplyProfile())
+        Serial.println("Telemetry: no saved profile on server (keeping local tank)");
+}
+
+// Runtime re-enable: compare local profile to the server's; prompt if different.
+static void telemetryReenableCheck() {
+    if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
+    DynamicJsonDocument doc(8192);
+    if (!_fetchBootstrapDoc(doc) || !doc["exists"].as<bool>()) return;
+    const char* ss = doc["profile_sig"] | "";
+    if (_localProfileSig() == String(ss)) return; // matches → no conflict
+    JsonObject counts = doc["counts"];
+    telemetrySrvPair    = counts["pair"]    | 0;
+    telemetrySrvSchool  = counts["school"]  | 0;
+    telemetrySrvSchool2 = counts["school2"] | 0;
+    telemetrySrvAngel   = counts["angel"]   | 0;
+    telemetryConflictPending.store(true);
+}
+
+static void _postResolve(const char* choice) {
+    if (TELEMETRY_HOST[0] == '\0' || !_wifiEnsureConnected()) return;
+    String base = String(TELEMETRY_HOST);
+    if (base.endsWith("/api/telemetry")) base = base.substring(0, base.length() - 14);
+    String url  = base + "/api/aquariums/" + TELEMETRY_AQUARIUM_ID + "/resolve";
+    String body = String("{\"choice\":\"") + choice + "\"}";
+    WiFiClient client;
+    HTTPClient http;
+    if (!http.begin(client, url)) return;
+    http.addHeader("Content-Type", "application/json");
+    http.setConnectTimeout(3000);
+    http.setTimeout(5000);
+    http.POST((uint8_t*)body.c_str(), body.length());
+    http.end();
+}
+
+// Conflict resolution entry points (called from the modal's button handlers).
+static void telemetryResolveUseServer() {
+    telemetryFetchAndApplyProfile();
+    telemetryConflictPending.store(false);
+}
+static void telemetryResolveKeepLocal() {
+    telemetryConflictPending.store(false);
+    _postResolve("local");
+}
+
+// Run once per loop() on core 1: act on directives flagged by the POST worker.
+static void telemetryProcessFlags() {
+    if (_telemetryRestoreReq.exchange(false)) {
+        if (telemetryFetchAndApplyProfile()) telemetryConflictPending.store(false);
+    }
+    if (_telemetryConflictHint.exchange(false) && !telemetryConflictPending.load())
+        telemetryReenableCheck();
 }
 
 static void telemetryInit() {
