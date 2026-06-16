@@ -15,11 +15,7 @@ const FISH_GAP_MS = parseInt(process.env.FISH_GAP_MS || '10000', 10); // absence
 const MAX_NAME_LEN = 24;
 
 // Physics simulation matching the device (aquarium.ino / main.cpp).
-// Seek strengths and max velocities by fish type (0=pair,1=school,2=school2,3=angel).
-const _SEEK  = [0.018, 0.012, 0.012, 0.020];
-const _MAXV  = [7.0,   5.5,   5.5,   7.0  ];
 const _DAMP  = 0.85;
-const _DAMPZ = 0.88;
 const TANK_TOP = 72, SCREEN_W = 800, SCREEN_H = 480;
 
 function _bound(v, lo, hi, k) {
@@ -28,32 +24,65 @@ function _bound(v, lo, hi, k) {
   return 0;
 }
 
-function _extrapolateFish(f, elapsedMs, frameMs) {
-  const fm  = frameMs || 50;
-  const n   = Math.round(Math.min(elapsedMs, 3000) / fm);
-  if (n === 0) return f;
-  const type = f.type || 0;
-  const seek = _SEEK[type] ?? 0.012;
-  const maxV = f.going_for_food ? 8.0 : (_MAXV[type] ?? 5.5);
-  const maxVy = maxV * 0.5;
-  const tx = f.tx ?? f.x, ty = f.ty ?? f.y;
-  // wander_cd: frames until fish picks a new random target — seek only while valid.
-  const wcd = typeof f.wander_cd === 'number' ? f.wander_cd : n;
-  let x = f.x, y = f.y, z = f.z || 0;
-  let vx = f.vx || 0, vy = f.vy || 0, vz = f.vz || 0;
-  for (let i = 0; i < n; i++) {
-    const seeking = f.going_for_food || i < wcd;
-    let ax = (seeking ? (tx - x) * seek : 0) + _bound(x, 30, SCREEN_W - 30, 0.30);
-    let ay = (seeking ? (ty - y) * seek : 0) + _bound(y, TANK_TOP + 20, SCREEN_H - 80, 0.30);
-    let az = _bound(z, 0.0, 0.75, 0.08);
-    vx = Math.max(-maxV,  Math.min(maxV,  vx + ax)) * _DAMP;
-    vy = Math.max(-maxVy, Math.min(maxVy, vy + ay)) * _DAMP;
-    vz = Math.max(-0.015, Math.min(0.015, vz + az)) * _DAMPZ;
-    x  = Math.max(5,            Math.min(SCREEN_W - 5,  x + vx));
-    y  = Math.max(TANK_TOP + 5, Math.min(SCREEN_H - 60, y + vy));
-    z  = Math.max(0,            Math.min(0.78,           z + vz));
+// Joint simulation: all fish stepped together each frame so school centroids
+// and pairwise separation forces match the device's updateFish() exactly.
+function _extrapolateSnapshot(snapshot, elapsedMs) {
+  const fish = snapshot && Array.isArray(snapshot.fish) ? snapshot.fish : [];
+  if (!fish.length) return snapshot;
+  const fm = snapshot.frame_ms || 50;
+  const n  = Math.round(Math.min(elapsedMs, 3000) / fm);
+  if (n === 0) return snapshot;
+
+  const st = fish.map((f) => ({
+    id: f.id, type: f.type || 0,
+    x: f.x, y: f.y, z: f.z || 0,
+    vx: f.vx || 0, vy: f.vy || 0, vz: f.vz || 0,
+    tx: f.tx ?? f.x, ty: f.ty ?? f.y,
+    wcd: typeof f.wander_cd === 'number' ? f.wander_cd : n,
+    chasing: !!f.chasing, going_for_food: !!f.going_for_food,
+  }));
+
+  for (let frame = 0; frame < n; frame++) {
+    const cent = [0, 1, 2, 3].map((t) => {
+      const g = st.filter((f) => f.type === t);
+      if (!g.length) return { x: 0, y: 0 };
+      return { x: g.reduce((s, f) => s + f.x, 0) / g.length,
+               y: g.reduce((s, f) => s + f.y, 0) / g.length };
+    });
+    for (const f of st) {
+      f.wcd--;
+      const t = f.type, chasing = f.chasing && t === 0;
+      const seeking = f.going_for_food || f.wcd >= 0;
+      const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
+      const maxV    = f.going_for_food ? 8.0 : (chasing || t === 3) ? 7.0 : 5.5;
+      let ax = seeking ? (f.tx - f.x) * seekStr : 0;
+      let ay = seeking ? (f.ty - f.y) * seekStr : 0;
+      if (t === 1 || t === 2) {
+        ax += (cent[t].x - f.x) * 0.010; ay += (cent[t].y - f.y) * 0.007;
+      } else if (t === 3) {
+        ax += (cent[3].x - f.x) * 0.012; ay += (cent[3].y - f.y) * 0.010;
+      }
+      const sepR2 = t === 3 ? 60*60 : 80*80, sepK = t === 3 ? 7 : 8;
+      if (t === 1 || t === 2 || t === 3) {
+        for (const o of st) {
+          if (o === f || o.type !== t) continue;
+          const dx = f.x - o.x, dy = f.y - o.y, d2 = dx*dx + dy*dy;
+          if (d2 < sepR2 && d2 > 0.01) { const inv = sepK/d2; ax += dx*inv; ay += dy*inv; }
+        }
+      }
+      ax += _bound(f.x, 30, SCREEN_W - 30, 0.30);
+      ay += _bound(f.y, TANK_TOP + 20, SCREEN_H - 80, 0.30);
+      f.vx = Math.max(-maxV,     Math.min(maxV,     f.vx + ax)) * _DAMP;
+      f.vy = Math.max(-maxV*0.5, Math.min(maxV*0.5, f.vy + ay)) * _DAMP;
+      f.x  = Math.max(5,          Math.min(SCREEN_W - 5,  f.x + f.vx));
+      f.y  = Math.max(TANK_TOP+5, Math.min(SCREEN_H - 60, f.y + f.vy));
+    }
   }
-  return { ...f, x: Math.round(x), y: Math.round(y), z };
+
+  const fishOut = fish.map((orig, i) => ({
+    ...orig, x: Math.round(st[i].x), y: Math.round(st[i].y), z: st[i].z,
+  }));
+  return { ...snapshot, fish: fishOut };
 }
 
 /**
@@ -131,11 +160,7 @@ function enrichExtrapolated(entry) {
   const base = enrich(entry);
   if (!base) return null;
   const elapsedMs = now() - entry.lastSeenMs;
-  const frameMs = (entry.snapshot && entry.snapshot.frame_ms) || 50;
-  return {
-    ...base,
-    fish: base.fish.map((f) => _extrapolateFish(f, elapsedMs, frameMs)),
-  };
+  return _extrapolateSnapshot(base, elapsedMs);
 }
 
 function broadcast(entry) {
