@@ -91,7 +91,8 @@ static void checkForOTAUpdate() {
         http.addHeader("User-Agent", "ESP32-Aquarium/" FIRMWARE_VERSION);
         http.addHeader("Accept",     "application/vnd.github.v3+json");
         http.setTimeout(10000);
-        http.collectHeaders((const char*[]){"Content-Type"}, 1);
+        static const char* hdrs[] = {"Content-Type"};
+        http.collectHeaders(hdrs, 1);
 
         {
             int code = http.GET();
