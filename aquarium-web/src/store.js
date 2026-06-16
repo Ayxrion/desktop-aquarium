@@ -152,6 +152,7 @@ function getOrCreate(id) {
       savedSig: null,         // profileSig(saved)
       conflict: null,         // { savedSig, deviceSig, savedCounts, deviceCounts, since }
       pendingDirective: null, // one-shot line for the device's next POST response
+      awaitingRestore: false, // user chose 'server'; suppress conflict until device restores
     };
     aquariums.set(id, entry);
   }
@@ -267,10 +268,17 @@ function upsert(snapshot) {
     entry.conflict = null;
     db.saveSnapshot(id, snapshot, t, entry.createdAt);
   } else if (sig === entry.savedSig) {
-    // Profile unchanged → keep the baseline fresh and clear any prior conflict.
+    // Profile matches the baseline → keep it fresh, clear any prior conflict, and
+    // finish a pending server-restore (the device has caught up to the baseline).
     entry.saved = snapshot;
     entry.conflict = null;
+    entry.awaitingRestore = false;
     db.saveSnapshot(id, snapshot, t, entry.createdAt);
+  } else if (entry.awaitingRestore) {
+    // User chose 'server'; the restore directive is in flight but the device is
+    // still reporting its old profile. Don't re-raise the conflict — wait for it
+    // to restore (handled by the matching branch above).
+    entry.conflict = null;
   } else {
     // Profile diverged → record the conflict without overwriting the baseline.
     entry.conflict = {
@@ -385,12 +393,14 @@ function resolveConflict(id, choice) {
     entry.savedSig = profileSig(entry.snapshot);
     entry.conflict = null;
     entry.pendingDirective = null;
+    entry.awaitingRestore = false;
     db.saveSnapshot(id, entry.saved, entry.lastSeenMs, entry.createdAt);
     broadcast(entry);
     return { ok: true, choice };
   }
   if (choice === 'server') {
     entry.conflict = null;
+    entry.awaitingRestore = true;       // suppress re-flagging until the device restores
     entry.pendingDirective = 'restore'; // delivered in the next POST response
     broadcast(entry);
     return { ok: true, choice };

@@ -575,6 +575,11 @@ const legendRows = new Map(); // fishId -> { el, nameInput, ageEl, swatchEl }
 const BLEND_MS = 250;
 let _blendFrom = new Map(); // fishId → {x, y} at the moment the new snapshot arrived
 let _blendStartMs = 0;
+// The boat's telemetry is sparse (≤1 Hz) and dead-reckoned between snapshots, so
+// it snaps when a new snapshot lands. Capture its predicted x at that moment and
+// lerp to the new trajectory over BLEND_MS, exactly like the fish. null = no blend
+// (first snapshot, or a relaunch teleport where sliding across would look wrong).
+let _blendBoatFrom = null;
 
 const els = {
   list: document.getElementById('aquarium-list'),
@@ -638,6 +643,7 @@ function select(id) {
   snapshotReceivedAt = 0;
   _blendFrom.clear();
   _blendStartMs = 0;
+  _blendBoatFrom = null;
   highlightedFishId = null;
   legendRows.clear();
   els.legend.innerHTML = '';
@@ -672,6 +678,17 @@ function applySnapshot(snap) {
       boat: (latestSnapshot.boat && snap.boat && latestSnapshot.boat.active && snap.boat.active)
         ? _obsVel(latestSnapshot.boat, snap.boat, dt) : 0,
     };
+
+    // Capture the boat's predicted x to blend from. Only when it was (and stays)
+    // active and the new position is close to the prediction — a large gap means
+    // a relaunch from the far edge, where sliding across the tank looks worse than
+    // a clean snap.
+    _blendBoatFrom = null;
+    if (prev.boat && snap.boat && prev.boat.active && snap.boat.active &&
+        typeof prev.boat.x === 'number' && typeof snap.boat.x === 'number' &&
+        Math.abs(prev.boat.x - snap.boat.x) < 120) {
+      _blendBoatFrom = prev.boat.x;
+    }
   }
   latestSnapshot = snap;
   snapshotReceivedAt = serverRx;
@@ -818,7 +835,10 @@ function _rafDraw() {
     if (!prev) return f;
     return { ...f, x: prev.x + (f.x - prev.x) * sFac, y: prev.y + (f.y - prev.y) * sFac };
   });
-  drawTank({ ...ext, fish });
+  let boat = ext.boat;
+  if (boat && _blendBoatFrom != null)
+    boat = { ...boat, x: _blendBoatFrom + (boat.x - _blendBoatFrom) * sFac };
+  drawTank({ ...ext, fish, boat });
 }
 
 // Full re-render (called on highlight toggle, etc.) — extrapolates fish to now.
@@ -980,8 +1000,10 @@ function drawTank(s) {
 
   drawSky(top, bright, cond, s);   // gradient + sun/moon + stars + clouds
   drawWater(top, bright);          // shimmering light bands
+  drawBubbles(top);                // behind the sand bed → bubbles rise out of the substrate
   drawSand(bright);                // bumpy terrain bed
-  drawRim(top, bright);            // metal frame + glass over the waterline
+  if (s.boat && s.boat.active) drawBoat(s.boat.x, top); // behind the rim → sits slightly submerged
+  drawRim(top, bright);            // metal frame + glass over the waterline (drawn over the boat)
 
   if (s.plants) {                  // back-to-front plant layers, each swaying
     drawBgPlants(s.plants, bright);
@@ -998,11 +1020,9 @@ function drawTank(s) {
     for (const f of ordered) drawFish(f);
   }
 
-  drawBubbles(top);
   if (Array.isArray(s.flakes)) for (const f of s.flakes) drawFlake(f);
   if (s.snail) drawSnail(s.snail);
   if (s.starfish) drawStarfish(s.starfish);
-  if (s.boat && s.boat.active) drawBoat(s.boat.x, top);
 
   if (cond === 3 || cond === 4) drawRain(cond, bright);
   else if (cond === 5) drawSnow(bright);
