@@ -2,12 +2,14 @@
 
 // In-memory store of the latest telemetry snapshot per aquarium, plus per-fish
 // names and age tracking, plus a tiny pub/sub used to push updates to SSE
-// subscribers. State is ephemeral (live view) but persists for the life of the
-// process — a restart simply waits for the next telemetry post.
+// subscribers. State is persisted to SQLite (via db.js) and restored on startup
+// so a server restart doesn't lose aquarium history or fish names.
 //
 // Fish identity is the device-provided `id` (the fish's stable array slot).
 // Names are keyed by (aquarium_id, fish_id); age is derived from when the
 // server first saw a given fish id (reset if the fish was absent for a while).
+
+const db = require('./db');
 
 const STALE_MS = parseInt(process.env.STALE_MS || '15000', 10);
 const MAX_AQUARIUMS = parseInt(process.env.MAX_AQUARIUMS || '64', 10);
@@ -93,6 +95,31 @@ function _extrapolateSnapshot(snapshot, elapsedMs) {
 /** @type {Map<string, Entry>} */
 const aquariums = new Map();
 
+// Restore persisted state on startup so the server is immediately useful after
+// a restart without waiting for the next device telemetry post.
+(function _restore() {
+  const rows = db.loadAll();
+  for (const row of rows) {
+    if (!row.snapshot) continue;
+    const entry = {
+      snapshot: row.snapshot,
+      lastSeenMs: row.lastSeenMs,
+      createdAt: row.createdAt,
+      names: row.names,           // Map<fishId, name> from DB
+      meta: new Map(),
+    };
+    // Re-seed fish meta from the persisted snapshot so ageMs is meaningful.
+    if (Array.isArray(row.snapshot.fish)) {
+      for (const f of row.snapshot.fish) {
+        if (typeof f.id === 'number')
+          entry.meta.set(f.id, { firstSeenMs: row.createdAt, lastSeenMs: row.lastSeenMs });
+      }
+    }
+    aquariums.set(row.id, entry);
+  }
+  if (rows.length) console.log(`Store: restored ${rows.length} aquarium(s) from DB`);
+})();
+
 /** @type {Set<(snapshot: object) => void>} */
 const subscribers = new Set();
 
@@ -114,7 +141,7 @@ function sanitizeName(name) {
 function getOrCreate(id) {
   let entry = aquariums.get(id);
   if (!entry) {
-    entry = { snapshot: null, lastSeenMs: 0, names: new Map(), meta: new Map() };
+    entry = { snapshot: null, lastSeenMs: 0, createdAt: now(), names: new Map(), meta: new Map() };
     aquariums.set(id, entry);
   }
   return entry;
@@ -182,9 +209,11 @@ function upsert(snapshot) {
     return { ok: false, error: 'max_aquariums_reached' };
   }
   const entry = getOrCreate(id);
+  const t = now();
   entry.snapshot = snapshot;
-  entry.lastSeenMs = now();
+  entry.lastSeenMs = t;
   if (Array.isArray(snapshot.fish)) updateFishMeta(entry, snapshot.fish);
+  db.saveSnapshot(id, snapshot, t, entry.createdAt);
   broadcast(entry);
   return { ok: true };
 }
@@ -206,6 +235,7 @@ function setName(aquariumId, fishId, rawName) {
   if (name === null) return { ok: false, error: 'invalid_name' };
   if (name === '') entry.names.delete(fishId);
   else entry.names.set(fishId, name);
+  db.saveName(aquariumId, fishId, name);
   broadcast(entry); // open dashboards update immediately
   return { ok: true, name };
 }
@@ -239,12 +269,42 @@ function get(id) {
   return enrichExtrapolated(entry);
 }
 
+// Bootstrap response for a device that just booted. Returns the last-persisted
+// snapshot with names embedded in each fish object so the device can restore
+// positions and names in one call. Returns null if no record exists yet.
+function bootstrap(id) {
+  // Prefer in-memory (may have names set since last snapshot), fall back to DB.
+  const entry = aquariums.get(id);
+  if (!entry || !entry.snapshot) {
+    // Try DB directly in case the server just restarted and hasn't received a
+    // telemetry post yet (loadAll already ran, so this is a true miss).
+    return null;
+  }
+  const s = entry.snapshot;
+  const snapshotAgeMs = now() - entry.lastSeenMs;
+  const fish = Array.isArray(s.fish)
+    ? s.fish.map((f) => ({
+        ...f,
+        name: entry.names.get(f.id) || null,
+      }))
+    : [];
+  return {
+    exists: true,
+    aquarium_id: id,
+    snapshot_age_ms: snapshotAgeMs,
+    created_at: entry.createdAt,
+    fish,
+    counts: s.counts || null,
+    screen: s.screen || null,
+  };
+}
+
 function subscribe(fn) {
   subscribers.add(fn);
   return () => subscribers.delete(fn);
 }
 
 module.exports = {
-  upsert, list, get, subscribe, setName, getNamesText,
+  upsert, list, get, bootstrap, subscribe, setName, getNamesText,
   STALE_MS, MAX_AQUARIUMS,
 };

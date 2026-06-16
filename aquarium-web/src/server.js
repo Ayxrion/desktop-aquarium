@@ -124,6 +124,20 @@ app.get('/api/traffic', async (req, res) => {
   }
 });
 
+// ─── Device bootstrap ────────────────────────────────────────────────────────
+// Called by a device on boot (before it starts posting telemetry) to restore
+// the last-known aquarium state: fish positions, velocities, wander targets,
+// and names. Requires the API key so only the device itself can read its state.
+// Returns { exists: false } when no prior record exists (first boot).
+app.get('/api/aquariums/:id/bootstrap', (req, res) => {
+  if (!checkKey(req)) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  const data = store.bootstrap(req.params.id);
+  if (!data) return res.json({ exists: false });
+  return res.json(data);
+});
+
 // ─── Read APIs ───────────────────────────────────────────────────────────────
 app.get('/api/aquariums', (_req, res) => res.json(store.list()));
 
