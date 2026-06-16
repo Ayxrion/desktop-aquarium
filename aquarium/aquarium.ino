@@ -258,6 +258,7 @@ static Boat boat = { (float)(SCREEN_W + BOAT_W), false, 0UL };
 #define EAC_Y1          180     // top of horizontal current band (mid-tank)
 #define EAC_Y2          270     // bottom of horizontal current band
 #define EAC_MAX_FISH     12
+#define EAC_MIN_FISH      2     // always visible even at 0 congestion
 
 struct EacFish {
   float x, y, spd, size, wobbleOff;
@@ -1180,8 +1181,8 @@ void updateFish() {
 // ─── EAC silhouette fish ─────────────────────────────────────────────────────
 
 void updateEacFish() {
-  int target = (int)(trafficCongestion() * EAC_MAX_FISH + 0.5f);
-  eacActiveCount = constrain(target, 0, EAC_MAX_FISH);
+  int target = EAC_MIN_FISH + (int)(trafficCongestion() * (EAC_MAX_FISH - EAC_MIN_FISH) + 0.5f);
+  eacActiveCount = constrain(target, EAC_MIN_FISH, EAC_MAX_FISH);
 
   float bandH = EAC_Y2 - EAC_Y1;
   float midY  = (EAC_Y1 + EAC_Y2) * 0.5f;
@@ -1201,8 +1202,8 @@ void updateEacFish() {
 }
 
 void drawEacSilhouette(float x, float y, float size) {
-  // Just slightly darker than deep water — barely perceptible silhouette
-  const uint32_t COL = 0x021428UL;
+  // Light blue-gray — visible against dark water but clearly background
+  const uint32_t COL = 0x4a6e82UL;
   int ix = (int)x, iy = (int)y, sz = (int)size;
   canvas.fillEllipse(ix, iy, sz, (int)(size * 0.5f), COL);
   int tx = (int)(size * 0.7f);

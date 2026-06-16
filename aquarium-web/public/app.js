@@ -122,6 +122,7 @@ function startWatchdog() {
 // Horizontal current band across the mid-tank. Fish drift left to right.
 const EAC_Y1 = 180, EAC_Y2 = 270;   // horizontal band (mid-tank)
 const EAC_MAX_FISH = 12;
+const EAC_MIN_FISH = 2;             // always visible even at 0 congestion
 
 let eacFish = [];
 let eacTargetCount = 0;
@@ -138,7 +139,7 @@ function eacSpawnFish(startX) {
 }
 
 function updateEacCount(congestion) {
-  eacTargetCount = Math.round(congestion * EAC_MAX_FISH);
+  eacTargetCount = EAC_MIN_FISH + Math.round(congestion * (EAC_MAX_FISH - EAC_MIN_FISH));
 }
 
 function tickEac(frameCount) {
@@ -155,10 +156,9 @@ function tickEac(frameCount) {
 }
 
 function drawEacZone(bright) {
-  // No zone tint — silhouettes only
   ctx.save();
-  ctx.globalAlpha = 0.13 * bright + 0.04;  // very faint, brightest at noon
-  ctx.fillStyle = '#061c2e';
+  ctx.globalAlpha = 0.28 * bright + 0.10;
+  ctx.fillStyle = '#7a9db8';  // light blue-gray, reads as pale silhouette on dark water
   for (const f of eacFish) {
     drawSilhouetteFish(f.x, f.y, f.size);
   }
