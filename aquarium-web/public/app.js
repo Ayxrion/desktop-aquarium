@@ -12,6 +12,83 @@ const TANK_TOP = 72;
 const SCREEN_W = 800;
 const SCREEN_H = 480;
 
+// ─── Fish appearance: luck-driven coloring + shiny rarity ────────────────────
+// Each fish TYPE has a PRIMARY hue. A fish's luck/quality (0..1) tints that
+// primary toward LUCK_TINT_COLOR — luckier fish look richer/more golden. The
+// blend is capped by LUCK_TINT_STRENGTH so even a legendary fish keeps a hint of
+// its type colour. Re-theme the whole tank by editing these four lines; the
+// canvas, legend, tooltips and profiles all follow along.
+const FISH_PRIMARY = [0x2E8BFF, 0x33D17A, 0xFF7A33, 0xB45CFF]; // Pair, School, School 2, Angel
+const LUCK_TINT_COLOR = 0xFFE14D;   // high-luck fish shift toward this (warm gold)
+const LUCK_TINT_STRENGTH = 0.7;     // max blend toward the tint at luck = 1
+const SHINY_ODDS = 1000;            // 1-in-N fish are shiny (inverted + glistening)
+
+// Rarity tiers derived from luck/quality — names + colours borrow the loot
+// conventions of dungeon crawlers (grey → green → blue → purple → gold).
+const RARITY_TIERS = [
+  { min: 0.00, name: 'Common',    color: '#b9c6d4' },
+  { min: 0.20, name: 'Uncommon',  color: '#5fd75f' },
+  { min: 0.45, name: 'Rare',      color: '#4aa3ff' },
+  { min: 0.70, name: 'Epic',      color: '#c05cff' },
+  { min: 0.90, name: 'Legendary', color: '#ffb02e' },
+];
+const SHINY_RARITY = { name: 'Shiny', color: '#5ffbf1' };
+
+// Linear blend between two 24-bit RGB ints (0..1).
+function lerpColorInt(a, b, t) {
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  const ar = (a >> 16) & 0xff, ag = (a >> 8) & 0xff, ab = a & 0xff;
+  const br = (b >> 16) & 0xff, bg = (b >> 8) & 0xff, bb = b & 0xff;
+  return ((Math.round(ar + (br - ar) * t) << 16) |
+          (Math.round(ag + (bg - ag) * t) << 8) |
+           Math.round(ab + (bb - ab) * t));
+}
+function invertInt(n) { return (~n) & 0xffffff; }
+
+// Stable per-id hash so shiny rolls + wild-fish luck don't flicker frame-to-frame.
+function hash32(n) {
+  n = (n | 0) ^ 0x9e3779b9;
+  n = Math.imul(n ^ (n >>> 16), 0x45d9f3b);
+  n = Math.imul(n ^ (n >>> 16), 0x45d9f3b);
+  return (n ^ (n >>> 16)) >>> 0;
+}
+
+// A fish's luck/quality (0..1). Resident fish carry fish_luck in telemetry; wild
+// (wandering) fish don't, so we derive a stable pseudo-luck from their id.
+function fishLuck(f) {
+  if (typeof f.fish_luck === 'number') return clamp(f.fish_luck, 0, 1);
+  if (typeof f.luck === 'number') return clamp(f.luck, 0, 1);
+  return (hash32((f.id | 0) + 1) % 1000) / 1000;
+}
+
+// Shiny is honoured from telemetry (f.shiny) if present, else rolled 1-in-N
+// deterministically from the id so the same fish is always (or never) shiny.
+function isShiny(f) {
+  if (typeof f.shiny === 'boolean') return f.shiny;
+  return hash32((f.id | 0) ^ 0x5bd1e995) % SHINY_ODDS === 0;
+}
+
+// Rarity tier for a fish (shiny overrides everything).
+function rarityOf(f) {
+  if (isShiny(f)) return SHINY_RARITY;
+  const l = fishLuck(f);
+  let r = RARITY_TIERS[0];
+  for (const t of RARITY_TIERS) if (l >= t.min) r = t;
+  return r;
+}
+
+// Final display colour for a fish — type primary tinted by luck, inverted if
+// shiny. Overrides the raw telemetry colour so the tank is themed by type+luck.
+function fishColorInt(f) {
+  const type = f.type || 0;
+  const base = FISH_PRIMARY[type] != null ? FISH_PRIMARY[type] : 0x33D17A;
+  let c = lerpColorInt(base, LUCK_TINT_COLOR, fishLuck(f) * LUCK_TINT_STRENGTH);
+  if (isShiny(f)) c = invertInt(c);
+  return c;
+}
+function fishColorHex(f) { return hex(fishColorInt(f)); }
+function fishName(f) { return f.name || `${FISH_TYPE_NAMES[f.type] || 'Fish'} #${f.id}`; }
+
 // ─── Physics simulation (mirrors device updateFish, aquarium.ino / main.cpp) ──
 const _DAMP  = 0.85;
 const _DAMPZ = 0.88;
@@ -537,8 +614,15 @@ function drawWanderer(w) {
   ctx.font = 'bold 16px "Courier New", monospace';
   ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(0,18,34,0.6)';
   ctx.strokeText(glyph, sx, sy);
-  ctx.fillStyle = hex(w.color || 0x88e0ff);
+  ctx.fillStyle = fishColorHex(w);
   ctx.fillText(glyph, sx, sy);
+  if (isShiny(w)) {
+    ctx.globalAlpha = 0.18 + 0.24 * (0.5 + 0.5 * Math.sin(animTick * 0.30 + (w.id || 0)));
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(glyph, sx, sy);
+    ctx.globalAlpha = 1;
+    drawShinyGlints(sx, sy, 14, 16, w.id || 0);
+  }
   ctx.restore();
 }
 
@@ -620,6 +704,65 @@ let rafId = null;
 let highlightedFishId = null; // legend row → highlight on the canvas
 const legendRows = new Map(); // fishId -> { el, nameInput, ageEl, swatchEl }
 
+// ─── Canvas hover / selection state ──────────────────────────────────────────
+// hitTargets is rebuilt every drawn frame from the *displayed* (extrapolated)
+// positions, so hover/click hit-testing lines up with what's on screen.
+let hitTargets = [];      // [{ key, kind, ref, x, y, r, role }]
+let hoveredKey = null;    // entity under the cursor (canvas hover)
+let profileKey = null;    // entity whose detail profile is open (fish/snail)
+
+// Transient click feedback: a glass-tap ripple on every tank click, plus a
+// celebratory burst when a collectible is obtained. Driven by wall-clock ms so
+// the animation is smooth at the 60fps rAF rate regardless of telemetry cadence.
+const pulses = [];        // { x, y, kind: 'tap'|'collect', color, t0 }
+function spawnPulse(x, y, kind, color) {
+  pulses.push({ x, y, kind, color: color || null, t0: performance.now() });
+  if (pulses.length > 24) pulses.splice(0, pulses.length - 24);
+}
+function rgbaFromHex(h, a) {
+  const n = parseInt(h.slice(1), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${clamp(a, 0, 1).toFixed(3)})`;
+}
+function drawPulses() {
+  if (!pulses.length) return;
+  const now = performance.now();
+  ctx.save();
+  for (let i = pulses.length - 1; i >= 0; i--) {
+    const p = pulses[i];
+    const life = p.kind === 'tap' ? 480 : 620;
+    const t = (now - p.t0) / life;
+    if (t >= 1) { pulses.splice(i, 1); continue; }
+    const ease = 1 - (1 - t) * (1 - t);   // ease-out expansion
+    const a = 1 - t;                        // linear fade
+    if (p.kind === 'tap') {
+      const r = 6 + ease * 30;
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = rgbaFromHex('#c8f0ff', a * 0.9);
+      ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.stroke();
+      ctx.strokeStyle = rgbaFromHex('#78c8ff', a * 0.5);
+      ctx.beginPath(); ctx.arc(p.x, p.y, r * 0.55, 0, Math.PI * 2); ctx.stroke();
+    } else {
+      const col = p.color || '#ffd23f';
+      const r = 8 + ease * 26;
+      ctx.lineWidth = 2.5;
+      ctx.strokeStyle = rgbaFromHex(col, a);
+      ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.stroke();
+      const spark = 6 + ease * 22;
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = rgbaFromHex(col, a * 0.9);
+      for (let k = 0; k < 6; k++) {
+        const ang = (k / 6) * Math.PI * 2 + t * 0.6;
+        const c = Math.cos(ang), s = Math.sin(ang);
+        ctx.beginPath();
+        ctx.moveTo(p.x + c * spark, p.y + s * spark);
+        ctx.lineTo(p.x + c * (spark + 6), p.y + s * (spark + 6));
+        ctx.stroke();
+      }
+    }
+  }
+  ctx.restore();
+}
+
 // Dead-reckoning blend: when a new snapshot arrives, fish positions snap from the
 // old extrapolation to the new one. We lerp over BLEND_MS to hide the discontinuity.
 const BLEND_MS = 250;
@@ -672,6 +815,10 @@ const els = {
   modeConfirmDetail: document.getElementById('mode-confirm-detail'),
   modeConfirmOk: document.getElementById('mode-confirm-ok'),
   modeConfirmCancel: document.getElementById('mode-confirm-cancel'),
+  tooltip: document.getElementById('entity-tooltip'),
+  profile: document.getElementById('entity-profile'),
+  profileBody: document.getElementById('profile-body'),
+  profileClose: document.getElementById('profile-close'),
 };
 const ctx = els.canvas.getContext('2d');
 
@@ -773,6 +920,11 @@ function select(id) {
   _blendStartMs = 0;
   _blendBoatFrom = null;
   highlightedFishId = null;
+  hoveredKey = null;
+  hitTargets = [];
+  pulses.length = 0;
+  closeProfile();
+  hideTooltip();
   legendRows.clear();
   els.legend.innerHTML = '';
   els.conflictBar.hidden = true;
@@ -835,6 +987,7 @@ function applySnapshot(snap) {
   renderConflict(snap);
   renderControls(snap);
   renderGame(snap);
+  if (profileKey) renderProfile();
   resolvePending(snap);
   setConn(true);
   // Ensure the 60fps canvas loop is running.
@@ -1012,9 +1165,10 @@ function renderLegend(s) {
       legendRows.set(f.id, row);
       els.legend.appendChild(row.el);
     }
-    const color = hex(f.color || 0x00ee66);
+    const color = fishColorHex(f);
     row.swatchEl.style.background = color;
     row.el.style.borderLeftColor = color;
+    row.el.classList.toggle('shiny', isShiny(f));
     row.ageEl.textContent = formatAge(f.ageMs);
     row.nameInput.placeholder = `${FISH_TYPE_NAMES[f.type] || 'Fish'} #${f.id}`;
     if (document.activeElement !== row.nameInput) row.nameInput.value = f.name || '';
@@ -1421,31 +1575,252 @@ els.modeConfirmOk.addEventListener('click', () => {
   _pendingMode = null; els.modeConfirm.hidden = true;
 });
 
-// ─── Catch: click a wandering fish or loot item on the canvas ─────────────────
+// ─── Canvas hit-testing ───────────────────────────────────────────────────────
+// Rebuilt every drawn frame from the displayed snapshot so hover/click matches
+// exactly what's on screen (fish are perspective-projected; loot/snails aren't).
+function buildHitTargets(s) {
+  const targets = [];
+  if (Array.isArray(s.fish)) {
+    for (const f of s.fish) {
+      const z = f.z || 0;
+      targets.push({ key: 'fish:' + f.id, kind: 'fish', ref: f,
+        x: projX(f.x, z), y: projY(f.y, z), r: Math.max(fishHW(f), 9) + 8 });
+    }
+  }
+  if (s.snail) targets.push(snailTarget(s.snail, 'snail:decor', 'wild'));
+  if (Array.isArray(s.snails))
+    s.snails.forEach((sn, i) => targets.push(snailTarget(sn, 'snail:' + i, 'collector')));
+  if (Array.isArray(s.loot))
+    for (const it of s.loot)
+      targets.push({ key: 'loot:' + it.id, kind: 'loot', ref: it, x: it.x, y: it.y, r: 15 });
+  if (Array.isArray(s.wanderers))
+    for (const w of s.wanderers)
+      targets.push({ key: 'wanderer:' + w.id, kind: 'wanderer', ref: w, x: w.x, y: w.y, r: 22 });
+  hitTargets = targets;
+}
+function snailTarget(sn, key, role) {
+  const bx = Math.round(sn.x), by = terrainY[clamp(bx, 0, SCREEN_W - 1)];
+  return { key, kind: 'snail', ref: sn, role, x: bx, y: by - 8, r: 18 };
+}
+
+// Nearest target whose radius the point falls inside (screen-space coords).
+function pickTarget(x, y) {
+  let best = null, bestD = Infinity;
+  for (const t of hitTargets) {
+    const d = (t.x - x) ** 2 + (t.y - y) ** 2;
+    if (d <= t.r * t.r && d < bestD) { bestD = d; best = t; }
+  }
+  return best;
+}
+function eventToScreen(e) {
+  const rect = els.canvas.getBoundingClientRect();
+  return { x: (e.clientX - rect.left) / rect.width * SCREEN_W,
+           y: (e.clientY - rect.top) / rect.height * SCREEN_H };
+}
+
+// ─── Hover: highlight + dungeon-crawler tooltip + action-aware cursor ─────────
+els.canvas.addEventListener('mousemove', (e) => {
+  const p = eventToScreen(e);
+  const t = pickTarget(p.x, p.y);
+  hoveredKey = t ? t.key : null;
+  els.canvas.style.cursor = t ? 'pointer' : 'default';
+  if (t) showTooltip(t, e.clientX, e.clientY); else hideTooltip();
+});
+els.canvas.addEventListener('mouseleave', () => {
+  hoveredKey = null;
+  els.canvas.style.cursor = 'default';
+  hideTooltip();
+});
+
+// ─── Click: fish/snail → open profile; loot/wanderer → collect/catch ──────────
 els.canvas.addEventListener('click', (e) => {
   if (!latestSnapshot) return;
-  const rect = els.canvas.getBoundingClientRect();
-  const x = (e.clientX - rect.left) / rect.width * SCREEN_W;
-  const y = (e.clientY - rect.top) / rect.height * SCREEN_H;
-  let best = null, bestD = Infinity, bestKind = null;
-  for (const w of (latestSnapshot.wanderers || [])) {
-    const d = (w.x - x) ** 2 + (w.y - y) ** 2;
-    if (d < bestD && d < 32 * 32) { bestD = d; best = w; bestKind = 'wanderer'; }
-  }
-  for (const it of (latestSnapshot.loot || [])) {
-    const d = (it.x - x) ** 2 + (it.y - y) ** 2;
-    if (d < bestD && d < 22 * 22) { bestD = d; best = it; bestKind = 'loot'; }
-  }
-  if (!best) return;
+  const p = eventToScreen(e);
+  spawnPulse(p.x, p.y, 'tap');     // glass-tap ripple wherever you click
+  const t = pickTarget(p.x, p.y);
+  if (!t) { closeProfile(); return; }
+  if (t.kind === 'fish' || t.kind === 'snail') { openProfile(t); return; }
+
+  const best = t.ref;
+  const pcol = t.kind === 'wanderer' ? '#88e0ff'
+    : (best.kind === 'coin' ? '#ffd23f'
+      : (['#e7c9a0', '#ff9ec4', '#ffd23f'][best.tier || 0] || '#e7c9a0'));
+  spawnPulse(t.x, t.y, 'collect', pcol);   // celebratory burst on obtaining it
   sendControl({ type: 'catch', itemId: best.id },
-    bestKind === 'wanderer' ? 'Caught a fish! 🎣'
+    t.kind === 'wanderer' ? 'Caught a fish! 🎣'
       : (best.kind === 'coin' ? 'Grabbed a coin 🪙' : 'Grabbed a shell 🐚'));
   // Optimistic: remove locally so it vanishes at once; next snapshot reconciles.
-  if (bestKind === 'wanderer')
+  if (t.kind === 'wanderer')
     latestSnapshot.wanderers = (latestSnapshot.wanderers || []).filter((w) => w.id !== best.id);
   else
     latestSnapshot.loot = (latestSnapshot.loot || []).filter((it) => it.id !== best.id);
+  hoveredKey = null;
+  hideTooltip();
 });
+
+// ─── Tooltip content (one small card per entity kind) ─────────────────────────
+function ttStat(icon, label, val) {
+  return `<div class="tt-stat"><span class="tt-stat-l">${icon} ${label}</span>` +
+         `<span class="tt-stat-v">${escapeHtml(String(val))}</span></div>`;
+}
+function ttTitle(name, color, shiny) {
+  return `<div class="tt-name" style="color:${color}">${escapeHtml(name)}` +
+         (shiny ? ' <span class="tt-shiny">✦ SHINY</span>' : '') + `</div>`;
+}
+function fishTooltipHTML(f) {
+  const r = rarityOf(f), shiny = isShiny(f);
+  const q = Math.round(fishLuck(f) * 100), size = Math.round(growth(f) * 100);
+  return ttTitle(fishName(f), r.color, shiny) +
+    `<div class="tt-sub" style="color:${r.color}">${r.name} ${escapeHtml(FISH_TYPE_NAMES[f.type] || 'Fish')}</div>` +
+    `<div class="tt-bar"><div class="tt-bar-fill" style="width:${q}%;background:${r.color}"></div></div>` +
+    `<div class="tt-stats">` +
+      ttStat('🍀', 'Quality', q + '%') +
+      ttStat('📐', 'Size', size + '%') +
+      (typeof f.xp === 'number' ? ttStat('⭐', 'XP', f.xp) : '') +
+      (f.ageMs ? ttStat('🎂', 'Age', formatAge(f.ageMs)) : '') +
+    `</div>` +
+    `<div class="tt-action">Click to view profile</div>`;
+}
+function snailTooltipHTML(t) {
+  const collector = t.role === 'collector';
+  return ttTitle(collector ? 'Collector Snail' : 'Pond Snail',
+                 collector ? '#5fd75f' : '#b9c6d4', false) +
+    `<div class="tt-sub">${collector ? 'Gathers coins from the sand' : 'A peaceful tank cleaner'}</div>` +
+    `<div class="tt-action">Click to view profile</div>`;
+}
+function lootTooltipHTML(it) {
+  if (it.kind === 'coin')
+    return ttTitle('Gold Coin', '#ffd23f', false) +
+      `<div class="tt-sub">Spend it in the shop</div>` +
+      `<div class="tt-action grab">Click to collect 🪙</div>`;
+  const names = ['Common Shell', 'Pink Shell', 'Golden Shell'];
+  const cols = ['#e7c9a0', '#ff9ec4', '#ffd23f'];
+  const ti = it.tier || 0;
+  return ttTitle(names[ti] || 'Shell', cols[ti] || '#e7c9a0', false) +
+    `<div class="tt-sub">A shell for your collection</div>` +
+    `<div class="tt-action grab">Click to collect 🐚</div>`;
+}
+function wandererTooltipHTML(w) {
+  const r = rarityOf(w), shiny = isShiny(w);
+  return ttTitle('Wild ' + (FISH_TYPE_NAMES[w.type] || 'Fish'), r.color, shiny) +
+    `<div class="tt-sub" style="color:${r.color}">${r.name} · wandering by</div>` +
+    `<div class="tt-action grab">Click to catch 🎣</div>`;
+}
+function tooltipHTML(t) {
+  switch (t.kind) {
+    case 'fish': return fishTooltipHTML(t.ref);
+    case 'snail': return snailTooltipHTML(t);
+    case 'loot': return lootTooltipHTML(t.ref);
+    case 'wanderer': return wandererTooltipHTML(t.ref);
+  }
+  return '';
+}
+function showTooltip(t, cx, cy) {
+  els.tooltip.innerHTML = tooltipHTML(t);
+  els.tooltip.hidden = false;
+  const pad = 12, w = els.tooltip.offsetWidth, h = els.tooltip.offsetHeight;
+  let left = cx + 18, top = cy + 18;
+  if (left + w + pad > window.innerWidth) left = cx - w - 18;
+  if (top + h + pad > window.innerHeight) top = cy - h - 18;
+  els.tooltip.style.left = Math.max(pad, left) + 'px';
+  els.tooltip.style.top = Math.max(pad, top) + 'px';
+}
+function hideTooltip() { els.tooltip.hidden = true; }
+
+// ─── Detailed profile panel (fish + snails) ───────────────────────────────────
+function findEntityByKey(key) {
+  if (!latestSnapshot || !key) return null;
+  const sep = key.indexOf(':');
+  const kind = key.slice(0, sep), id = key.slice(sep + 1);
+  if (kind === 'fish') {
+    const ref = (latestSnapshot.fish || []).find((f) => 'fish:' + f.id === key);
+    return ref ? { kind, ref } : null;
+  }
+  if (kind === 'snail') {
+    if (id === 'decor') return latestSnapshot.snail ? { kind, ref: latestSnapshot.snail, role: 'wild' } : null;
+    const ref = (latestSnapshot.snails || [])[Number(id)];
+    return ref ? { kind, ref, role: 'collector' } : null;
+  }
+  return null;
+}
+function openProfile(t) {
+  profileKey = t.key;
+  if (t.kind === 'fish') highlightedFishId = t.ref.id;
+  hideTooltip();
+  renderProfile();
+  els.profile.hidden = false;
+}
+function closeProfile() {
+  if (!profileKey) return;
+  if (profileKey.indexOf('fish:') === 0) highlightedFishId = null;
+  profileKey = null;
+  els.profile.hidden = true;
+}
+function pfStat(label, val) {
+  return `<div class="pf-stat"><div class="pf-stat-l">${label}</div>` +
+         `<div class="pf-stat-v">${escapeHtml(String(val))}</div></div>`;
+}
+function fishProfileHTML(f) {
+  const r = rarityOf(f), shiny = isShiny(f);
+  const q = Math.round(fishLuck(f) * 100), size = Math.round(growth(f) * 100);
+  const col = fishColorHex(f);
+  return `
+    <div class="pf-head">
+      <div class="pf-chip${shiny ? ' shiny' : ''}" style="--chip:${col}"></div>
+      <div class="pf-head-text">
+        <input class="pf-name" maxlength="24" spellcheck="false"
+          placeholder="${escapeHtml(FISH_TYPE_NAMES[f.type] || 'Fish')} #${f.id}"
+          value="${escapeHtml(f.name || '')}" />
+        <div class="pf-rarity" style="color:${r.color}">${r.name} ${escapeHtml(FISH_TYPE_NAMES[f.type] || 'Fish')}${shiny ? ' · ✦ Shiny' : ''}</div>
+      </div>
+    </div>
+    <div class="pf-bar"><div class="pf-bar-fill" style="width:${q}%;background:${r.color}"></div></div>
+    <div class="pf-grid">
+      ${pfStat('Quality', q + '%')}
+      ${pfStat('Size', size + '%')}
+      ${pfStat('XP', f.xp != null ? f.xp : '—')}
+      ${pfStat('Age', f.ageMs ? formatAge(f.ageMs) : '—')}
+      ${pfStat('Type', FISH_TYPE_NAMES[f.type] || 'Fish')}
+      ${pfStat('Colour', col.toUpperCase())}
+    </div>
+    ${shiny ? `<div class="pf-note">✦ A 1-in-${SHINY_ODDS} shiny — inverted colours and a glistening shimmer as it swims.</div>` : ''}`;
+}
+function snailProfileHTML(ent) {
+  const collector = ent.role === 'collector';
+  return `
+    <div class="pf-head">
+      <div class="pf-chip" style="--chip:#ddb060"></div>
+      <div class="pf-head-text">
+        <div class="pf-name-static">${collector ? 'Collector Snail' : 'Pond Snail'}</div>
+        <div class="pf-rarity" style="color:${collector ? '#5fd75f' : '#b9c6d4'}">${collector ? 'Uncommon · Helper' : 'Common · Critter'}</div>
+      </div>
+    </div>
+    <div class="pf-desc">${collector
+      ? 'Patrols the sea floor and automatically scoops up coins that fall near it, banking them straight to your tank.'
+      : 'A gentle bottom-dweller that ambles along the substrate, grazing as it goes.'}</div>`;
+}
+function renderProfile() {
+  if (!profileKey) return;
+  // Don't clobber an in-progress rename when a fresh snapshot re-renders.
+  if (els.profile.contains(document.activeElement) &&
+      document.activeElement.classList.contains('pf-name')) return;
+  const ent = findEntityByKey(profileKey);
+  if (!ent || !ent.ref) { closeProfile(); return; }
+  els.profileBody.innerHTML = ent.kind === 'fish' ? fishProfileHTML(ent.ref) : snailProfileHTML(ent);
+  if (ent.kind === 'fish') {
+    const input = els.profileBody.querySelector('.pf-name');
+    if (input) {
+      input.addEventListener('blur', () => saveName(ent.ref.id, input.value));
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') input.blur();
+        if (e.key === 'Escape') { input.value = ''; input.blur(); }
+      });
+    }
+  }
+}
+els.profileClose.addEventListener('click', closeProfile);
+els.profile.addEventListener('click', (e) => { if (e.target === els.profile) closeProfile(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeProfile(); });
 
 function drawTitle(s) {
   els.viewName.textContent = s.aquarium_id || selectedId || '—';
@@ -1472,6 +1847,9 @@ function drawTank(s) {
   const top = (s.screen && s.screen.tank_top) || TANK_TOP;
   const bright = dayTint(s.time && s.time.day_progress);
   const cond = (s.weather && s.weather.condition) || 0;
+
+  // Rebuild hover/click hit targets from the positions we're about to draw.
+  buildHitTargets(s);
 
   drawSky(top, bright, cond, s);   // gradient + sun/moon + stars + clouds
   drawWater(top, bright);          // shimmering light bands
@@ -1506,6 +1884,33 @@ function drawTank(s) {
 
   if (cond === 3 || cond === 4) drawRain(cond, bright);
   else if (cond === 5) drawSnow(bright);
+
+  drawSelectionHighlights();       // hover glow + open-profile ring, drawn on top
+  drawPulses();                    // tap ripples + collect bursts, topmost feedback
+}
+
+// Glow ring under the cursor-hovered entity, plus a steady ring on whatever
+// entity's profile is currently open.
+function drawSelectionHighlights() {
+  const ring = (t, pulse) => {
+    ctx.save();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = `rgba(120,230,255,${(0.4 + 0.45 * pulse).toFixed(2)})`;
+    ctx.shadowColor = 'rgba(120,230,255,0.85)';
+    ctx.shadowBlur = 10 * pulse + 4;
+    ctx.beginPath();
+    ctx.arc(t.x, t.y, t.r + 4, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  };
+  if (profileKey && profileKey !== hoveredKey) {
+    const t = hitTargets.find((h) => h.key === profileKey);
+    if (t) ring(t, 1);
+  }
+  if (hoveredKey) {
+    const t = hitTargets.find((h) => h.key === hoveredKey);
+    if (t) ring(t, 0.5 + 0.5 * Math.sin(animTick * 0.18));
+  }
 }
 
 // Fish are the device's signature ASCII glyphs, perspective-projected by depth.
@@ -1514,7 +1919,8 @@ function drawFish(f) {
   const sx = projX(f.x, z), sy = projY(f.y, z);
   const ts = fishTS(f);
   const fontPx = Math.max(6, Math.round(9 * ts * growth(f)));
-  const col = hex(f.color || 0x00ee66);
+  const shiny = isShiny(f);
+  const col = fishColorHex(f);
   const hw = fishHW(f);
 
   if (f.id === highlightedFishId) {
@@ -1551,6 +1957,17 @@ function drawFish(f) {
   ctx.fillStyle = col;
   ctx.fillText(glyph, sx, sy);
 
+  // Shiny fish glisten: a pulsing white sheen over the body + twinkling sparkles.
+  if (shiny) {
+    const sheen = 0.16 + 0.24 * (0.5 + 0.5 * Math.sin(animTick * 0.30 + f.id));
+    ctx.save();
+    ctx.globalAlpha = sheen;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(glyph, sx, sy);
+    ctx.restore();
+    drawShinyGlints(sx, sy, hw, fontPx, f.id);
+  }
+
   if (f.going_for_food) {
     ctx.fillStyle = '#ffee44';
     ctx.beginPath();
@@ -1564,10 +1981,35 @@ function drawFish(f) {
     ctx.font = '12px system-ui, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'alphabetic';
-    ctx.fillStyle = f.id === highlightedFishId ? '#ffffff' : '#CCE6FF';
+    ctx.fillStyle = f.id === highlightedFishId ? '#ffffff' : rarityOf(f).color;
     ctx.fillText(f.name, sx, sy - fontPx * 0.8 - 6);
     ctx.restore();
   }
+}
+
+// Twinkling cross-sparkles orbiting a shiny fish — phased per-fish off animTick.
+function drawShinyGlints(sx, sy, hw, fontPx, id) {
+  const n = 3;
+  ctx.save();
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < n; i++) {
+    const ph = animTick * 0.18 + id * 1.3 + i * (Math.PI * 2 / n);
+    const tw = Math.sin(ph);
+    if (tw <= 0) continue;
+    const a = tw * tw;
+    const ang = ph * 0.7 + i * 2.1;
+    const rad = hw * 0.6 + 5;
+    const gx = sx + Math.cos(ang) * rad;
+    const gy = sy + Math.sin(ang) * rad * 0.6 - fontPx * 0.15;
+    const sz = 1.5 + 2.5 * a;
+    ctx.globalAlpha = 0.85 * a;
+    ctx.beginPath();
+    ctx.moveTo(gx - sz, gy); ctx.lineTo(gx + sz, gy);
+    ctx.moveTo(gx, gy - sz); ctx.lineTo(gx, gy + sz);
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 // Multiply a #rrggbb color by a 0..1 brightness factor.

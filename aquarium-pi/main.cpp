@@ -165,7 +165,8 @@ int gameCoins = 0, gameShells = 0, gameFood = 0;
 #define COIN_BASE_CD  3000              // frames between a fish's coin rolls
 #define SHELL_BASE_CD 2600
 #define WANDER_BASE_CD 7000             // wandering fish are very rare
-#define COIN_GRAV     0.6f              // coin sink acceleration (px/frame²)
+#define COIN_GRAV     0.2f              // coin sink acceleration (px/frame²) — gentle, water-like
+#define COIN_MAX_VY   2.8f              // terminal sink speed so coins drift down, not plummet
 #define COIN_REST     20                // frames a landed coin sits before vanishing (~1s)
 #define SHELL_TTL     220               // shells linger on the sand a bit longer
 #define SAND_Y        (SCREEN_H - 20)   // resting line on the sea floor
@@ -208,6 +209,11 @@ uint32_t lastBtnMs     = 0;
 bool     lastTouched   = false;
 bool     menuOpen      = false;
 
+// Switching to Career wipes the tank (careerStartReset), so the menu's CAREER
+// button arms first and only commits on a confirming second tap within the window.
+#define  CAREER_ARM_MS 3000
+uint32_t careerArmMs   = 0;
+
 int8_t   weatherOverrideIdx = -1;
 
 // ─── Weather visuals ─────────────────────────────────────────────────────────
@@ -236,6 +242,61 @@ static Star skyStars[NUM_STARS];
 // ─── Display / canvas globals ─────────────────────────────────────────────────
 static Display display;
 static Canvas  canvas(&display);
+
+// ── Tap / collect feedback pulses ──────────────────────────────────────────────
+// Transient expanding rings drawn over the tank: a "glass tap" ripple wherever
+// the screen is touched, plus a celebratory burst when a collectible is obtained.
+#define MAX_PULSES 6
+struct Pulse { float x, y; int age, life; uint32_t col; uint8_t kind; bool active; }; // kind 0 tap, 1 collect
+static Pulse pulses[MAX_PULSES] = {};
+
+void spawnPulse(float x, float y, uint8_t kind, uint32_t col) {
+    int slot = -1, oldest = 0, oldestAge = -1;
+    for (int i = 0; i < MAX_PULSES; i++) {
+        if (!pulses[i].active) { slot = i; break; }
+        if (pulses[i].age > oldestAge) { oldestAge = pulses[i].age; oldest = i; }
+    }
+    if (slot < 0) slot = oldest;
+    pulses[slot].x = x; pulses[slot].y = y; pulses[slot].age = 0;
+    pulses[slot].life = (kind == 0) ? 12 : 16;   // ~0.6s / ~0.8s at 20fps
+    pulses[slot].col = col; pulses[slot].kind = kind; pulses[slot].active = true;
+}
+
+void updatePulses() {
+    for (int i = 0; i < MAX_PULSES; i++)
+        if (pulses[i].active && ++pulses[i].age >= pulses[i].life) pulses[i].active = false;
+}
+
+// Fade a 24-bit colour toward black as t goes 0→1 (no alpha on the panel).
+static uint32_t pulseFade(uint32_t c, float t) {
+    float k = 1.0f - t;
+    uint32_t r = (uint32_t)(((c >> 16) & 0xFF) * k);
+    uint32_t g = (uint32_t)(((c >> 8) & 0xFF) * k);
+    uint32_t b = (uint32_t)(( c        & 0xFF) * k);
+    return (r << 16) | (g << 8) | b;
+}
+
+void drawPulses() {
+    for (int i = 0; i < MAX_PULSES; i++) {
+        if (!pulses[i].active) continue;
+        Pulse& p = pulses[i];
+        float t = (float)p.age / (float)p.life;       // 0..1 progress
+        int cx = (int)p.x, cy = (int)p.y;
+        if (p.kind == 0) {                            // glass tap: two expanding rings
+            int r = (int)(4 + t * 26);
+            canvas.drawCircle(cx, cy, r, pulseFade(0xCCF2FFUL, t));
+            if (r > 6) canvas.drawCircle(cx, cy, r - 5, pulseFade(0x88CCFFUL, t));
+        } else {                                       // collect: ring + four sparks
+            int r = (int)(6 + t * 22), s = (int)(3 + t * 16);
+            uint32_t col = pulseFade(p.col, t);
+            canvas.drawCircle(cx, cy, r, col);
+            canvas.drawLine(cx, cy - s, cx, cy - s - 4, col);
+            canvas.drawLine(cx, cy + s, cx, cy + s + 4, col);
+            canvas.drawLine(cx - s, cy, cx - s - 4, cy, col);
+            canvas.drawLine(cx + s, cy, cx + s + 4, cy, col);
+        }
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Helpers
@@ -782,14 +843,19 @@ bool catchWandererById(uint32_t id) {
     static const FishType T[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
     for (int i = 0; i < MAX_WANDER; i++)
         if (wanderers[i].active && wanderers[i].id == id) {
-            addFish(T[wanderers[i].type]); wanderers[i].active = false; return true;
+            addFish(T[wanderers[i].type]);
+            spawnPulse(wanderers[i].x, wanderers[i].y, 1, 0x88E0FFUL);
+            wanderers[i].active = false; return true;
         }
     return false;
 }
 bool collectLootById(uint32_t id) {
     for (int i = 0; i < MAX_LOOT; i++)
         if (loot[i].active && loot[i].id == id) {
+            uint32_t pc = loot[i].kind == 0 ? 0xFFD23FUL
+                : (loot[i].tier == 2 ? 0xFFD23FUL : loot[i].tier == 1 ? 0xFF9EC4UL : 0xE7C9A0UL);
             if (loot[i].kind == 0) gameCoins++; else gameShells += SHELL_VALUE[loot[i].tier];
+            spawnPulse(loot[i].x, loot[i].y, 1, pc);
             loot[i].active = false; return true;
         }
     return false;
@@ -858,7 +924,9 @@ void updateCareer() {
         if (!loot[i].active) continue;
         Loot& it = loot[i];
         if (it.kind == 0 && !it.landed) {
-            it.vy += COIN_GRAV; it.y += it.vy;
+            it.vy += COIN_GRAV;
+            if (it.vy > COIN_MAX_VY) it.vy = COIN_MAX_VY;
+            it.y += it.vy;
             if (it.y >= SAND_Y) { it.y = SAND_Y; it.landed = true; it.ttl = COIN_REST; }
         } else if (--it.ttl <= 0) { it.active = false; }
     }
@@ -1509,10 +1577,31 @@ void drawMenu() {
     canvas.fillRect(MENU_X,   MENU_Y,   MENU_W,   MENU_H,   0x0A1E3CUL);
     canvas.drawRect(MENU_X,   MENU_Y,   MENU_W,   MENU_H,   0x4488CCUL);
     canvas.drawRect(MENU_X+1, MENU_Y+1, MENU_W-2, MENU_H-2, 0x1A3355UL);
-    canvas.setTextSize(2); canvas.setTextColor(0x88DDFFUL);
-    canvas.setCursor(MENU_X + 28, MENU_Y + 10);
-    canvas.print("AQUARIUM MENU");
-    canvas.drawFastHLine(MENU_X + 8, MENU_Y + 32, MENU_W - 16, 0x2244AAUL);
+    // ── Game-mode segmented control (CREATIVE | CAREER) + career wallet ─────────
+    bool career = (gameMode == MODE_CAREER);
+    bool armed  = (!career) && (millis() - careerArmMs < CAREER_ARM_MS);
+    {
+        canvas.fillRect(MENU_X + 8, MENU_Y + 6, 104, 24, !career ? 0x6A3AC0UL : 0x16203AUL);
+        canvas.drawRect(MENU_X + 8, MENU_Y + 6, 104, 24, !career ? 0xC8A8FFUL : 0x33508AUL);
+        canvas.setTextSize(1); canvas.setTextColor(!career ? 0xFFFFFFUL : 0x8899AAUL);
+        canvas.setCursor(MENU_X + 8 + (104 - 8 * 6) / 2, MENU_Y + 13); canvas.print("CREATIVE");
+
+        uint32_t kF = career ? 0xB8860BUL : (armed ? 0x6A1818UL : 0x16203AUL);
+        uint32_t kB = career ? 0xFFD23FUL : (armed ? 0xFF6655UL : 0x33508AUL);
+        canvas.fillRect(MENU_X + 114, MENU_Y + 6, 104, 24, kF);
+        canvas.drawRect(MENU_X + 114, MENU_Y + 6, 104, 24, kB);
+        const char* kLbl = armed ? "RESET?" : "CAREER";
+        canvas.setTextColor(career ? 0x111111UL : (armed ? 0xFFDDDDUL : 0x8899AAUL));
+        canvas.setCursor(MENU_X + 114 + (104 - (int)strlen(kLbl) * 6) / 2, MENU_Y + 13);
+        canvas.print(kLbl);
+
+        if (career) {
+            char wbuf[12]; snprintf(wbuf, sizeof(wbuf), "%dc", gameCoins);
+            canvas.setTextColor(0xFFD23FUL);
+            canvas.setCursor(MENU_X + 226, MENU_Y + 13); canvas.print(wbuf);
+        }
+    }
+    canvas.drawFastHLine(MENU_X + 8, MENU_Y + 34, MENU_W - 16, 0x2244AAUL);
 
     const char* labels[4] = { "LARGE FISH", "SCHOOL FISH", "DEEP FISH", "ANGELFISH" };
     int counts[4]         = { numPair, numSchool, numSchool2, numAngel };
@@ -1521,7 +1610,7 @@ void drawMenu() {
         int ry = MENU_Y + 45 + row * 58;
         canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
         canvas.setCursor(MENU_X + 10, ry + 11); canvas.print(labels[row]);
-        bool canRm = counts[row] > 0;
+        bool canRm = !career && counts[row] > 0;   // remove: creative only
         canvas.fillRect(MENU_X + 148, ry, 30, 30, canRm ? 0x1A3355UL : 0x0C1A2AUL);
         canvas.drawRect(MENU_X + 148, ry, 30, 30, canRm ? 0x4488CCUL : 0x223344UL);
         canvas.setTextSize(2); canvas.setTextColor(canRm ? 0xFFFFFFUL : 0x334455UL);
@@ -1529,11 +1618,17 @@ void drawMenu() {
         char buf[4]; snprintf(buf, sizeof(buf), "%d", counts[row]);
         canvas.setTextSize(2); canvas.setTextColor(0xFFEE88UL);
         canvas.setCursor(MENU_X + 184, ry + 7); canvas.print(buf);
-        bool canAdd = counts[row] < maxes[row];
-        canvas.fillRect(MENU_X + 210, ry, 30, 30, canAdd ? 0x1A3355UL : 0x0C1A2AUL);
-        canvas.drawRect(MENU_X + 210, ry, 30, 30, canAdd ? 0x4488CCUL : 0x223344UL);
+        bool atCap  = counts[row] >= maxes[row];
+        bool canAdd = career ? (!atCap && gameCoins >= FISH_PRICE[row]) : !atCap;
+        canvas.fillRect(MENU_X + 210, ry, 30, 30, canAdd ? (career ? 0x3A2E0AUL : 0x1A3355UL) : 0x0C1A2AUL);
+        canvas.drawRect(MENU_X + 210, ry, 30, 30, canAdd ? (career ? 0xFFD23FUL : 0x4488CCUL) : 0x223344UL);
         canvas.setTextSize(2); canvas.setTextColor(canAdd ? 0xFFFFFFUL : 0x334455UL);
         canvas.setCursor(MENU_X + 217, ry + 7); canvas.print("+");
+        if (career) {                               // price tag beside the buy button
+            char pbuf[6]; snprintf(pbuf, sizeof(pbuf), "%d", FISH_PRICE[row]);
+            canvas.setTextSize(1); canvas.setTextColor(canAdd ? 0xFFD23FUL : 0x556677UL);
+            canvas.setCursor(MENU_X + 244, ry + 11); canvas.print(pbuf);
+        }
     }
     {
         int ry5 = MENU_Y + 45 + 5 * 58;
@@ -1693,13 +1788,40 @@ void loop() {
             ty >= HBTN_Y && ty < (uint16_t)(HBTN_Y + HBTN_H)) {
             menuOpen = !menuOpen;
         } else if (menuOpen) {
+            // ── Game-mode segments (header) ─────────────────────────────────────
+            if (ty >= (uint16_t)(MENU_Y + 6) && ty < (uint16_t)(MENU_Y + 30)) {
+                if (tx >= (uint16_t)(MENU_X + 8) && tx < (uint16_t)(MENU_X + 112)) {
+                    if (gameMode != MODE_CREATIVE) setGameMode(MODE_CREATIVE);  // non-destructive
+                    careerArmMs = 0;
+                } else if (tx >= (uint16_t)(MENU_X + 114) && tx < (uint16_t)(MENU_X + 218)) {
+                    // Career entry wipes the tank → require a confirming second tap.
+                    if (gameMode != MODE_CAREER) {
+                        if (millis() - careerArmMs < CAREER_ARM_MS) { setGameMode(MODE_CAREER); careerArmMs = 0; }
+                        else careerArmMs = millis();
+                    }
+                }
+            }
             const FishType rowType[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
             for (int row = 0; row < 4; row++) {
                 int ry = MENU_Y + 45 + row * 58;
                 if (tx >= (uint16_t)(MENU_X + 148) && tx < (uint16_t)(MENU_X + 178) &&
-                    ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) { removeFish(rowType[row]); break; }
+                    ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
+                    if (gameMode != MODE_CAREER) removeFish(rowType[row]);  // creative only
+                    break;
+                }
                 if (tx >= (uint16_t)(MENU_X + 210) && tx < (uint16_t)(MENU_X + 240) &&
-                    ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) { addFish(rowType[row]); break; }
+                    ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
+                    if (gameMode == MODE_CAREER) {            // buy with coins (guard the cap)
+                        int cnt[4] = { numPair, numSchool, numSchool2, numAngel };
+                        int mx[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
+                        if (cnt[row] < mx[row] && gameCoins >= FISH_PRICE[row]) {
+                            gameCoins -= FISH_PRICE[row]; addFish(rowType[row]);
+                        }
+                    } else {
+                        addFish(rowType[row]);               // creative: free
+                    }
+                    break;
+                }
             }
             {
                 int ry5 = MENU_Y + 45 + 5 * 58;
@@ -1739,6 +1861,7 @@ void loop() {
                 }
             }
         } else if ((int)ty > TANK_TOP) {
+            spawnPulse((float)tx, (float)ty, 0, 0);   // glass-tap ripple where you touched
             // Career: tap a wanderer to keep it / loot to collect; else feed (uses food).
             if (!tapCatch((int)tx, (int)ty)) {
                 if (gameMode == MODE_CAREER) { if (gameFood > 0) { gameFood--; dropFood((int)tx, (int)ty); } }
@@ -1769,6 +1892,7 @@ void loop() {
     updateFlakes();
     updateFish();
     updateCareer();            // age fish + spawn coins/shells/wanderers (career only)
+    updatePulses();            // advance tap/collect feedback rings
 
     drawBackground();
     drawWeatherSky();
@@ -1785,6 +1909,7 @@ void loop() {
     drawCoinSnails();          // purchased coin-collector snails
     drawLootItems();           // coins + shells (career collectibles)
     drawWanderers();           // wandering fish with catch halo
+    drawPulses();              // tap ripples + collect bursts (over entities, under rim)
     drawTankRim();
     drawGameHud();             // mode + wallet readout
     drawTelemetryStatus();

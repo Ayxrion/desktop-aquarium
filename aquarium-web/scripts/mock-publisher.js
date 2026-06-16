@@ -24,7 +24,8 @@ const GROW_FRAMES = 800;                      // juvenile→mature growth span
 const COIN_BASE_CD = 3000;                    // frames between a fish's coin rolls (~2.5 min)
 const SHELL_BASE_CD = 2600;                   // frames between shell spawns
 const WANDER_BASE_CD = 7000;                  // wandering fish are very rare (~6 min)
-const COIN_GRAV = 0.6;                         // coin sink acceleration (px/frame²)
+const COIN_GRAV = 0.2;                         // coin sink acceleration (px/frame²) — gentle, water-like
+const COIN_MAX_VY = 2.8;                        // terminal sink speed so coins drift down, not plummet
 const COIN_REST = 20;                          // frames a landed coin sits before vanishing (~1s)
 const SHELL_TTL = 220;                         // shells linger on the sand a bit longer
 const SAND_Y = H - 20;                         // resting line on the sea floor
@@ -56,7 +57,9 @@ function makeFish(type, x, y) {
     facing_right: Math.random() > 0.5,
     color: PALETTE[(type * 3 + nextId) % PALETTE.length],
     going_for_food: false, chasing: false,
-    age: 0, xp: 0, fishLuck: 0,
+    // Seed a spread of starting luck so the luck-driven coloring + rarity tiers
+    // are visible in the dashboard without first grinding feedings.
+    age: 0, xp: 0, fishLuck: parseFloat(rnd(0, 0.85).toFixed(3)),
   };
 }
 
@@ -234,7 +237,9 @@ function stepCareer() {
   for (let s = 0; s < dt; s++) {
     for (const it of loot) {
       if (it.kind === 'coin' && !it.landed) {
-        it.vy += COIN_GRAV; it.y += it.vy;
+        it.vy += COIN_GRAV;
+        if (it.vy > COIN_MAX_VY) it.vy = COIN_MAX_VY;
+        it.y += it.vy;
         if (it.y >= SAND_Y) { it.y = SAND_Y; it.landed = true; it.ttl = COIN_REST; }
       } else { it.ttl -= 1; }
     }
