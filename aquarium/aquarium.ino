@@ -131,7 +131,7 @@ static int16_t terrainY[SCREEN_W];
 #define DEBOUNCE_MS  300
 
 // ─── Timing ──────────────────────────────────────────────────────────────────
-#define FRAME_MS  50
+#define FRAME_MS  33   // ~30 fps (was 50 / 20 fps)
 
 // ─── Weather sky strip ────────────────────────────────────────────────────────
 // Tied to TANK_TOP so the sky always fills the above-tank area exactly.
@@ -360,11 +360,55 @@ struct Star { uint16_t x; uint8_t y; uint8_t phase; };
 static Star skyStars[NUM_STARS];
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Helpers
+//  Fast RNG — xorshift32 (~5× faster than Arduino random())
 // ═══════════════════════════════════════════════════════════════════════════════
 
-float frand()                    { return random(0, 1000) * 0.001f; }
-float frandr(float lo, float hi) { return lo + frand() * (hi - lo); }
+static uint32_t _rngState = 0x12345678UL;
+
+inline uint32_t xorshift32() {
+  _rngState ^= _rngState << 13;
+  _rngState ^= _rngState >> 17;
+  _rngState ^= _rngState << 5;
+  return _rngState;
+}
+inline float    frand()                    { return (xorshift32() & 0xFFFF) * (1.0f / 65536.0f); }
+inline float    frandr(float lo, float hi) { return lo + frand() * (hi - lo); }
+inline int      irandom(int lo, int hi)    { return lo + (int)(xorshift32() % (uint32_t)(hi - lo)); }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Fast sin — 512-entry LUT, ~8× faster than sinf()
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#define SIN_LUT_N  512
+static float _sinLUT[SIN_LUT_N];
+
+static void initSinLUT() {
+  for (int i = 0; i < SIN_LUT_N; i++)
+    _sinLUT[i] = sinf(i * (2.0f * (float)M_PI / SIN_LUT_N));
+}
+
+inline float fastSin(float x) {
+  x -= floorf(x * (1.0f / (2.0f * (float)M_PI))) * (2.0f * (float)M_PI);
+  if (x < 0) x += 2.0f * (float)M_PI;
+  return _sinLUT[(int)(x * (SIN_LUT_N / (2.0f * (float)M_PI))) & (SIN_LUT_N - 1)];
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Sky cache — recomputed only when dayFactor shifts by > 0.004
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static float    _cachedDayFactor   = -1.0f;
+static int      _cachedWeather     = -1;
+static uint32_t _skyBands[8];        // precomputed fillRect colours
+static uint32_t _cachedCloudCol    = 0xFFFFFFUL;
+static uint32_t _cachedSkyTop      = 0x1A78C8UL;
+static bool     _skyCacheDirty     = true;
+
+static void _markSkyCacheDirty() { _skyCacheDirty = true; }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Helpers
+// ═══════════════════════════════════════════════════════════════════════════════
 
 inline bool isFishActive(int i) {
   if (i < MAX_PAIR)                                      return i < numPair;
@@ -414,7 +458,7 @@ void resetBubble(int i, bool scatter) {
   bubbles[i].x   = frandr(5.0f, SCREEN_W - 5.0f);
   bubbles[i].y   = scatter ? frandr((float)TANK_TOP, (float)SCREEN_H) : (float)(SCREEN_H + 10);
   bubbles[i].spd = frandr(0.8f, 2.5f);
-  bubbles[i].r   = (uint8_t)random(3, 9);
+  bubbles[i].r   = (uint8_t)irandom(3, 9);
 }
 
 void initFishEntry(int idx,
@@ -433,7 +477,7 @@ void initFishEntry(int idx,
   f.partner     = partner;
   f.goingForFood = false;
   f.targetFlake  = -1;
-  f.chasing      = (random(0, 2) == 0);
+  f.chasing      = (irandom(0, 2) == 0);
   f.fullTimer    = 0;
 }
 
@@ -503,7 +547,7 @@ void initWeatherEffects() {
     clouds[i].y   = frandr(15, WEATHER_SKY_H - 25);
     clouds[i].w   = frandr(90, 160);
     clouds[i].h   = frandr(20, 30);   // min 20 ensures at least 4 pixel rows
-    clouds[i].spd = frandr(0.06f, 0.22f) * (random(0, 2) ? 1.0f : -1.0f);
+    clouds[i].spd = frandr(0.06f, 0.22f) * (irandom(0, 2) ? 1.0f : -1.0f);
   }
   for (int i = 0; i < MAX_RAINDROPS; i++) {
     rainDrops[i].x   = frandr(0, SCREEN_W);
@@ -542,7 +586,7 @@ void updateWeatherEffects() {
   if (currentWeather == WEATHER_SNOWY) {
     for (int i = 0; i < MAX_SNOWFLAKES; i++) {
       snowFlakes[i].sway += 0.04f;
-      snowFlakes[i].x    += sinf(snowFlakes[i].sway) * 0.5f;
+      snowFlakes[i].x    += fastSin(snowFlakes[i].sway) * 0.5f;
       snowFlakes[i].y    += snowFlakes[i].spd;
       if (snowFlakes[i].y >= WEATHER_SKY_H) {
         snowFlakes[i].x   = frandr(0, SCREEN_W);
@@ -599,9 +643,9 @@ static uint32_t colorLerp(uint32_t a, uint32_t b, float t) {
 
 static void initStars() {
   for (int i = 0; i < NUM_STARS; i++) {
-    skyStars[i].x     = (uint16_t)random(0, SCREEN_W);
-    skyStars[i].y     = (uint8_t) random(2, WEATHER_SKY_H - 4);
-    skyStars[i].phase = (uint8_t) random(0, 100);
+    skyStars[i].x     = (uint16_t)irandom(0, SCREEN_W);
+    skyStars[i].y     = (uint8_t) irandom(2, WEATHER_SKY_H - 4);
+    skyStars[i].phase = (uint8_t) irandom(0, 100);
   }
 }
 
@@ -654,22 +698,36 @@ void drawWeatherSky() {
   }
   cloudCol = colorLerp(0x223344UL, cloudCol, dayFactor);
 
-  // ── 8-band vertical gradient ───────────────────────────────────────────────
+  // ── 8-band vertical gradient (cached — only rebuilt when sky changes) ───────
+  if (_skyCacheDirty || fabsf(dayFactor - _cachedDayFactor) > 0.004f
+      || (int)currentWeather != _cachedWeather) {
+    for (int band = 0; band < 8; band++) {
+      float t  = (float)band / 7.0f;
+      uint8_t r = (uint8_t)(((skyTop >> 16 & 0xFF) * (1.0f - t)) + ((skyBot >> 16 & 0xFF) * t));
+      uint8_t g = (uint8_t)(((skyTop >>  8 & 0xFF) * (1.0f - t)) + ((skyBot >>  8 & 0xFF) * t));
+      uint8_t b = (uint8_t)(((skyTop       & 0xFF) * (1.0f - t)) + ((skyBot       & 0xFF) * t));
+      _skyBands[band] = (uint32_t)((r << 16) | (g << 8) | b);
+    }
+    _cachedCloudCol  = cloudCol;
+    _cachedSkyTop    = skyTop;
+    _cachedDayFactor = dayFactor;
+    _cachedWeather   = (int)currentWeather;
+    _skyCacheDirty   = false;
+  }
+  cloudCol = _cachedCloudCol;
+  skyTop   = _cachedSkyTop;
+
   for (int band = 0; band < 8; band++) {
-    int   y0 = band       * WEATHER_SKY_H / 8;
-    int   y1 = (band + 1) * WEATHER_SKY_H / 8;
-    float t  = (float)band / 7.0f;
-    uint8_t r = (uint8_t)(((skyTop >> 16 & 0xFF) * (1.0f - t)) + ((skyBot >> 16 & 0xFF) * t));
-    uint8_t g = (uint8_t)(((skyTop >>  8 & 0xFF) * (1.0f - t)) + ((skyBot >>  8 & 0xFF) * t));
-    uint8_t b = (uint8_t)(((skyTop       & 0xFF) * (1.0f - t)) + ((skyBot       & 0xFF) * t));
-    canvas.fillRect(0, y0, SCREEN_W, y1 - y0 + 1, (uint32_t)((r << 16) | (g << 8) | b));
+    int y0 = band       * WEATHER_SKY_H / 8;
+    int y1 = (band + 1) * WEATHER_SKY_H / 8;
+    canvas.fillRect(0, y0, SCREEN_W, y1 - y0 + 1, _skyBands[band]);
   }
 
   // ── Stars (night / dusk / dawn) ────────────────────────────────────────────
   if (dayFactor < 0.9f) {
     float starAlpha = 1.0f - dayFactor / 0.9f;
     for (int i = 0; i < NUM_STARS; i++) {
-      float twinkle = 0.55f + 0.45f * sinf(tick * 0.07f + skyStars[i].phase * 0.13f);
+      float twinkle = 0.55f + 0.45f * fastSin(tick * 0.07f + skyStars[i].phase * 0.13f);
       uint8_t br = (uint8_t)(starAlpha * twinkle * 210);
       if (br < 15) continue;
       // Slightly blue-white colour
@@ -724,8 +782,8 @@ void drawWeatherSky() {
     canvas.fillRect(0, 0, SCREEN_W, WEATHER_SKY_H, 0xCCDDFFUL);
     int bx = (int)_lightBoltX, by = 4;
     while (by < WEATHER_SKY_H) {
-      int nx = bx + (int)random(-14, 14);
-      int ny = by + (int)random(10, 22);
+      int nx = bx + irandom(-14, 14);
+      int ny = by + irandom(10, 22);
       if (ny > WEATHER_SKY_H) ny = WEATHER_SKY_H;
       canvas.drawLine(bx,     by, nx,     ny, 0xFFFFAAUL);
       canvas.drawLine(bx + 1, by, nx + 1, ny, 0xFFFF66UL);
@@ -775,6 +833,9 @@ void drawWeatherSky() {
 void setup() {
   Serial.begin(115200);
   randomSeed(analogRead(36));
+  _rngState = (uint32_t)analogRead(36) ^ (uint32_t)millis() ^ 0xDEADBEEFUL;
+  if (!_rngState) _rngState = 1;
+  initSinLUT();
   if (BUTTON_PIN >= 0) pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   Serial.printf("Total PSRAM : %u bytes\n", ESP.getPsramSize());
@@ -815,25 +876,25 @@ void setup() {
   for (int i = 0; i < NUM_BUBBLES; i++) resetBubble(i, true);
 
   for (int i = 0; i < NUM_BG_PLANTS; i++) {
-    bgPlants[i].baseX = (uint16_t)(15 + i * (SCREEN_W / NUM_BG_PLANTS) + random(0, 25));
-    bgPlants[i].segs  = (uint8_t)(5 + random(0, 7));
+    bgPlants[i].baseX = (uint16_t)(15 + i * (SCREEN_W / NUM_BG_PLANTS) + irandom(0, 25));
+    bgPlants[i].segs  = (uint8_t)(5 + irandom(0, 7));
     bgPlants[i].type  = (uint8_t)(i % 2);  // alternate types across the tank
   }
 
   for (int i = 0; i < NUM_WEEDS; i++) {
     weeds[i].baseX       = (uint16_t)(40 + i * (SCREEN_W / (NUM_WEEDS + 1)));
-    weeds[i].segs        = (uint8_t)(8 + random(0, 7));
-    weeds[i].numBranches = (uint8_t)(1 + random(0, 2));
+    weeds[i].segs        = (uint8_t)(8 + irandom(0, 7));
+    weeds[i].numBranches = (uint8_t)(1 + irandom(0, 2));
     for (int b = 0; b < 2; b++) {
-      weeds[i].branchAt[b]   = (uint8_t)(2 + random(0, weeds[i].segs - 3));
-      weeds[i].branchSide[b] = (random(0, 2) == 0) ? 1 : -1;
+      weeds[i].branchAt[b]   = (uint8_t)(2 + irandom(0, weeds[i].segs - 3));
+      weeds[i].branchSide[b] = (irandom(0, 2) == 0) ? 1 : -1;
     }
   }
 
   // Foreground hornwort — spread across tank, offset from seaweed positions
   for (int i = 0; i < NUM_FG_HORNWORT; i++) {
-    fgHornworts[i].baseX = (uint16_t)(80 + i * (SCREEN_W / NUM_FG_HORNWORT) + random(0, 40));
-    fgHornworts[i].segs  = (uint8_t)(6 + random(0, 6));
+    fgHornworts[i].baseX = (uint16_t)(80 + i * (SCREEN_W / NUM_FG_HORNWORT) + irandom(0, 40));
+    fgHornworts[i].segs  = (uint8_t)(6 + irandom(0, 6));
   }
 
   // Pair fish — indices 0 and 1
@@ -880,11 +941,11 @@ void setup() {
 
   snail.x           = frandr(80, SCREEN_W - 80);
   snail.spd         = frandr(0.12f, 0.25f);
-  snail.facingRight = (random(0, 2) == 0);
+  snail.facingRight = (irandom(0, 2) == 0);
 
   starfish.x           = frandr(80, SCREEN_W - 80);
   starfish.spd         = frandr(0.10f, 0.20f);
-  starfish.facingRight = (random(0, 2) == 0);
+  starfish.facingRight = (irandom(0, 2) == 0);
 
   lastFrameMs = millis();
 }
@@ -893,7 +954,7 @@ void setup() {
 //  Food drop
 // ═══════════════════════════════════════════════════════════════════════════════
 void dropFood(int touchX = -1, int touchY = -1) {
-  int n = random(5, 11);
+  int n = irandom(5, 11);
   int spawned = 0;
   bool hasTouch = (touchX >= 0);
   for (int i = 0; i < MAX_FLAKES && spawned < n; i++) {
@@ -907,7 +968,7 @@ void dropFood(int touchX = -1, int touchY = -1) {
       }
       flakes[i].spd      = frandr(0.4f, 1.0f);
       flakes[i].active   = true;
-      flakes[i].shape    = (uint8_t)random(0, 3);
+      flakes[i].shape    = (uint8_t)irandom(0, 3);
       flakes[i].colorIdx = (uint8_t)(spawned % 7);
       spawned++;
     }
@@ -941,7 +1002,7 @@ void updateStarfish() {
 void updateBubbles() {
   for (int i = 0; i < NUM_BUBBLES; i++) {
     bubbles[i].y -= bubbles[i].spd;
-    bubbles[i].x += sinf(tick * 0.06f + i * 1.57f) * 0.8f;
+    bubbles[i].x += fastSin(tick * 0.06f + i * 1.57f) * 0.8f;
     bubbles[i].x  = constrain(bubbles[i].x, 2.0f, (float)(SCREEN_W - 2));
     if (bubbles[i].y < TANK_TOP) resetBubble(i, false);
   }
@@ -951,7 +1012,7 @@ void updateFlakes() {
   for (int i = 0; i < MAX_FLAKES; i++) {
     if (!flakes[i].active) continue;
     flakes[i].y += flakes[i].spd;
-    flakes[i].x += sinf(tick * 0.03f + i * 0.9f) * 0.5f;
+    flakes[i].x += fastSin(tick * 0.03f + i * 0.9f) * 0.5f;
     if (flakes[i].y > SCREEN_H - 4) flakes[i].active = false;
   }
 }
@@ -1194,7 +1255,7 @@ void updateEacFish() {
     // Drift left to right across the tank
     eacFish[i].x += eacFish[i].spd;
     // Gentle vertical wobble within the band
-    eacFish[i].y = midY + sinf(tick * 0.018f + eacFish[i].wobbleOff) * bandH * 0.3f;
+    eacFish[i].y = midY + fastSin(tick * 0.018f + eacFish[i].wobbleOff) * bandH * 0.3f;
 
     // Loop back to left edge
     if (eacFish[i].x > SCREEN_W + 20) eacFish[i].x = -20.0f;
@@ -1363,8 +1424,8 @@ void drawBackground() {
   // there are no vertical column streaks.
   for (int y = TANK_TOP; y < SCREEN_H; y += 3) {
     float fy = (float)(y - TANK_TOP);
-    float w  = sinf(fy * 0.040f + tick * 0.10f)  * 14.0f
-             + sinf(fy * 0.016f - tick * 0.034f) *  8.0f;
+    float w  = fastSin(fy * 0.040f + tick * 0.10f)  * 14.0f
+             + fastSin(fy * 0.016f - tick * 0.034f) *  8.0f;
     int g = constrain(0x30 + (int)(w * 0.4f), 0, 255);
     int b = constrain(0x60 + (int)w,          0, 255);
     canvas.fillRect(0, y, SCREEN_W, 3, ((uint32_t)g << 8) | (uint32_t)b);
@@ -1421,7 +1482,7 @@ void drawBgPlants() {
       sx[0] = p.baseX;
       sy[0] = SCREEN_H - 20;
       for (int s = 1; s <= p.segs; s++) {
-        float sway = sinf(tick * 0.035f + i * 1.60f + s * 0.42f) * s * 1.1f;
+        float sway = fastSin(tick * 0.035f + i * 1.60f + s * 0.42f) * s * 1.1f;
         sx[s] = p.baseX + (int)sway;
         sy[s] = SCREEN_H - 20 - s * BG_PLANT_SEG_H;
       }
@@ -1440,7 +1501,7 @@ void drawBgPlants() {
       int baseY = SCREEN_H - 20;
       int topY  = baseY - p.segs * BG_PLANT_SEG_H;
       // Whole plant sways gently at the tip
-      float tipSway = sinf(tick * 0.028f + i * 1.85f) * 3.0f;
+      float tipSway = fastSin(tick * 0.028f + i * 1.85f) * 3.0f;
 
       for (int s = 0; s <= p.segs; s++) {
         float t  = (float)s / p.segs;            // 0 = base, 1 = tip
@@ -1472,7 +1533,7 @@ void drawFgHornwort() {
     int baseY = SCREEN_H - 20;
 
     // More pronounced sway than background version
-    float tipSway = sinf(tick * 0.05f + i * 1.30f) * 5.0f;
+    float tipSway = fastSin(tick * 0.05f + i * 1.30f) * 5.0f;
 
     for (int s = 0; s <= h.segs; s++) {
       float t  = (float)s / h.segs;
@@ -1506,7 +1567,7 @@ void drawSeaweed() {
     sx[0] = w.baseX;
     sy[0] = SCREEN_H - 20;
     for (int s = 1; s <= w.segs; s++) {
-      float sway = sinf(tick * 0.05f + i * 1.20f + s * 0.45f) * s * 2.0f;
+      float sway = fastSin(tick * 0.05f + i * 1.20f + s * 0.45f) * s * 2.0f;
       sx[s] = w.baseX + (int)sway;
       sy[s] = SCREEN_H - 20 - s * WEED_SEG_H;
     }
@@ -1530,7 +1591,7 @@ void drawSeaweed() {
 
       int bx = sx[bs], by = sy[bs];
       for (int s = 1; s <= BRANCH_SEGS; s++) {
-        float sway = sinf(tick * 0.05f + i * 1.20f + (bs + s) * 0.45f) * (bs + s) * 1.5f;
+        float sway = fastSin(tick * 0.05f + i * 1.20f + (bs + s) * 0.45f) * (bs + s) * 1.5f;
         int nx = w.baseX + (int)sway + w.branchSide[b] * s * 12;
         int ny = by - s * (WEED_SEG_H - 2);
         canvas.drawLine(bx, by, nx, ny, COL_WEED);
@@ -1997,7 +2058,7 @@ void loop() {
   if (weatherOverrideIdx < 0) {
     WeatherCondition prevW = currentWeather;
     updateWeather();
-    if (currentWeather != prevW) initWeatherEffects();
+    if (currentWeather != prevW) { initWeatherEffects(); _markSkyCacheDirty(); }
   }
   updateWeatherEffects();
   telemetryUpdate();
