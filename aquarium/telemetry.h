@@ -146,13 +146,13 @@ static int _buildTelemetryJson() {
 
     o = _tAppend(o,
         "{\"aquarium_id\":\"%s\",\"platform\":\"esp32\",\"fw_version\":\"%s\","
-        "\"uptime_ms\":%lu,\"tick\":%d,"
+        "\"uptime_ms\":%lu,\"tick\":%d,\"frame_ms\":%d,"
         "\"screen\":{\"w\":%d,\"h\":%d,\"tank_top\":%d},"
         "\"weather\":{\"condition\":%d,\"name\":\"%s\",\"override\":%s},"
         "\"time\":{\"day_progress\":%.4f,\"mode\":\"%s\"},"
         "\"counts\":{\"pair\":%d,\"school\":%d,\"school2\":%d,\"angel\":%d},",
         TELEMETRY_AQUARIUM_ID, FIRMWARE_VERSION,
-        (unsigned long)millis(), (int)tick,
+        (unsigned long)millis(), (int)tick, FRAME_MS,
         SCREEN_W, SCREEN_H, TANK_TOP,
         wc, _telemetryWeatherName(wc), (weatherOverrideIdx >= 0) ? "true" : "false",
         getDayProgress(), (currentTimeMode == TIME_FAST) ? "FAST" : "REAL",
@@ -165,10 +165,14 @@ static int _buildTelemetryJson() {
         if (!isFishActive(i)) continue;
         Fish& f = fish[i];
         o = _tAppend(o,
-            "%s{\"id\":%d,\"x\":%d,\"y\":%d,\"z\":%.3f,\"type\":%d,\"facing_right\":%s,"
+            "%s{\"id\":%d,\"x\":%d,\"y\":%d,\"z\":%.3f,"
+            "\"vx\":%.2f,\"vy\":%.2f,\"vz\":%.4f,"
+            "\"type\":%d,\"facing_right\":%s,"
             "\"color\":%u,\"going_for_food\":%s,\"chasing\":%s}",
             first ? "" : ",", i,
-            (int)f.x, (int)f.y, f.z, (int)f.type,
+            (int)f.x, (int)f.y, f.z,
+            f.vx, f.vy, f.vz,
+            (int)f.type,
             f.facingRight ? "true" : "false",
             (unsigned)fishColor(i),
             f.goingForFood ? "true" : "false",

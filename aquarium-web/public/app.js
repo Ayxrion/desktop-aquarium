@@ -9,10 +9,42 @@ const TANK_TOP = 72;
 const SCREEN_W = 800;
 const SCREEN_H = 480;
 
+// ─── Physics extrapolation constants (must match device) ─────────────────────
+// Device applies per-frame: vx *= 0.85; x += vx (at FRAME_MS intervals).
+// Continuous-time integral: x(t) = x₀ + vx·fm·(1 − d^(t/fm)) / (−ln d)
+const _DAMP_XY  = 0.85;
+const _DAMP_Z   = 0.88;
+const _LOG_D_XY = Math.log(_DAMP_XY); // ≈ -0.1625
+const _LOG_D_Z  = Math.log(_DAMP_Z);  // ≈ -0.1278
+
+function _extrapolateFish(f, elapsedMs, frameMs) {
+  const vx = f.vx || 0, vy = f.vy || 0, vz = f.vz || 0;
+  if (!vx && !vy && !vz) return f;
+  const fm = frameMs || 50;
+  const t = Math.min(elapsedMs, 2000); // cap drift at 2 s
+  const sXY = fm * (1 - Math.pow(_DAMP_XY, t / fm)) / (-_LOG_D_XY);
+  const sZ  = fm * (1 - Math.pow(_DAMP_Z,  t / fm)) / (-_LOG_D_Z);
+  return {
+    ...f,
+    x: Math.min(Math.max(Math.round(f.x + vx * sXY), 5), SCREEN_W - 5),
+    y: Math.min(Math.max(Math.round(f.y + vy * sXY), TANK_TOP + 5), SCREEN_H - 60),
+    z: Math.min(Math.max(f.z + vz * sZ, 0), 0.78),
+    // Update facing direction if velocity is strong enough (mirrors device logic)
+    facing_right: Math.abs(vx) > 0.4 ? vx > 0 : f.facing_right,
+  };
+}
+
+function _extrapolateSnapshot(snap, elapsedMs) {
+  if (!snap || !Array.isArray(snap.fish)) return snap;
+  const fm = snap.frame_ms || 50;
+  return { ...snap, fish: snap.fish.map((f) => _extrapolateFish(f, elapsedMs, fm)) };
+}
+
 let selectedId = null;
 let stream = null;
-let latest = null; // latest snapshot for the selected aquarium
-let lastSnapshotMs = 0; // when we last received any snapshot (SSE or poll)
+let latestSnapshot = null; // last received SSE/poll snapshot (raw, not extrapolated)
+let snapshotReceivedAt = 0; // wall-clock ms when we received it
+let rafId = null;
 let highlightedFishId = null; // legend row → highlight on the canvas
 const legendRows = new Map(); // fishId -> { el, nameInput, ageEl, swatchEl }
 
@@ -68,8 +100,8 @@ function renderList(items) {
 function select(id) {
   if (selectedId === id) return;
   selectedId = id;
-  latest = null;
-  lastSnapshotMs = 0;
+  latestSnapshot = null;
+  snapshotReceivedAt = 0;
   highlightedFishId = null;
   legendRows.clear();
   els.legend.innerHTML = '';
@@ -80,10 +112,23 @@ function select(id) {
 }
 
 function applySnapshot(snap) {
-  latest = snap;
-  lastSnapshotMs = Date.now();
-  render();
+  latestSnapshot = snap;
+  snapshotReceivedAt = Date.now();
+  // Legend, stats, and title update at telemetry rate (≤1 Hz) — cheap DOM work.
+  drawTitle(snap);
+  drawStats(snap);
+  renderLegend(snap);
   setConn(true);
+  // Ensure the 60fps canvas loop is running.
+  if (!rafId) rafId = requestAnimationFrame(_rafDraw);
+}
+
+// 60fps canvas-only loop — extrapolates fish positions between telemetry frames.
+function _rafDraw() {
+  rafId = requestAnimationFrame(_rafDraw);
+  if (!latestSnapshot) return;
+  const elapsed = Date.now() - snapshotReceivedAt;
+  drawTank(_extrapolateSnapshot(latestSnapshot, elapsed));
 }
 
 // ─── SSE stream for the selected aquarium ────────────────────────────────────
@@ -120,17 +165,20 @@ async function pollSelected() {
 function startWatchdog() {
   setInterval(() => {
     if (!selectedId) return;
-    if (Date.now() - lastSnapshotMs > 4000) pollSelected();
+    if (Date.now() - snapshotReceivedAt > 4000) pollSelected();
   }, 2000);
 }
 
 // ─── Rendering ───────────────────────────────────────────────────────────────
+// Full re-render (called on highlight toggle, etc.) — extrapolates fish to now.
 function render() {
-  if (!latest) return;
-  drawTitle(latest);
-  drawTank(latest);
-  drawStats(latest);
-  renderLegend(latest);
+  if (!latestSnapshot) return;
+  const elapsed = Date.now() - snapshotReceivedAt;
+  const snap = _extrapolateSnapshot(latestSnapshot, elapsed);
+  drawTitle(snap);
+  drawTank(snap);
+  drawStats(snap);
+  renderLegend(latestSnapshot); // legend uses raw snapshot (names/ages, not positions)
 }
 
 // Legend: one row per fish, color-matched, with editable name, age, and
@@ -224,7 +272,7 @@ function drawTitle(s) {
   els.viewSub.textContent = [s.platform, s.fw_version ? 'fw ' + s.fw_version : '', weather]
     .filter(Boolean)
     .join(' · ');
-  const stale = s._stale || Date.now() - lastSnapshotMs > 8000;
+  const stale = s._stale || Date.now() - snapshotReceivedAt > 8000;
   els.viewDot.className = 'dot ' + (stale ? 'stale' : 'live');
 }
 

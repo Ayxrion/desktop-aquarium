@@ -14,6 +14,30 @@ const MAX_AQUARIUMS = parseInt(process.env.MAX_AQUARIUMS || '64', 10);
 const FISH_GAP_MS = parseInt(process.env.FISH_GAP_MS || '10000', 10); // absence => new fish
 const MAX_NAME_LEN = 24;
 
+// Physics constants matching the device (aquarium.ino / main.cpp):
+//   vx *= 0.85 per FRAME_MS-tick; vy same; vz *= 0.88
+// Integral of decaying velocity: x(t) = x0 + vx * fm * (1 - d^(t/fm)) / (-ln d)
+const _DAMP_XY = 0.85;
+const _DAMP_Z  = 0.88;
+const _LOG_D_XY = Math.log(_DAMP_XY); // ≈ -0.1625
+const _LOG_D_Z  = Math.log(_DAMP_Z);  // ≈ -0.1278
+
+function _extrapolateFish(f, elapsedMs, frameMs) {
+  const vx = f.vx || 0, vy = f.vy || 0, vz = f.vz || 0;
+  if (!vx && !vy && !vz) return f;
+  const fm = frameMs || 50;
+  // Cap at 3 seconds to avoid runaway drift if a snapshot is very stale.
+  const t = Math.min(elapsedMs, 3000);
+  const sXY = fm * (1 - Math.pow(_DAMP_XY, t / fm)) / (-_LOG_D_XY);
+  const sZ  = fm * (1 - Math.pow(_DAMP_Z,  t / fm)) / (-_LOG_D_Z);
+  return {
+    ...f,
+    x: Math.round(f.x + vx * sXY),
+    y: Math.round(f.y + vy * sXY),
+    z: f.z + vz * sZ,
+  };
+}
+
 /**
  * @typedef {{ snapshot: object, lastSeenMs: number,
  *             names: Map<number,string>,
@@ -63,19 +87,24 @@ function updateFishMeta(entry, fish) {
   }
 }
 
-// Return a snapshot copy with each fish augmented with its name + ageMs.
+// Return a snapshot copy with each fish augmented with name + ageMs + extrapolated position.
+// Positions are projected forward from lastSeenMs using the device's damped-velocity physics,
+// so REST-polling clients get a current estimate rather than a stale snapshot position.
 function enrich(entry) {
   const s = entry.snapshot;
   if (!s) return null;
   const t = now();
+  const elapsedMs = t - entry.lastSeenMs;
+  const frameMs = s.frame_ms || 50;
   const fish = Array.isArray(s.fish)
     ? s.fish.map((f) => {
         const m = entry.meta.get(f.id);
-        return {
+        const enriched = {
           ...f,
           name: entry.names.get(f.id) || null,
           ageMs: m ? t - m.firstSeenMs : 0,
         };
+        return _extrapolateFish(enriched, elapsedMs, frameMs);
       })
     : [];
   return { ...s, fish, _lastSeenMs: entry.lastSeenMs, _stale: isStale(entry.lastSeenMs) };
