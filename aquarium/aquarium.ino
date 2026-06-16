@@ -255,8 +255,8 @@ struct Boat {
 static Boat boat = { (float)(SCREEN_W + BOAT_W), false, 0UL };
 
 // ─── EAC silhouette fish (traffic-driven) ────────────────────────────────────
-#define EAC_X1          560     // left edge of current lane
-#define EAC_X2          720     // right edge
+#define EAC_Y1          180     // top of horizontal current band (mid-tank)
+#define EAC_Y2          270     // bottom of horizontal current band
 #define EAC_MAX_FISH     12
 
 struct EacFish {
@@ -862,14 +862,15 @@ void setup() {
 
   for (int i = 0; i < MAX_FLAKES; i++) flakes[i].active = false;
 
-  // EAC fish — spawn spread across the zone, staggered vertically
+  // EAC fish — staggered horizontally across full tank width
   for (int i = 0; i < EAC_MAX_FISH; i++) {
-    eacFish[i].x        = EAC_X1 + frandr(10, EAC_X2 - EAC_X1 - 10);
-    eacFish[i].y        = TANK_TOP + (float)i / EAC_MAX_FISH * (SCREEN_H - TANK_TOP - 50);
+    float bandH = EAC_Y2 - EAC_Y1;
+    eacFish[i].x        = (float)i / EAC_MAX_FISH * SCREEN_W;
+    eacFish[i].y        = EAC_Y1 + bandH * 0.1f + frandr(0, (int)(bandH * 0.8f));
     eacFish[i].spd      = frandr(0.3f, 0.8f);
     eacFish[i].size     = frandr(6.0f, 13.0f);
     eacFish[i].wobbleOff = frandr(0.0f, 6.28f);
-    eacFish[i].active   = false;  // activated by congestion in updateEacFish()
+    eacFish[i].active   = false;
   }
   initTraffic();
 
@@ -1179,34 +1180,31 @@ void updateFish() {
 // ─── EAC silhouette fish ─────────────────────────────────────────────────────
 
 void updateEacFish() {
-  // Activate/deactivate based on current congestion
   int target = (int)(trafficCongestion() * EAC_MAX_FISH + 0.5f);
   eacActiveCount = constrain(target, 0, EAC_MAX_FISH);
+
+  float bandH = EAC_Y2 - EAC_Y1;
+  float midY  = (EAC_Y1 + EAC_Y2) * 0.5f;
 
   for (int i = 0; i < EAC_MAX_FISH; i++) {
     eacFish[i].active = (i < eacActiveCount);
     if (!eacFish[i].active) continue;
 
-    // Drift south (downward)
-    eacFish[i].y += eacFish[i].spd;
-    // Gentle lateral wobble within the lane
-    float mid = (EAC_X1 + EAC_X2) * 0.5f;
-    float w   = (EAC_X2 - EAC_X1) * 0.35f;
-    eacFish[i].x = mid + sinf(tick * 0.025f + eacFish[i].wobbleOff) * w;
+    // Drift left to right across the tank
+    eacFish[i].x += eacFish[i].spd;
+    // Gentle vertical wobble within the band
+    eacFish[i].y = midY + sinf(tick * 0.018f + eacFish[i].wobbleOff) * bandH * 0.3f;
 
-    // Loop back to top when reaching the sand
-    if (eacFish[i].y > SCREEN_H - 45) {
-      eacFish[i].y = (float)TANK_TOP + frandr(0, 20);
-    }
+    // Loop back to left edge
+    if (eacFish[i].x > SCREEN_W + 20) eacFish[i].x = -20.0f;
   }
 }
 
 void drawEacSilhouette(float x, float y, float size) {
-  // Very dark blue — reads as a silhouette against the water gradient
-  const uint32_t COL = 0x061420UL;
+  // Just slightly darker than deep water — barely perceptible silhouette
+  const uint32_t COL = 0x021428UL;
   int ix = (int)x, iy = (int)y, sz = (int)size;
   canvas.fillEllipse(ix, iy, sz, (int)(size * 0.5f), COL);
-  // tail (pointing left, fish faces right = swimming downstream)
   int tx = (int)(size * 0.7f);
   canvas.fillTriangle(ix - sz,      iy,
                       ix - sz - tx, iy - (int)(size * 0.45f),
@@ -1215,16 +1213,7 @@ void drawEacSilhouette(float x, float y, float size) {
 }
 
 void drawEacFish() {
-  // Faint lane shimmer — narrow vertical gradient strip
-  for (int x = EAC_X1; x < EAC_X2; x++) {
-    float t   = (float)(x - EAC_X1) / (EAC_X2 - EAC_X1);
-    float env = sinf(t * 3.14159f);          // bell: 0 at edges, 1 at centre
-    uint8_t a = (uint8_t)(env * 8);          // very faint tint
-    if (a == 0) continue;
-    uint32_t col = (uint32_t)a << 16 | (uint32_t)(a * 3) << 8 | (uint32_t)(a * 5);
-    canvas.drawFastVLine(x, TANK_TOP, SCREEN_H - TANK_TOP, col);
-  }
-
+  // No zone tint — silhouettes only
   for (int i = 0; i < EAC_MAX_FISH; i++) {
     if (!eacFish[i].active) continue;
     drawEacSilhouette(eacFish[i].x, eacFish[i].y, eacFish[i].size);

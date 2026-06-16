@@ -119,20 +119,20 @@ function startWatchdog() {
 }
 
 // ─── EAC silhouette fish ─────────────────────────────────────────────────────
-const EAC_X1 = 560, EAC_X2 = 720;   // horizontal band (right side of tank)
+// Horizontal current band across the mid-tank. Fish drift left to right.
+const EAC_Y1 = 180, EAC_Y2 = 270;   // horizontal band (mid-tank)
 const EAC_MAX_FISH = 12;
 
-let eacFish = [];        // { x, y, speed, size, wobble, wobbleOff }
-let eacTargetCount = 0;  // set by traffic fetch
-let eacBright = 0.5;     // mirrors latest day-brightness so silhouettes dim at night
+let eacFish = [];
+let eacTargetCount = 0;
 
-function eacSpawnFish(y) {
+function eacSpawnFish(startX) {
+  const bandH = EAC_Y2 - EAC_Y1;
   return {
-    x: EAC_X1 + Math.random() * (EAC_X2 - EAC_X1),
-    y: y ?? (TANK_TOP + Math.random() * (SCREEN_H - TANK_TOP - 40)),
-    speed: 0.4 + Math.random() * 0.6,  // px per frame
-    size: 6 + Math.random() * 7,
-    wobble: 0.5 + Math.random() * 1.5, // lateral wobble amplitude
+    x: startX ?? Math.random() * SCREEN_W,
+    y: EAC_Y1 + bandH * 0.1 + Math.random() * bandH * 0.8,
+    speed: 0.35 + Math.random() * 0.55,
+    size: 7 + Math.random() * 8,
     wobbleOff: Math.random() * Math.PI * 2,
   };
 }
@@ -142,30 +142,23 @@ function updateEacCount(congestion) {
 }
 
 function tickEac(frameCount) {
-  // Grow or shrink pool toward target
-  while (eacFish.length < eacTargetCount) eacFish.push(eacSpawnFish(TANK_TOP));
+  while (eacFish.length < eacTargetCount) eacFish.push(eacSpawnFish(0));
   if (eacFish.length > eacTargetCount) eacFish.splice(eacTargetCount);
 
+  const bandH = EAC_Y2 - EAC_Y1;
   for (const f of eacFish) {
-    f.y += f.speed;
-    f.x = EAC_X1 + (EAC_X2 - EAC_X1) * 0.5 +
-          Math.sin(frameCount * 0.03 + f.wobbleOff) * f.wobble * (EAC_X2 - EAC_X1) * 0.35;
-    if (f.y > SCREEN_H - 40) f.y = TANK_TOP;  // loop back to top
+    f.x += f.speed;
+    // gentle vertical wobble within the band
+    f.y = EAC_Y1 + bandH * 0.5 + Math.sin(frameCount * 0.018 + f.wobbleOff) * bandH * 0.3;
+    if (f.x > SCREEN_W + 20) f.x = -20;  // loop left
   }
 }
 
 function drawEacZone(bright) {
-  // Subtle current shimmer — faint vertical gradient tint
-  const grd = ctx.createLinearGradient(EAC_X1, 0, EAC_X2, 0);
-  grd.addColorStop(0,   'rgba(30,120,200,0)');
-  grd.addColorStop(0.5, `rgba(30,120,200,${(0.04 * bright).toFixed(3)})`);
-  grd.addColorStop(1,   'rgba(30,120,200,0)');
-  ctx.fillStyle = grd;
-  ctx.fillRect(EAC_X1, TANK_TOP, EAC_X2 - EAC_X1, SCREEN_H - TANK_TOP);
-
-  // Silhouette fish
+  // No zone tint — silhouettes only
   ctx.save();
-  ctx.globalAlpha = 0.22 * bright + 0.06;
+  ctx.globalAlpha = 0.13 * bright + 0.04;  // very faint, brightest at noon
+  ctx.fillStyle = '#061c2e';
   for (const f of eacFish) {
     drawSilhouetteFish(f.x, f.y, f.size);
   }
@@ -173,14 +166,11 @@ function drawEacZone(bright) {
 }
 
 function drawSilhouetteFish(x, y, size) {
-  ctx.fillStyle = '#0a2a44';
   ctx.save();
   ctx.translate(x, y);
-  // body
   ctx.beginPath();
   ctx.ellipse(0, 0, size, size * 0.5, 0, 0, Math.PI * 2);
   ctx.fill();
-  // tail (pointing left — fish face right, swimming downstream/south)
   ctx.beginPath();
   ctx.moveTo(-size, 0);
   ctx.lineTo(-size - size * 0.7, -size * 0.45);
