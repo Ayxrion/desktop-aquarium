@@ -12,8 +12,8 @@
 // Set TELEMETRY_ENABLED to 1 and point TELEMETRY_HOST at the server's base URL
 // (include any reverse-proxy prefix, e.g. ".../aquarium"). TELEMETRY_API_KEY
 // must match the server's API_KEY. Leave ENABLED 0 to disable.
-#define TELEMETRY_ENABLED      0
+#define TELEMETRY_ENABLED      1
 #define TELEMETRY_HOST         "http://192.168.1.215/aquarium"
 #define TELEMETRY_API_KEY      "change-me"
 #define TELEMETRY_AQUARIUM_ID  "pi-living-room"
-#define TELEMETRY_INTERVAL_MS  1000
+#define TELEMETRY_INTERVAL_MS  5000

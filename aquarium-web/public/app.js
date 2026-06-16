@@ -13,6 +13,24 @@ const SCREEN_H = 480;
 const _DAMP  = 0.85;
 const _DAMPZ = 0.88;
 
+// Smooth motion for the non-fish movers (boat, snail, starfish, flakes). Their
+// telemetry carries no velocity, so we dead-reckon: derive each one's velocity
+// from the observed delta between the last two snapshots and extrapolate that
+// forward every frame, the same way the fish are smoothed.
+let _sceneVel = { snail: 0, starfish: 0, boat: 0 }; // px per ms
+const FLAKE_FALL_PXF = 0.7;                          // avg device fall (px/frame)
+
+// Observed velocity (px/ms) between two snapshot positions. Returns 0 for
+// teleports/wraps (implausibly large deltas, e.g. the boat relaunching from the
+// far edge) so we don't fling objects. The cap (0.15 px/ms ≈ 150 px/s) is well
+// above any real mover — boat drift, snail/starfish crawl — but well below a
+// full-width wrap (~800 px/s).
+function _obsVel(a, b, dt) {
+  if (!a || !b || typeof a.x !== 'number' || typeof b.x !== 'number') return 0;
+  const v = (b.x - a.x) / dt;
+  return Math.abs(v) > 0.15 ? 0 : v;
+}
+
 function _bound(v, lo, hi, k) {
   if (v < lo) return (lo - v) * k;
   if (v > hi) return (hi - v) * k;
@@ -52,11 +70,14 @@ function _extrapolateFish(f, elapsedMs, frameMs) {
 // Joint simulation: all fish stepped together each frame so school centroids
 // and pairwise separation forces update correctly — matching device updateFish().
 function _extrapolateSnapshot(snap, elapsedMs) {
-  if (!snap || !Array.isArray(snap.fish) || snap.fish.length === 0) return snap;
+  if (!snap) return snap;
   const fm = snap.frame_ms || 50;
-  const n  = Math.round(Math.min(elapsedMs, 2000) / fm);
-  if (n === 0) return snap;
+  const e  = Math.min(Math.max(elapsedMs, 0), 2000);
+  const n  = Math.round(e / fm);
+  const hasFish = Array.isArray(snap.fish) && snap.fish.length > 0;
 
+  let fishOut = snap.fish;
+  if (hasFish && n > 0) {
   // Working copies of mutable state
   const st = snap.fish.map((f) => ({
     id: f.id, type: f.type || 0,
@@ -121,13 +142,424 @@ function _extrapolateSnapshot(snap, elapsedMs) {
     }
   }
 
-  const fishOut = snap.fish.map((orig, i) => ({
+  fishOut = snap.fish.map((orig, i) => ({
     ...orig,
     x: Math.round(st[i].x), y: Math.round(st[i].y), z: st[i].z,
     vx: st[i].vx, vy: st[i].vy,
     facing_right: st[i].facing_right,
   }));
-  return { ...snap, fish: fishOut };
+  }
+
+  // Dead-reckon the non-fish movers from their observed velocity.
+  const out = { ...snap, fish: fishOut };
+  if (snap.snail && typeof snap.snail.x === 'number')
+    out.snail = { ...snap.snail, x: snap.snail.x + _sceneVel.snail * e };
+  if (snap.starfish && typeof snap.starfish.x === 'number')
+    out.starfish = { ...snap.starfish, x: snap.starfish.x + _sceneVel.starfish * e };
+  if (snap.boat && typeof snap.boat.x === 'number')
+    out.boat = { ...snap.boat, x: snap.boat.x + _sceneVel.boat * e };
+  if (Array.isArray(snap.flakes)) {
+    const frames = e / fm;
+    out.flakes = snap.flakes.map((fl, i) => ({
+      ...fl,
+      x: fl.x + Math.sin(animTick * 0.03 + i * 0.9) * 0.5,
+      y: Math.min(SCREEN_H - 4, fl.y + FLAKE_FALL_PXF * frames),
+    }));
+  }
+  return out;
+}
+
+// ─── Faithful scene renderer (mirrors device aquarium.ino / main.cpp) ─────────
+// Decorative animations (sway, water, bubbles, smoke) are driven by animTick,
+// expressed in device "tick" units (one per 50ms) so the device's sin() phase
+// constants port over unchanged. Updated once per rAF frame in _rafDraw.
+let animTick = 0;
+
+// Bumpy sand bed: three layered sine waves, same as the device terrainY[].
+const terrainY = new Int16Array(SCREEN_W);
+for (let x = 0; x < SCREEN_W; x++) {
+  const hh = Math.sin(x * 0.018) * 4.0 + Math.sin(x * 0.063) * 2.5 + Math.sin(x * 0.140) * 1.5;
+  terrainY[x] = Math.round(SCREEN_H - 18 + hh);
+}
+
+// Perspective: deeper (higher z) fish converge toward screen centre and shrink.
+function projX(x, z) { const cx = SCREEN_W * 0.5;  return cx + (x - cx) * (1 - z * 0.30); }
+function projY(y, z) { const cy = SCREEN_H * 0.45; return cy + (y - cy) * (1 - z * 0.38); }
+
+// Fish text size / half-width (device units) — drives shadow + glyph scale.
+function fishTS(f)    { return (f.type || 0) === 0 ? (f.z < 0.5 ? 3 : 2) : (f.z < 0.6 ? 2 : 1); }
+function fishChars(f) { return (f.type || 0) === 0 ? 5 : 3; }
+function fishHW(f)    { return (fishChars(f) * 6 * fishTS(f)) / 2; }
+
+const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+
+// Multiply a 24-bit RGB int by a 0..1 brightness factor → css rgb().
+function shadeN(n, factor) {
+  const r = Math.round(((n >> 16) & 0xff) * factor);
+  const g = Math.round(((n >> 8) & 0xff) * factor);
+  const b = Math.round((n & 0xff) * factor);
+  return `rgb(${r},${g},${b})`;
+}
+
+// ── Low-level primitives (numeric colors, matching the device canvas API) ──
+function frect(x, y, w, h, c) { ctx.fillStyle = hex(c); ctx.fillRect(x, y, w, h); }
+function tri(x1, y1, x2, y2, x3, y3, c) {
+  ctx.fillStyle = hex(c);
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.lineTo(x3, y3); ctx.closePath(); ctx.fill();
+}
+function fcirc(x, y, r, c) { ctx.fillStyle = hex(c); ctx.beginPath(); ctx.arc(x, y, Math.max(0.5, r), 0, Math.PI * 2); ctx.fill(); }
+function scirc(x, y, r, c) { ctx.strokeStyle = hex(c); ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(x, y, Math.max(0.5, r), 0, Math.PI * 2); ctx.stroke(); }
+function seg(x1, y1, x2, y2) { ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); }
+function fillEllipseC(cx, cy, rx, ry, style) {
+  ctx.fillStyle = style;
+  ctx.beginPath(); ctx.ellipse(cx, cy, Math.max(0.5, rx), Math.max(0.5, ry), 0, 0, Math.PI * 2); ctx.fill();
+}
+
+// ── Sky: gradient, stars at night, sun/moon arc, drifting clouds ──
+function drawSky(top, bright, cond, s) {
+  const skyTop = [0x1A78C8, 0x2288CC, 0x556677, 0x334455, 0x111827, 0x8899AA, 0x7788AA];
+  const skyBot = [0x64B5E8, 0x77AEDD, 0x8899AA, 0x556677, 0x1A2233, 0xAABBCC, 0xAABBCC];
+  const base = skyTop[cond] ?? 0x1A78C8;
+  const g = ctx.createLinearGradient(0, 0, 0, top);
+  g.addColorStop(0, shadeN(base, bright));
+  g.addColorStop(1, shadeN(skyBot[cond] ?? 0x64B5E8, bright));
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, SCREEN_W, top);
+
+  const dp = (s.time && typeof s.time.day_progress === 'number') ? s.time.day_progress : 0.5;
+
+  if (bright < 0.55) {
+    const a = (0.55 - bright) / 0.55;
+    for (let i = 0; i < 50; i++) {
+      const x = (i * 101) % SCREEN_W;
+      const y = 3 + ((i * 53) % Math.max(1, top - 26));
+      const tw = 0.55 + 0.45 * Math.sin(animTick * 0.07 + i * 0.13);
+      ctx.fillStyle = `rgba(220,230,255,${(a * tw).toFixed(2)})`;
+      ctx.fillRect(x, y, 1, 1);
+    }
+  }
+
+  const alt = Math.sin(Math.PI * clamp(dp, 0, 1));
+  const cx = SCREEN_W * clamp(dp, 0, 1);
+  const cy = (top - 14) - alt * (top - 26);
+  if (dp > 0.22 && dp < 0.78) {
+    fillEllipseC(cx, cy, 13, 13, shadeN(0xFFE680, Math.max(bright, 0.7)));
+    fillEllipseC(cx, cy, 9, 9, shadeN(0xFFF0A0, Math.max(bright, 0.85)));
+    fillEllipseC(cx, cy, 5, 5, '#ffffff');
+  } else {
+    fillEllipseC(cx, cy, 8, 8, '#EEEEFF');
+    fillEllipseC(cx + 3, cy - 2, 8, 8, shadeN(base, bright)); // carve crescent
+  }
+
+  if (cond === 1 || cond === 2 || cond === 5 || cond === 6) {
+    const cc = cond === 2 ? 0xBBBBCC : cond === 5 ? 0xCCDDEE : cond === 6 ? 0xBBCCDD : 0xEEEEFF;
+    const n = (cond === 2 || cond === 6) ? 4 : 2;
+    const col = shadeN(cc, bright);
+    for (let i = 0; i < n; i++) {
+      const cxp = ((i * 230 + animTick * 0.3) % (SCREEN_W + 140)) - 70;
+      drawCloud(cxp, 14 + (i % 2) * 12, 70, 26, col);
+    }
+  }
+}
+
+function drawCloud(cx, cy, cw, ch, style) {
+  fillEllipseC(cx, cy - ch * 0.28, cw * 0.50, ch * 0.32, style);
+  fillEllipseC(cx - cw * 0.08, cy - ch * 0.62, cw * 0.26, ch * 0.42, style);
+}
+
+// ── Water: counter-travelling sine bands for a shimmering light effect ──
+function drawWater(top, bright) {
+  for (let y = top; y < SCREEN_H; y += 3) {
+    const fy = y - top;
+    const w = Math.sin(fy * 0.040 + animTick * 0.10) * 14.0 + Math.sin(fy * 0.016 - animTick * 0.034) * 8.0;
+    const g = clamp(0x30 + Math.round(w * 0.4), 0, 255);
+    const b = clamp(0x60 + Math.round(w), 0, 255);
+    ctx.fillStyle = `rgb(0,${Math.round(g * bright)},${Math.round(b * bright)})`;
+    ctx.fillRect(0, y, SCREEN_W, 3);
+  }
+}
+
+// ── Sand: filled terrain contour with a darker top edge for definition ──
+function drawSand(bright) {
+  ctx.fillStyle = shadeN(0xC8A050, bright);
+  ctx.beginPath();
+  ctx.moveTo(0, SCREEN_H);
+  ctx.lineTo(0, terrainY[0]);
+  for (let x = 1; x < SCREEN_W; x++) ctx.lineTo(x, terrainY[x]);
+  ctx.lineTo(SCREEN_W - 1, terrainY[SCREEN_W - 1]);
+  ctx.lineTo(SCREEN_W, SCREEN_H);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = shadeN(0x9A7838, bright);
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(0, terrainY[0]);
+  for (let x = 1; x < SCREEN_W; x++) ctx.lineTo(x, terrainY[x]);
+  ctx.stroke();
+}
+
+// ── Tank rim / glass over the waterline seam ──
+function drawRim(top, bright) {
+  const b = Math.max(bright, 0.5);
+  frect(0, top - 22, SCREEN_W, 12, mul(0x484848, b));
+  frect(0, top - 22, SCREEN_W, 1, mul(0xB0B0B0, b));
+  frect(0, top - 11, SCREEN_W, 1, mul(0x202020, b));
+  frect(0, top - 10, SCREEN_W, 9, mul(0x2E6888, b));
+  frect(0, top - 10, SCREEN_W, 2, mul(0xAADDEE, b));
+  frect(0, top - 4, SCREEN_W, 2, mul(0x5098B8, b));
+  frect(0, top - 2, SCREEN_W, 1, mul(0x88CCDD, b));
+  frect(0, top - 1, SCREEN_W, 1, mul(0xDDEEFF, b));
+  frect(0, top, SCREEN_W, 4, mul(0x061018, b));
+}
+// Scale a 24-bit color by a factor, returning a 24-bit int (for frect/etc.).
+function mul(n, f) {
+  const r = clamp(Math.round(((n >> 16) & 0xff) * f), 0, 255);
+  const g = clamp(Math.round(((n >> 8) & 0xff) * f), 0, 255);
+  const bl = clamp(Math.round((n & 0xff) * f), 0, 255);
+  return (r << 16) | (g << 8) | bl;
+}
+
+// ── Plants — three families, each with its own sway, port from the device ──
+function drawBgPlants(plants, bright) {
+  if (!Array.isArray(plants.bg)) return;
+  const stem = shadeN(0x0D3318, bright), leaf = shadeN(0x163D20, bright);
+  plants.bg.forEach((p, i) => {
+    const segs = p.segs || 6;
+    if ((p.type || 0) === 0) {
+      const sx = [p.x], sy = [SCREEN_H - 20];
+      for (let s = 1; s <= segs; s++) {
+        sx[s] = p.x + Math.sin(animTick * 0.035 + i * 1.60 + s * 0.42) * s * 1.1;
+        sy[s] = SCREEN_H - 20 - s * 15;
+      }
+      ctx.strokeStyle = stem; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(sx[0], sy[0]);
+      for (let s = 1; s <= segs; s++) ctx.lineTo(sx[s], sy[s]);
+      ctx.stroke();
+      for (let s = 1; s < segs; s++) {
+        const lx = (sx[s - 1] + sx[s]) / 2, ly = (sy[s - 1] + sy[s]) / 2 - 2;
+        const side = (s % 2 === 0) ? 1 : -1, rx = 4 + (s % 2);
+        fillEllipseC(lx + side * rx, ly, rx, 2, leaf);
+      }
+    } else {
+      const tipSway = Math.sin(animTick * 0.028 + i * 1.85) * 3.0;
+      ctx.strokeStyle = stem; ctx.lineWidth = 1;
+      for (let s = 0; s < segs; s++) {
+        const t = s / segs, tn = (s + 1) / segs;
+        const cy = SCREEN_H - 20 - s * 15;
+        seg(p.x + tipSway * t, cy, p.x + tipSway * tn, cy - 15);
+      }
+      ctx.strokeStyle = leaf;
+      for (let s = 0; s <= segs; s++) {
+        const t = s / segs, cx = p.x + tipSway * t, cy = SCREEN_H - 20 - s * 15;
+        const nl = (1 - t * 0.65) * 9;
+        if (nl > 1) { seg(cx, cy, cx - nl, cy - 1); seg(cx, cy, cx + nl, cy - 1); }
+      }
+    }
+  });
+}
+
+function drawLeaf(cx, cy, side, rx, ry, leafCol, stemCol) {
+  const lx = cx + side * (rx + 2);
+  fillEllipseC(lx, cy, rx, ry, leafCol);
+  ctx.strokeStyle = stemCol; ctx.lineWidth = 1; seg(cx, cy, lx, cy);
+}
+
+// Branch placement is random per-device (not in telemetry) → derive it
+// deterministically from the plant x so it's stable frame-to-frame.
+function seaweedBranches(x, segs) {
+  const n = 1 + (x % 2);
+  const out = [];
+  for (let b = 0; b < n; b++) {
+    const at = 2 + (((x >> (b * 3)) >>> 0) % Math.max(1, segs - 2));
+    out.push({ at, side: ((x >> b) & 1) ? 1 : -1 });
+  }
+  return out;
+}
+
+function drawSeaweed(plants, bright) {
+  if (!Array.isArray(plants.weeds)) return;
+  const stem = shadeN(0x00AA44, bright), leaf = shadeN(0x33DD66, bright);
+  plants.weeds.forEach((w, i) => {
+    const segs = w.segs || 6;
+    const sx = [w.x], sy = [SCREEN_H - 20];
+    for (let s = 1; s <= segs; s++) {
+      sx[s] = w.x + Math.sin(animTick * 0.05 + i * 1.20 + s * 0.45) * s * 2.0;
+      sy[s] = SCREEN_H - 20 - s * 14;
+    }
+    ctx.strokeStyle = stem; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(sx[0], sy[0]);
+    for (let s = 1; s <= segs; s++) ctx.lineTo(sx[s], sy[s]);
+    ctx.stroke();
+    for (let s = 1; s < segs; s++) {
+      const lx = (sx[s - 1] + sx[s]) / 2, ly = (sy[s - 1] + sy[s]) / 2 - 2;
+      drawLeaf(lx, ly, (s % 2 === 0) ? 1 : -1, 5 + (s % 3), 3, leaf, stem);
+    }
+    for (const br of seaweedBranches(w.x, segs)) {
+      if (br.at >= segs) continue;
+      let bx = sx[br.at], byy = sy[br.at];
+      for (let s = 1; s <= 3; s++) {
+        const sway = Math.sin(animTick * 0.05 + i * 1.20 + (br.at + s) * 0.45) * (br.at + s) * 1.5;
+        const nx = w.x + sway + br.side * s * 12, ny = byy - s * 12;
+        ctx.strokeStyle = stem; ctx.lineWidth = 2; seg(bx, byy, nx, ny);
+        drawLeaf((bx + nx) / 2, (byy + ny) / 2 - 1, br.side, 4, 2, leaf, stem);
+        bx = nx; byy = ny;
+      }
+    }
+  });
+}
+
+function drawFgHornwort(plants, bright) {
+  if (!Array.isArray(plants.hornwort)) return;
+  const stem = shadeN(0x00AA44, bright), leaf = shadeN(0x33DD66, bright);
+  plants.hornwort.forEach((h, i) => {
+    const segs = h.segs || 5;
+    const tipSway = Math.sin(animTick * 0.05 + i * 1.30) * 5.0;
+    ctx.strokeStyle = stem; ctx.lineWidth = 2;
+    for (let s = 0; s < segs; s++) {
+      const t = s / segs, tn = (s + 1) / segs, cy = SCREEN_H - 20 - s * 14;
+      seg(h.x + tipSway * t, cy, h.x + tipSway * tn, cy - 14);
+    }
+    ctx.strokeStyle = leaf; ctx.lineWidth = 1;
+    for (let s = 0; s <= segs; s++) {
+      const t = s / segs, cx = h.x + tipSway * t, cy = SCREEN_H - 20 - s * 14;
+      const nl = (1 - t * 0.60) * 13;
+      if (nl > 1) { seg(cx, cy, cx - nl, cy - 2); seg(cx, cy, cx + nl, cy - 2); }
+    }
+  });
+}
+
+// ── Fish cast soft shadows on the sand directly below them ──
+function drawShadows(fishArr) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(74,48,16,0.45)';
+  for (const f of fishArr) {
+    const type = f.type || 0, z = f.z || 0;
+    if ((type === 1 || type === 2 || type === 3) && z > 0.78) continue;
+    const sx = projX(f.x, z), fy = projY(f.y, z);
+    const gnd = terrainY[clamp(Math.round(sx), 0, SCREEN_W - 1)];
+    const dist = gnd - fy;
+    if (dist <= 0) continue;
+    let scale = 1 - dist / 300; if (scale < 0.12) scale = 0.12;
+    const rx = Math.max(1, fishHW(f) * scale), ry = Math.max(1, 3 * fishTS(f) * scale);
+    ctx.beginPath(); ctx.ellipse(sx, gnd - 1, rx, ry, 0, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+}
+
+// ── Decorative bubbles (not in telemetry) — local sim, like the device ──
+const bubbles = Array.from({ length: 20 }, () => ({
+  x: Math.random() * SCREEN_W,
+  y: TANK_TOP + Math.random() * (SCREEN_H - TANK_TOP),
+  spd: 0.8 + Math.random() * 1.7,
+  r: 3 + Math.floor(Math.random() * 6),
+  ph: Math.random() * Math.PI * 2,
+}));
+function tickBubbles() {
+  for (const b of bubbles) {
+    b.y -= b.spd;
+    b.x = clamp(b.x + Math.sin(animTick * 0.06 + b.ph) * 0.8, 2, SCREEN_W - 2);
+    if (b.y < TANK_TOP) {
+      b.y = SCREEN_H + 10; b.x = Math.random() * SCREEN_W;
+      b.spd = 0.8 + Math.random() * 1.7; b.r = 3 + Math.floor(Math.random() * 6);
+    }
+  }
+}
+function drawBubbles(top) {
+  ctx.strokeStyle = 'rgba(85,204,255,0.7)'; ctx.lineWidth = 1;
+  for (const b of bubbles) {
+    if (b.y - b.r < top) continue;
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2); ctx.stroke();
+    if (b.r > 1) { ctx.beginPath(); ctx.arc(b.x, b.y, b.r - 1, 0, Math.PI * 2); ctx.stroke(); }
+  }
+}
+
+// ── Food flakes — telemetry sends x/y/color only; draw a little cross ──
+function drawFlake(f) {
+  const x = Math.round(f.x), y = Math.round(f.y);
+  ctx.fillStyle = hex(f.color || 0xffaa22);
+  ctx.fillRect(x - 3, y, 7, 1);
+  ctx.fillRect(x, y - 3, 1, 7);
+}
+
+// ── Bottom dwellers ──
+function drawSnail(sn) {
+  const bx = Math.round(sn.x), by = terrainY[clamp(bx, 0, SCREEN_W - 1)];
+  const d = sn.facing_right ? 1 : -1;
+  const BODY = 0xDDB060;
+  fcirc(bx - d * 4, by - 8, 8, 0x7A2E0A);          // shell
+  scirc(bx - d * 3, by - 8, 5, 0xB05020);          // swirl
+  scirc(bx - d * 2, by - 8, 2, 0xB05020);
+  fillEllipseC(bx, by - 3, 12, 3, hex(BODY));        // body
+  fcirc(bx + d * 10, by - 5, 5, BODY);              // head
+  ctx.strokeStyle = hex(BODY); ctx.lineWidth = 1;
+  seg(bx + d * 8, by - 9, bx + d * 6, by - 15);     // eyestalks
+  seg(bx + d * 12, by - 9, bx + d * 14, by - 15);
+  fcirc(bx + d * 6, by - 15, 2, BODY); fcirc(bx + d * 14, by - 15, 2, BODY);
+  fcirc(bx + d * 6, by - 15, 1, 0x111111); fcirc(bx + d * 14, by - 15, 1, 0x111111);
+}
+
+function drawStarfish(st) {
+  const bx = Math.round(st.x), by = terrainY[clamp(bx, 0, SCREEN_W - 1)] - 10;
+  const rot = Math.sin(animTick * 0.018) * 0.18;
+  const px = [], py = [];
+  for (let i = 0; i < 10; i++) {
+    const a = rot - 1.5708 + i * 0.6283, rad = (i % 2 === 0) ? 9 : 4;
+    px[i] = bx + rad * Math.cos(a); py[i] = by + rad * Math.sin(a);
+  }
+  ctx.fillStyle = hex(0xFF6600);
+  for (let i = 0; i < 10; i++) {
+    const j = (i + 1) % 10;
+    ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(px[i], py[i]); ctx.lineTo(px[j], py[j]); ctx.closePath(); ctx.fill();
+  }
+}
+
+// ── Steamboat: hull, cabin, portholes, smokestack + animated smoke ──
+function drawBoat(bxf, top) {
+  const bx = Math.round(bxf);
+  const by = top - 23 + Math.round(Math.sin(animTick * 0.04)); // gentle bob
+  tri(bx + 4, by, bx + 72, by, bx + 38, by + 6, 0x7B3A10);     // keel
+  frect(bx + 2, by - 11, 72, 11, 0xA0522D);                    // hull
+  tri(bx, by, bx + 2, by - 8, bx + 2, by, 0x7B3A10);           // bow
+  tri(bx + 74, by, bx + 74, by - 8, bx + 72, by - 8, 0x7B3A10);// stern
+  frect(bx + 2, by - 11, 72, 2, 0xC07040);                     // hull highlight
+  frect(bx + 2, by - 13, 72, 2, 0xD2B48C);                     // deck rail
+  frect(bx + 16, by - 25, 40, 12, 0xFDF5E6);                   // cabin
+  frect(bx + 14, by - 27, 44, 2, 0x888888);                    // roof
+  ctx.strokeStyle = hex(0xAAAAAA); ctx.lineWidth = 1; ctx.strokeRect(bx + 16, by - 25, 40, 12);
+  fcirc(bx + 26, by - 20, 4, 0x87CEEB); fcirc(bx + 44, by - 20, 4, 0x87CEEB); // portholes
+  scirc(bx + 26, by - 20, 4, 0x555555); scirc(bx + 44, by - 20, 4, 0x555555);
+  frect(bx + 52, by - 37, 8, 14, 0x444444);                    // smokestack
+  frect(bx + 50, by - 39, 12, 3, 0x444444);                    // stack cap
+  for (let p = 0; p < 3; p++) {
+    const phase = (animTick * 0.6 + p * 20) % 60;
+    let sr = 4 - Math.floor(phase / 20); if (sr < 1) sr = 1;
+    const alpha = 180 - phase * 2;
+    const sc = alpha > 150 ? 0xCCCCCC : alpha > 100 ? 0xBBBBBB : 0xAAAAAA;
+    ctx.save();
+    ctx.globalAlpha = clamp(alpha / 255, 0.15, 0.7);
+    fcirc(bx + 55 - phase * 0.6, by - 42 - phase * 0.35, sr + 1, sc);
+    ctx.restore();
+  }
+}
+
+// ── Weather particles over the tank ──
+function drawRain(cond, bright) {
+  ctx.strokeStyle = shadeN(cond === 4 ? 0x7799BB : 0x88AACC, bright);
+  ctx.lineWidth = 1;
+  const N = cond === 4 ? 90 : 60;
+  for (let i = 0; i < N; i++) {
+    const x = (i * 53 + animTick * 1.8) % (SCREEN_W + 20) - 10;
+    const y = (i * 71 + animTick * (9 + (i % 5))) % (SCREEN_H + 20) - 10;
+    seg(x, y, x + 2, y + 5);
+  }
+}
+function drawSnow(bright) {
+  ctx.fillStyle = shadeN(0xEEEEFF, bright);
+  for (let i = 0; i < 70; i++) {
+    const x = (i * 37 + Math.sin(animTick * 0.02 + i) * 8) % SCREEN_W;
+    const y = (i * 59 + animTick * (1.2 + (i % 4) * 0.4)) % SCREEN_H;
+    ctx.fillRect(x, y, 2, 2);
+  }
 }
 
 let selectedId = null;
@@ -156,6 +588,10 @@ const els = {
   viewSub: document.getElementById('view-sub'),
   viewDot: document.getElementById('view-dot'),
   legend: document.getElementById('legend'),
+  conflictBar: document.getElementById('conflict-bar'),
+  conflictDetail: document.getElementById('conflict-detail'),
+  conflictServer: document.getElementById('conflict-server'),
+  conflictLocal: document.getElementById('conflict-local'),
 };
 const ctx = els.canvas.getContext('2d');
 
@@ -185,12 +621,14 @@ function renderList(items) {
     const weather = a.weather ? (WEATHER_NAMES[a.weather.condition] || '?') : '—';
     li.innerHTML = `
       <div class="aq-name">
-        <span class="dot ${a.stale ? 'stale' : 'live'}"></span>${escapeHtml(a.aquarium_id)}
+        <span class="dot ${a.stale ? 'stale' : 'live'}"></span>${escapeHtml(a.aquarium_id)}${a.conflict ? '<span class="aq-conflict">⚠ mismatch</span>' : ''}
       </div>
       <div class="aq-meta">${escapeHtml(a.platform)} · ${a.fishCount} fish · ${weather}</div>`;
     li.onclick = () => select(a.aquarium_id);
     els.list.appendChild(li);
   }
+  // Highlight the first aquarium by default so the view is never empty.
+  if (!selectedId && items.length) select(items[0].aquarium_id);
 }
 
 function select(id) {
@@ -203,6 +641,7 @@ function select(id) {
   highlightedFishId = null;
   legendRows.clear();
   els.legend.innerHTML = '';
+  els.conflictBar.hidden = true;
   els.viewEmpty.hidden = true;
   els.viewContent.hidden = false;
   openStream(id);
@@ -219,14 +658,20 @@ function applySnapshot(snap) {
   // Capture each fish's current predicted position before replacing the snapshot,
   // so we can blend smoothly from there to the new snapshot's trajectory.
   if (latestSnapshot) {
-    const oldElapsed = serverRx - snapshotReceivedAt;
-    const oldFm = latestSnapshot.frame_ms || 50;
+    const oldElapsed = Math.max(0, serverRx - snapshotReceivedAt);
+    const prev = _extrapolateSnapshot(latestSnapshot, oldElapsed);
     _blendFrom.clear();
-    for (const f of (latestSnapshot.fish || [])) {
-      const p = _extrapolateFish(f, Math.max(0, oldElapsed), oldFm);
-      _blendFrom.set(f.id, { x: p.x, y: p.y });
-    }
+    for (const f of (prev.fish || [])) _blendFrom.set(f.id, { x: f.x, y: f.y });
     _blendStartMs = now;
+
+    // Refresh scene-mover velocities from this snapshot interval (px/ms).
+    const dt = Math.max(1, oldElapsed);
+    _sceneVel = {
+      snail: _obsVel(latestSnapshot.snail, snap.snail, dt),
+      starfish: _obsVel(latestSnapshot.starfish, snap.starfish, dt),
+      boat: (latestSnapshot.boat && snap.boat && latestSnapshot.boat.active && snap.boat.active)
+        ? _obsVel(latestSnapshot.boat, snap.boat, dt) : 0,
+    };
   }
   latestSnapshot = snap;
   snapshotReceivedAt = serverRx;
@@ -234,38 +679,10 @@ function applySnapshot(snap) {
   drawTitle(snap);
   drawStats(snap);
   renderLegend(snap);
+  renderConflict(snap);
   setConn(true);
   // Ensure the 60fps canvas loop is running.
   if (!rafId) rafId = requestAnimationFrame(_rafDraw);
-}
-
-// 60fps canvas-only loop — extrapolates fish positions between telemetry frames
-// and blends out the discontinuity at each snapshot boundary.
-function _rafDraw() {
-  rafId = requestAnimationFrame(_rafDraw);
-  if (!latestSnapshot) return;
-  const now = Date.now();
-  const elapsed = now - snapshotReceivedAt;
-  const fm = latestSnapshot.frame_ms || 50;
-
-  const blendAge = _blendStartMs ? now - _blendStartMs : BLEND_MS;
-  if (blendAge >= BLEND_MS) {
-    drawTank(_extrapolateSnapshot(latestSnapshot, elapsed));
-    return;
-  }
-  // Smooth step: s goes 0→1 over BLEND_MS with ease-in-out curve.
-  const s = (blendAge / BLEND_MS) ** 2 * (3 - 2 * (blendAge / BLEND_MS));
-  const fish = latestSnapshot.fish.map((f) => {
-    const ext = _extrapolateFish(f, elapsed, fm);
-    const prev = _blendFrom.get(f.id);
-    if (!prev) return ext;
-    return {
-      ...ext,
-      x: Math.round(prev.x + (ext.x - prev.x) * s),
-      y: Math.round(prev.y + (ext.y - prev.y) * s),
-    };
-  });
-  drawTank({ ...latestSnapshot, fish });
 }
 
 // ─── SSE stream for the selected aquarium ────────────────────────────────────
@@ -371,18 +788,37 @@ function drawSilhouetteFish(x, y, size) {
 }
 
 // ─── Rendering ───────────────────────────────────────────────────────────────
-// Single 60fps rAF loop: ticks EAC animation and redraws the canvas with
-// physics-extrapolated fish positions. Title/stats/legend update at SSE rate
-// (≤1 Hz) from applySnapshot — no need to touch the DOM every frame.
+// Single 60fps rAF loop: advances decorative animations (EAC, bubbles, sway via
+// animTick), extrapolates fish positions between telemetry frames, and blends
+// out the discontinuity at each snapshot boundary so motion stays smooth.
+// Title/stats/legend update at SSE rate (≤1 Hz) from applySnapshot.
 function _rafDraw() {
   rafId = requestAnimationFrame(_rafDraw);
+  const now = Date.now();
+  animTick = now / 50;            // device "tick" units (one per frame at 50ms)
+  _frameCount++;
+  tickEac(_frameCount);
+  tickBubbles();
   eacBright = latestSnapshot
     ? dayTint(latestSnapshot.time && latestSnapshot.time.day_progress)
     : 0.5;
-  tickEac(_frameCount++);
   if (!latestSnapshot) return;
-  const elapsed = Date.now() - snapshotReceivedAt;
-  drawTank(_extrapolateSnapshot(latestSnapshot, elapsed));
+
+  const elapsed = now - snapshotReceivedAt;
+  const ext = _extrapolateSnapshot(latestSnapshot, elapsed);
+
+  const blendAge = _blendStartMs ? now - _blendStartMs : BLEND_MS;
+  if (blendAge >= BLEND_MS) { drawTank(ext); return; }
+
+  // Smooth-step blend from the positions captured when this snapshot arrived.
+  const r = blendAge / BLEND_MS;
+  const sFac = r * r * (3 - 2 * r);
+  const fish = ext.fish.map((f) => {
+    const prev = _blendFrom.get(f.id);
+    if (!prev) return f;
+    return { ...f, x: prev.x + (f.x - prev.x) * sFac, y: prev.y + (f.y - prev.y) * sFac };
+  });
+  drawTank({ ...ext, fish });
 }
 
 // Full re-render (called on highlight toggle, etc.) — extrapolates fish to now.
@@ -481,6 +917,41 @@ function formatAge(ms) {
   return Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
 }
 
+function fmtCounts(c) {
+  if (!c) return '—';
+  return `pair ${c.pair || 0} · school ${c.school || 0}/${c.school2 || 0} · angel ${c.angel || 0}`;
+}
+
+// Show/hide the profile-mismatch banner from the snapshot's _conflict field.
+function renderConflict(s) {
+  const c = s && s._conflict;
+  if (!c) { els.conflictBar.hidden = true; return; }
+  els.conflictBar.hidden = false;
+  els.conflictDetail.textContent =
+    `This device reports a different tank than the server's saved profile — ` +
+    `saved: ${fmtCounts(c.savedCounts)}; device: ${fmtCounts(c.deviceCounts)}.`;
+}
+
+async function resolveConflict(choice) {
+  if (!selectedId) return;
+  els.conflictServer.disabled = els.conflictLocal.disabled = true;
+  try {
+    await fetch(`api/aquariums/${encodeURIComponent(selectedId)}/resolve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ choice }),
+    });
+    els.conflictBar.hidden = true; // optimistic; the next snapshot confirms
+  } catch {
+    /* leave the banner up so the user can retry */
+  } finally {
+    els.conflictServer.disabled = els.conflictLocal.disabled = false;
+  }
+}
+
+els.conflictServer.addEventListener('click', () => resolveConflict('server'));
+els.conflictLocal.addEventListener('click', () => resolveConflict('local'));
+
 function drawTitle(s) {
   els.viewName.textContent = s.aquarium_id || selectedId || '—';
   const weather = s.weather ? (WEATHER_NAMES[s.weather.condition] || '') : '';
@@ -503,125 +974,100 @@ function hex(rgb) {
 }
 
 function drawTank(s) {
-  const w = SCREEN_W, h = SCREEN_H, top = (s.screen && s.screen.tank_top) || TANK_TOP;
+  const top = (s.screen && s.screen.tank_top) || TANK_TOP;
   const bright = dayTint(s.time && s.time.day_progress);
-
-  // Sky strip (weather-tinted, dimmed by time of day)
-  const skyCols = ['#1a78c8', '#2288cc', '#556677', '#334455', '#111827', '#8090a0', '#7a8a98'];
   const cond = (s.weather && s.weather.condition) || 0;
-  ctx.fillStyle = shade(skyCols[cond] || '#1a78c8', bright);
-  ctx.fillRect(0, 0, w, top);
 
-  // Water
-  const grd = ctx.createLinearGradient(0, top, 0, h);
-  grd.addColorStop(0, shade('#0a4a80', bright));
-  grd.addColorStop(1, shade('#022038', bright));
-  ctx.fillStyle = grd;
-  ctx.fillRect(0, top, w, h - top);
+  drawSky(top, bright, cond, s);   // gradient + sun/moon + stars + clouds
+  drawWater(top, bright);          // shimmering light bands
+  drawSand(bright);                // bumpy terrain bed
+  drawRim(top, bright);            // metal frame + glass over the waterline
 
-  // Sand floor
-  ctx.fillStyle = shade('#c8a050', bright);
-  ctx.fillRect(0, h - 40, w, 40);
-
-  // Plants (static decor) as simple stems
-  if (s.plants) {
-    ctx.strokeStyle = shade('#1f8a3a', bright);
-    ctx.lineWidth = 3;
-    for (const grp of [s.plants.bg, s.plants.weeds, s.plants.hornwort]) {
-      if (!Array.isArray(grp)) continue;
-      for (const p of grp) {
-        const segs = p.segs || 5;
-        ctx.beginPath();
-        ctx.moveTo(p.x, h - 40);
-        ctx.lineTo(p.x, h - 40 - segs * 13);
-        ctx.stroke();
-      }
-    }
+  if (s.plants) {                  // back-to-front plant layers, each swaying
+    drawBgPlants(s.plants, bright);
+    drawSeaweed(s.plants, bright);
+    drawFgHornwort(s.plants, bright);
   }
 
-  // Food flakes
-  if (Array.isArray(s.flakes)) {
-    for (const f of s.flakes) {
-      ctx.fillStyle = hex(f.color || 0xffaa22);
-      ctx.beginPath();
-      ctx.arc(f.x, f.y, 3, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
+  drawEacZone(bright);             // background traffic silhouettes
 
-  // EAC silhouette fish (background layer, before foreground fish)
-  drawEacZone(bright);
-
-  // Fish
   if (Array.isArray(s.fish)) {
-    for (const f of s.fish) drawFish(f);
+    drawShadows(s.fish);
+    // Far (deeper) fish first so nearer fish overlap them correctly.
+    const ordered = s.fish.slice().sort((a, b) => (b.z || 0) - (a.z || 0));
+    for (const f of ordered) drawFish(f);
   }
 
-  // Snail / starfish on the floor
-  if (s.snail) drawMarker(s.snail.x, h - 46, '#b8946a', 7);
-  if (s.starfish) drawMarker(s.starfish.x, h - 44, '#ff7755', 8);
+  drawBubbles(top);
+  if (Array.isArray(s.flakes)) for (const f of s.flakes) drawFlake(f);
+  if (s.snail) drawSnail(s.snail);
+  if (s.starfish) drawStarfish(s.starfish);
+  if (s.boat && s.boat.active) drawBoat(s.boat.x, top);
 
-  // Boat on the rim
-  if (s.boat && s.boat.active) {
-    ctx.fillStyle = '#caa05a';
-    ctx.fillRect(s.boat.x, top - 14, 40, 12);
-  }
+  if (cond === 3 || cond === 4) drawRain(cond, bright);
+  else if (cond === 5) drawSnow(bright);
 }
 
+// Fish are the device's signature ASCII glyphs, perspective-projected by depth.
 function drawFish(f) {
-  const size = f.type === 3 ? 16 : f.type === 0 ? 13 : 10; // angel bigger, school smaller
+  const type = f.type || 0, z = f.z || 0;
+  const sx = projX(f.x, z), sy = projY(f.y, z);
+  const ts = fishTS(f);
+  const fontPx = Math.max(8, Math.round(9 * ts));
+  const col = hex(f.color || 0x00ee66);
+  const hw = fishHW(f);
 
-  // Highlight ring + name label for the legend-selected fish.
   if (f.id === highlightedFishId) {
     ctx.save();
     ctx.strokeStyle = '#ffffff';
     ctx.lineWidth = 2;
     ctx.setLineDash([4, 3]);
     ctx.beginPath();
-    ctx.arc(f.x, f.y, size + 9, 0, Math.PI * 2);
+    ctx.arc(sx, sy, hw + 10, 0, Math.PI * 2);
     ctx.stroke();
     ctx.restore();
   }
+
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  // Angelfish dorsal + ventral fins (single chars, above/below the body).
+  if (type === 3) {
+    ctx.fillStyle = col;
+    ctx.font = 'bold 9px "Courier New", monospace';
+    ctx.fillText(f.facing_right ? '\\' : '/', sx, sy - fontPx * 0.7);
+    ctx.fillText(f.facing_right ? '/' : '\\', sx, sy + fontPx * 0.7);
+  }
+
+  const glyph = type === 0
+    ? (f.facing_right ? '><(o>' : '<o(><')
+    : (f.facing_right ? '><>' : '<><');
+  ctx.font = `bold ${fontPx}px "Courier New", monospace`;
+  // Dark outline keeps bright fish legible over the busy water/plants.
+  ctx.lineWidth = Math.max(1, fontPx * 0.12);
+  ctx.strokeStyle = 'rgba(0,18,34,0.55)';
+  ctx.strokeText(glyph, sx, sy);
+  ctx.fillStyle = col;
+  ctx.fillText(glyph, sx, sy);
+
+  if (f.going_for_food) {
+    ctx.fillStyle = '#ffee44';
+    ctx.beginPath();
+    ctx.arc(sx + hw * 0.5, sy - fontPx * 0.5, 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+
   if (f.name) {
     ctx.save();
     ctx.font = '12px system-ui, sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillStyle = f.id === highlightedFishId ? '#ffffff' : 'rgba(230,240,255,0.85)';
-    ctx.fillText(f.name, f.x, f.y - size - 8);
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = f.id === highlightedFishId ? '#ffffff' : '#CCE6FF';
+    ctx.fillText(f.name, sx, sy - fontPx * 0.8 - 6);
     ctx.restore();
   }
-
-  const dir = f.facing_right ? 1 : -1;
-  ctx.save();
-  ctx.translate(f.x, f.y);
-  ctx.scale(dir, 1);
-  ctx.fillStyle = hex(f.color || 0x00ee66);
-  // body
-  ctx.beginPath();
-  ctx.ellipse(0, 0, size, size * 0.55, 0, 0, Math.PI * 2);
-  ctx.fill();
-  // tail
-  ctx.beginPath();
-  ctx.moveTo(-size, 0);
-  ctx.lineTo(-size - size * 0.7, -size * 0.5);
-  ctx.lineTo(-size - size * 0.7, size * 0.5);
-  ctx.closePath();
-  ctx.fill();
-  // food indicator
-  if (f.going_for_food) {
-    ctx.fillStyle = '#ffee44';
-    ctx.beginPath();
-    ctx.arc(size * 0.5, -size * 0.4, 2, 0, Math.PI * 2);
-    ctx.fill();
-  }
-  ctx.restore();
-}
-
-function drawMarker(x, y, color, r) {
-  ctx.fillStyle = color;
-  ctx.beginPath();
-  ctx.arc(x, y, r, 0, Math.PI * 2);
-  ctx.fill();
 }
 
 // Multiply a #rrggbb color by a 0..1 brightness factor.

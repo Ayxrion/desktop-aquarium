@@ -1291,6 +1291,52 @@ void drawMenu() {
     }
 }
 
+// ── Profile-mismatch modal ───────────────────────────────────────────────────
+// Shown when the device's local profile differs from the server's saved one
+// (raised by telemetry.h). Two buttons: adopt the server's profile, or keep the
+// local one (and have the server adopt it). Geometry is shared with the loop()
+// hit-test below.
+#define PM_W      380
+#define PM_H      170
+#define PM_X      ((SCREEN_W - PM_W) / 2)
+#define PM_Y      ((SCREEN_H - PM_H) / 2)
+#define PM_BTN_W  150
+#define PM_BTN_H  34
+#define PM_BTN_Y  (PM_Y + PM_H - 46)
+#define PM_BTN1_X (PM_X + 24)                       // USE SERVER
+#define PM_BTN2_X (PM_X + PM_W - 24 - PM_BTN_W)     // KEEP LOCAL
+
+void drawProfileModal() {
+    if (!telemetryConflictPending.load()) return;
+    canvas.fillRect(PM_X,     PM_Y,     PM_W,     PM_H,     0x201A0AUL);
+    canvas.drawRect(PM_X,     PM_Y,     PM_W,     PM_H,     0xD9A441UL);
+    canvas.drawRect(PM_X + 1, PM_Y + 1, PM_W - 2, PM_H - 2, 0x3A2E10UL);
+
+    canvas.setTextSize(2); canvas.setTextColor(0xFFD166UL);
+    canvas.setCursor(PM_X + 20, PM_Y + 14); canvas.print("PROFILE MISMATCH");
+
+    canvas.setTextSize(1); canvas.setTextColor(0xFFE9B8UL);
+    canvas.setCursor(PM_X + 20, PM_Y + 46);
+    canvas.print("Server has a different saved tank.");
+    char line[80];
+    snprintf(line, sizeof(line), "Local:  pair %d  school %d/%d  angel %d",
+             numPair, numSchool, numSchool2, numAngel);
+    canvas.setCursor(PM_X + 20, PM_Y + 64); canvas.print(line);
+    snprintf(line, sizeof(line), "Server: pair %d  school %d/%d  angel %d",
+             telemetrySrvPair, telemetrySrvSchool, telemetrySrvSchool2, telemetrySrvAngel);
+    canvas.setCursor(PM_X + 20, PM_Y + 80); canvas.print(line);
+
+    canvas.fillRect(PM_BTN1_X, PM_BTN_Y, PM_BTN_W, PM_BTN_H, 0x115522UL);
+    canvas.drawRect(PM_BTN1_X, PM_BTN_Y, PM_BTN_W, PM_BTN_H, 0x33CC66UL);
+    canvas.setTextColor(0xCCFFDDUL);
+    canvas.setCursor(PM_BTN1_X + 30, PM_BTN_Y + 13); canvas.print("USE SERVER");
+
+    canvas.fillRect(PM_BTN2_X, PM_BTN_Y, PM_BTN_W, PM_BTN_H, 0x33240AUL);
+    canvas.drawRect(PM_BTN2_X, PM_BTN_Y, PM_BTN_W, PM_BTN_H, 0xD9A441UL);
+    canvas.setTextColor(0xFFE9B8UL);
+    canvas.setCursor(PM_BTN2_X + 30, PM_BTN_Y + 13); canvas.print("KEEP LOCAL");
+}
+
 // Small failure badge drawn in the tank view when telemetry publishing is on
 // but recent POSTs are failing. Blinks to draw attention.
 void drawTelemetryStatus() {
@@ -1328,7 +1374,15 @@ void loop() {
     uint16_t tx = 0, ty = 0;
     bool touched = display.getTouch(&tx, &ty);
     if (touched && !lastTouched) {
-        if (tx >= HBTN_X && tx < (uint16_t)(HBTN_X + HBTN_W) &&
+        if (telemetryConflictPending.load()) {
+            // Modal is up — only its two buttons respond; swallow other taps.
+            if (tx >= PM_BTN1_X && tx < (uint16_t)(PM_BTN1_X + PM_BTN_W) &&
+                ty >= PM_BTN_Y  && ty < (uint16_t)(PM_BTN_Y + PM_BTN_H))
+                telemetryResolveUseServer();
+            else if (tx >= PM_BTN2_X && tx < (uint16_t)(PM_BTN2_X + PM_BTN_W) &&
+                     ty >= PM_BTN_Y  && ty < (uint16_t)(PM_BTN_Y + PM_BTN_H))
+                telemetryResolveKeepLocal();
+        } else if (tx >= HBTN_X && tx < (uint16_t)(HBTN_X + HBTN_W) &&
             ty >= HBTN_Y && ty < (uint16_t)(HBTN_Y + HBTN_H)) {
             menuOpen = !menuOpen;
         } else if (menuOpen) {
@@ -1373,6 +1427,7 @@ void loop() {
                     if (telemetryEnabled) {   // start clean — clear any stale error
                         telemetryEverTried = false;
                         telemetryLastOk    = true;
+                        telemetryReenableCheck(); // prompt if server profile differs
                     }
                 }
             }
@@ -1394,6 +1449,7 @@ void loop() {
     }
     updateWeatherEffects();
     telemetryUpdate();
+    telemetryProcessFlags();   // act on server directives (rebuild / re-check)
     updateBoat();
     updateSnail();
     updateStarfish();
@@ -1417,6 +1473,7 @@ void loop() {
     drawTelemetryStatus();
     drawMenuButton();
     drawMenu();
+    drawProfileModal();
     canvas.pushSprite(0, 0);
 }
 

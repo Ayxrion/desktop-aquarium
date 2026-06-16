@@ -103,6 +103,10 @@ const aquariums = new Map();
     if (!row.snapshot) continue;
     const entry = {
       snapshot: row.snapshot,
+      saved: row.snapshot,                  // persisted snapshot is the baseline
+      savedSig: profileSig(row.snapshot),
+      conflict: null,
+      pendingDirective: null,
       lastSeenMs: row.lastSeenMs,
       createdAt: row.createdAt,
       names: row.names,           // Map<fishId, name> from DB
@@ -141,10 +145,39 @@ function sanitizeName(name) {
 function getOrCreate(id) {
   let entry = aquariums.get(id);
   if (!entry) {
-    entry = { snapshot: null, lastSeenMs: 0, createdAt: now(), names: new Map(), meta: new Map() };
+    entry = {
+      snapshot: null, lastSeenMs: 0, createdAt: now(),
+      names: new Map(), meta: new Map(),
+      saved: null,            // source-of-truth snapshot (profile baseline)
+      savedSig: null,         // profileSig(saved)
+      conflict: null,         // { savedSig, deviceSig, savedCounts, deviceCounts, since }
+      pendingDirective: null, // one-shot line for the device's next POST response
+    };
     aquariums.set(id, entry);
   }
   return entry;
+}
+
+// Canonical profile signature: the aquarium's *composition* (not positions) —
+// per-type counts, each fish's id/type/color, and the plant layout. The device
+// builds the identical string so the two can be compared byte-for-byte. Changing
+// fish counts/types/colors or the plant set changes the signature; fish merely
+// swimming does not.
+function profileSig(s) {
+  if (!s) return '';
+  const c = s.counts || {};
+  const fish = (Array.isArray(s.fish) ? s.fish.slice() : []).sort((a, b) => (a.id || 0) - (b.id || 0));
+  const pl = s.plants || {};
+  const bg = Array.isArray(pl.bg) ? pl.bg : [];
+  const wd = Array.isArray(pl.weeds) ? pl.weeds : [];
+  const hw = Array.isArray(pl.hornwort) ? pl.hornwort : [];
+  return [
+    `P:${c.pair || 0},${c.school || 0},${c.school2 || 0},${c.angel || 0}`,
+    'F:' + fish.map((f) => `${f.id | 0}:${f.type || 0}:${(f.color >>> 0) || 0}`).join('|'),
+    'BG:' + bg.map((p) => `${p.x | 0}:${p.segs | 0}:${p.type || 0}`).join('|'),
+    'WD:' + wd.map((p) => `${p.x | 0}:${p.segs | 0}`).join('|'),
+    'HW:' + hw.map((p) => `${p.x | 0}:${p.segs | 0}`).join('|'),
+  ].join(';');
 }
 
 // Update per-fish age metadata from a snapshot's fish list.
@@ -178,7 +211,12 @@ function enrich(entry) {
         };
       })
     : [];
-  return { ...s, fish, _lastSeenMs: entry.lastSeenMs, _stale: isStale(entry.lastSeenMs) };
+  return {
+    ...s, fish,
+    _lastSeenMs: entry.lastSeenMs,
+    _stale: isStale(entry.lastSeenMs),
+    _conflict: entry.conflict || null,
+  };
 }
 
 // Like enrich() but also extrapolates positions forward from lastSeenMs.
@@ -203,6 +241,12 @@ function broadcast(entry) {
 }
 
 // Insert/replace the snapshot for an aquarium and notify SSE subscribers.
+//
+// The server is the source of truth for the aquarium *profile* (composition).
+// We always keep the latest live snapshot for the dashboard, but the persisted
+// `saved` baseline is only advanced when the incoming profile still matches it
+// (or on first sight). If a device reports a different profile, we flag a
+// conflict and leave the saved baseline untouched until the user resolves it.
 function upsert(snapshot) {
   const id = snapshot.aquarium_id;
   if (!aquariums.has(id) && aquariums.size >= MAX_AQUARIUMS) {
@@ -210,10 +254,34 @@ function upsert(snapshot) {
   }
   const entry = getOrCreate(id);
   const t = now();
-  entry.snapshot = snapshot;
+  const sig = profileSig(snapshot);
+
+  entry.snapshot = snapshot;     // live view, always current
   entry.lastSeenMs = t;
   if (Array.isArray(snapshot.fish)) updateFishMeta(entry, snapshot.fish);
-  db.saveSnapshot(id, snapshot, t, entry.createdAt);
+
+  if (!entry.saved) {
+    // First sighting → seed the source-of-truth baseline.
+    entry.saved = snapshot;
+    entry.savedSig = sig;
+    entry.conflict = null;
+    db.saveSnapshot(id, snapshot, t, entry.createdAt);
+  } else if (sig === entry.savedSig) {
+    // Profile unchanged → keep the baseline fresh and clear any prior conflict.
+    entry.saved = snapshot;
+    entry.conflict = null;
+    db.saveSnapshot(id, snapshot, t, entry.createdAt);
+  } else {
+    // Profile diverged → record the conflict without overwriting the baseline.
+    entry.conflict = {
+      savedSig: entry.savedSig,
+      deviceSig: sig,
+      savedCounts: (entry.saved && entry.saved.counts) || null,
+      deviceCounts: snapshot.counts || null,
+      since: (entry.conflict && entry.conflict.since) || t,
+    };
+  }
+
   broadcast(entry);
   return { ok: true };
 }
@@ -225,6 +293,14 @@ function getNamesText(id) {
   const entry = aquariums.get(id);
   if (!entry) return '';
   const lines = [];
+  // Control directives (no tab → the device's name parser skips them, but the
+  // device scans for them explicitly). One-shot: cleared once delivered.
+  if (entry.pendingDirective) {
+    lines.push(`!${entry.pendingDirective.toUpperCase()}`);
+    entry.pendingDirective = null;
+  } else if (entry.conflict) {
+    lines.push('!CONFLICT'); // device shows its on-screen prompt
+  }
   for (const [fishId, name] of entry.names) lines.push(`${fishId}\t${name}`);
   return lines.join('\n');
 }
@@ -257,6 +333,7 @@ function list() {
       fishCount,
       counts,
       weather: s.weather || null,
+      conflict: !!entry.conflict,
     });
   }
   out.sort((a, b) => a.aquarium_id.localeCompare(b.aquarium_id));
@@ -272,31 +349,53 @@ function get(id) {
 // Bootstrap response for a device that just booted. Returns the last-persisted
 // snapshot with names embedded in each fish object so the device can restore
 // positions and names in one call. Returns null if no record exists yet.
+// On-boot / re-enable handshake for a device. Returns the saved source-of-truth
+// profile (composition + last positions + names) plus its signature, so the
+// device can both restore state and detect whether its local profile diverges.
 function bootstrap(id) {
-  // Prefer in-memory (may have names set since last snapshot), fall back to DB.
   const entry = aquariums.get(id);
-  if (!entry || !entry.snapshot) {
-    // Try DB directly in case the server just restarted and hasn't received a
-    // telemetry post yet (loadAll already ran, so this is a true miss).
-    return null;
-  }
-  const s = entry.snapshot;
-  const snapshotAgeMs = now() - entry.lastSeenMs;
-  const fish = Array.isArray(s.fish)
-    ? s.fish.map((f) => ({
-        ...f,
-        name: entry.names.get(f.id) || null,
-      }))
+  const base = entry && (entry.saved || entry.snapshot);
+  if (!base) return null; // first boot — device keeps its own freshly-made tank
+  const fish = Array.isArray(base.fish)
+    ? base.fish.map((f) => ({ ...f, name: entry.names.get(f.id) || null }))
     : [];
   return {
     exists: true,
     aquarium_id: id,
-    snapshot_age_ms: snapshotAgeMs,
+    snapshot_age_ms: now() - entry.lastSeenMs,
     created_at: entry.createdAt,
+    profile_sig: entry.savedSig || profileSig(base),
+    counts: base.counts || null,
+    screen: base.screen || null,
+    plants: base.plants || null,
     fish,
-    counts: s.counts || null,
-    screen: s.screen || null,
   };
+}
+
+// Resolve a profile conflict (from the dashboard or the device).
+//   choice 'local'  → adopt the device's current profile as the new baseline.
+//   choice 'server' → tell the device to restore the saved baseline; the
+//                     conflict clears automatically once it reports a match.
+function resolveConflict(id, choice) {
+  const entry = aquariums.get(id);
+  if (!entry) return { ok: false, error: 'not_found' };
+  if (choice === 'local') {
+    if (!entry.snapshot) return { ok: false, error: 'no_snapshot' };
+    entry.saved = entry.snapshot;
+    entry.savedSig = profileSig(entry.snapshot);
+    entry.conflict = null;
+    entry.pendingDirective = null;
+    db.saveSnapshot(id, entry.saved, entry.lastSeenMs, entry.createdAt);
+    broadcast(entry);
+    return { ok: true, choice };
+  }
+  if (choice === 'server') {
+    entry.conflict = null;
+    entry.pendingDirective = 'restore'; // delivered in the next POST response
+    broadcast(entry);
+    return { ok: true, choice };
+  }
+  return { ok: false, error: 'bad_choice' };
 }
 
 function subscribe(fn) {
@@ -305,6 +404,6 @@ function subscribe(fn) {
 }
 
 module.exports = {
-  upsert, list, get, bootstrap, subscribe, setName, getNamesText,
+  upsert, list, get, bootstrap, resolveConflict, subscribe, setName, getNamesText,
   STALE_MS, MAX_AQUARIUMS,
 };
