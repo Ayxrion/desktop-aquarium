@@ -12,7 +12,12 @@ const W = 800, H = 480, TOP = 72;
 const PALETTE = [0x00ee66, 0xffdd00, 0xff6600, 0xcc44ff, 0x44ddff, 0xff44aa, 0x00ffff, 0xeeeeee];
 
 const FRAME_MS = 50; // matches device FRAME_MS
+const FRAMES_PER_PUBLISH = 1000 / FRAME_MS; // 20 — device runs at 20fps, publishes at 1Hz
 const DAMP = 0.85;
+
+// Must match _SEEK / _MAXV in app.js and store.js
+const SEEK = [0.018, 0.012, 0.012, 0.020];
+const MAXV = [7.0,   5.5,   5.5,   7.0  ];
 
 // Persistent fish so motion looks continuous. Each fish has position + velocity
 // that the mock updates with damping each frame — matching the device physics so
@@ -45,25 +50,36 @@ const plants = {
 let tick = 0;
 const startMs = Date.now();
 
-function step() {
-  tick++;
-  for (const f of fish) {
-    // Wander: decrement per device frame (step() fires every 1s = 20 frames at 50ms)
-    f.wanderCD -= 20;
-    if (f.wanderCD <= 0) {
-      f.tx = 20 + Math.random() * (W - 40);
-      f.ty = TOP + 20 + Math.random() * (H - TOP - 80);
-      f.wanderCD = Math.floor(Math.random() * 60) + 20;
+function stepPhysics() {
+  // Run exactly FRAMES_PER_PUBLISH device frames so the published position
+  // matches what the browser will predict by extrapolating the same number
+  // of frames forward from the previous snapshot.
+  for (let frame = 0; frame < FRAMES_PER_PUBLISH; frame++) {
+    tick++;
+    for (const f of fish) {
+      f.wanderCD--;
+      if (f.wanderCD <= 0) {
+        f.tx = 20 + Math.random() * (W - 40);
+        f.ty = TOP + 20 + Math.random() * (H - TOP - 80);
+        f.wanderCD = Math.floor(Math.random() * 60) + 20;
+      }
+      const seek = SEEK[f.type] ?? 0.012;
+      const maxV = MAXV[f.type] ?? 5.5;
+      const ax = (f.tx - f.x) * seek
+        + (f.x < 30 ? (30 - f.x) * 0.3 : f.x > W - 30 ? (W - 30 - f.x) * 0.3 : 0);
+      const ay = (f.ty - f.y) * seek
+        + (f.y < TOP + 20 ? (TOP + 20 - f.y) * 0.3 : f.y > H - 80 ? (H - 80 - f.y) * 0.3 : 0);
+      f.vx = Math.max(-maxV,       Math.min(maxV,       f.vx + ax)) * DAMP;
+      f.vy = Math.max(-maxV * 0.5, Math.min(maxV * 0.5, f.vy + ay)) * DAMP;
+      f.x = Math.max(5,       Math.min(W - 5,       f.x + f.vx));
+      f.y = Math.max(TOP + 5, Math.min(H - 60,      f.y + f.vy));
+      if (Math.abs(f.vx) > 0.4) f.facing_right = f.vx > 0;
     }
-    // Seek target with damped-velocity physics (mirrors device updateFish)
-    const ax = (f.tx - f.x) * 0.012 + (f.x < 30 ? (30 - f.x) * 0.3 : f.x > W - 30 ? (W - 30 - f.x) * 0.3 : 0);
-    const ay = (f.ty - f.y) * 0.012 + (f.y < TOP + 20 ? (TOP + 20 - f.y) * 0.3 : f.y > H - 80 ? (H - 80 - f.y) * 0.3 : 0);
-    f.vx = Math.max(-5.5, Math.min(5.5, f.vx + ax)) * DAMP;
-    f.vy = Math.max(-2.75, Math.min(2.75, f.vy + ay)) * DAMP;
-    f.x += f.vx;
-    f.y += f.vy;
-    if (Math.abs(f.vx) > 0.4) f.facing_right = f.vx > 0;
   }
+}
+
+function step() {
+  stepPhysics();
 
   const dayProgress = ((Date.now() - startMs) / 60000) % 1; // full day every minute
   const snapshot = {
