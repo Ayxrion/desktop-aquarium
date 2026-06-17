@@ -76,13 +76,19 @@ function _extrapolateSnapshot(snapshot, elapsedMs) {
     }));
 
     for (let frame = 0; frame < n; frame++) {
-      const cent = [0, 1, 2, 3].map((t) => {
-        const g = st.filter((f) => f.type === t);
-        if (!g.length) return { x: 0, y: 0, z: 0 };
-        return { x: g.reduce((s, f) => s + f.x, 0) / g.length,
-                 y: g.reduce((s, f) => s + f.y, 0) / g.length,
-                 z: g.reduce((s, f) => s + f.z, 0) / g.length };
-      });
+      // Sub-school centroids: schooling types split into schools capped at FISH_SCHOOL_SIZE,
+      // each fish coheres to its own school's centroid (so beyond the cap a new school forms).
+      const cent = {};
+      const order = [0, 0, 0, 0, 0];
+      for (const f of st) {
+        const sz = FISH_SCHOOL_SIZE[f.type] || 0;
+        f._sub = sz >= 2 ? Math.floor(order[f.type] / sz) : 0;
+        order[f.type]++;
+        const k = f.type + ':' + f._sub;
+        const c = cent[k] || (cent[k] = { x: 0, y: 0, z: 0, n: 0 });
+        c.x += f.x; c.y += f.y; c.z += f.z; c.n++;
+      }
+      for (const k in cent) { const c = cent[k]; c.x /= c.n; c.y /= c.n; c.z /= c.n; }
       for (const f of st) {
         const t = f.type, chasing = f.chasing && t === 0;
         const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
@@ -92,15 +98,16 @@ function _extrapolateSnapshot(snapshot, elapsedMs) {
         let ax = (f.tx - f.x) * seekStr;
         let ay = (f.ty - f.y) * seekStr;
         let az = (f.tz - f.z) * 0.010;
-        if (FISH_SCHOOLS[t]) {
-          ax += (cent[t].x - f.x) * 0.010; ay += (cent[t].y - f.y) * 0.007; az += (cent[t].z - f.z) * 0.007;
+        const grp = cent[t + ':' + f._sub];
+        if (t === 1 || t === 2) {
+          ax += (grp.x - f.x) * 0.010; ay += (grp.y - f.y) * 0.007; az += (grp.z - f.z) * 0.007;
         } else if (t === 3) {
-          ax += (cent[3].x - f.x) * 0.012; ay += (cent[3].y - f.y) * 0.010; az += (cent[3].z - f.z) * 0.008;
+          ax += (grp.x - f.x) * 0.012; ay += (grp.y - f.y) * 0.010; az += (grp.z - f.z) * 0.008;
         }
         const sepR2 = t === 3 ? 60*60 : 80*80, sepK = t === 3 ? 7 : 8;
         if (t === 1 || t === 2 || t === 3) {
           for (const o of st) {
-            if (o === f || o.type !== t) continue;
+            if (o === f || o.type !== t || o._sub !== f._sub) continue;
             const dx = f.x - o.x, dy = f.y - o.y, d2 = dx*dx + dy*dy;
             if (d2 < sepR2 && d2 > 0.01) { const inv = sepK/d2; ax += dx*inv; ay += dy*inv; }
           }
@@ -249,7 +256,7 @@ function getOrCreate(id) {
 function profileSig(s) {
   if (!s) return '';
   const c = s.counts || {};
-  return `P:${c.pair || 0},${c.school || 0},${c.school2 || 0},${c.angel || 0}`;
+  return `P:${c.pair || 0},${c.school || 0},${c.school2 || 0},${c.angel || 0},${c.salmon || 0}`;
 }
 
 // Update per-fish age metadata from a snapshot's fish list.
@@ -418,9 +425,10 @@ function getNamesText(id) {
 
 // Fish-type caps mirror the firmware (main.cpp / aquarium.ino) so the dashboard
 // and server can validate without a round-trip.
-const FISH_MAX = [8, 16, 20, 12]; // pair, guppy(school), piranha(school2), angel
-// Schooling is a per-type characteristic (not the type itself); drives shoaling physics.
-const FISH_SCHOOLS = [false, true, true, false];
+const FISH_MAX = [8, 16, 20, 12, 16]; // pair(clownfish), guppy(school), piranha(school2), angel, salmon
+// Max school size per type before fish split into a new school (0 = solitary). Clownfish
+// realize size-2 via mate-pairing; Guppy/Piranha use centroid sub-schools; Angel/Salmon don't.
+const FISH_SCHOOL_SIZE = [2, 6, 4, 0, 0];
 
 // Buffer a downstream control directive for the device's next telemetry response.
 // Returns { ok } or { ok:false, error } on bad input.
@@ -444,7 +452,7 @@ function queueControl(id, cmd) {
     case 'fish': {
       const ft = Number(cmd.fishType);
       const n = Math.max(1, Math.min(64, Number(cmd.count) || 1));
-      if (!Number.isInteger(ft) || ft < 0 || ft > 3) return { ok: false, error: 'bad_fish_type' };
+      if (!Number.isInteger(ft) || ft < 0 || ft > 4) return { ok: false, error: 'bad_fish_type' };
       if (cmd.action === 'add') p.fishAdd[ft] += n;
       else if (cmd.action === 'remove') p.fishDel[ft] += n;
       else return { ok: false, error: 'bad_fish_action' };
@@ -484,7 +492,7 @@ function queueControl(id, cmd) {
       const what = String(cmd.what);
       if (what === 'fish') {
         const ft = Number(cmd.fishType);
-        if (!Number.isInteger(ft) || ft < 0 || ft > 3) return { ok: false, error: 'bad_fish_type' };
+        if (!Number.isInteger(ft) || ft < 0 || ft > 4) return { ok: false, error: 'bad_fish_type' };
         p.buyFish[ft] += Math.max(1, Math.min(64, Number(cmd.count) || 1));
       } else if (what === 'food') {
         p.buyFood += Math.max(1, Math.min(99, Number(cmd.count) || 1));
@@ -519,7 +527,7 @@ function list() {
     const s = entry.snapshot || {};
     const counts = s.counts || {};
     const fishCount =
-      (counts.pair || 0) + (counts.school || 0) + (counts.school2 || 0) + (counts.angel || 0);
+      (counts.pair || 0) + (counts.school || 0) + (counts.school2 || 0) + (counts.angel || 0) + (counts.salmon || 0);
     out.push({
       aquarium_id: id,
       platform: s.platform || 'unknown',

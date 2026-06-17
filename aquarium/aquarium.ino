@@ -285,9 +285,12 @@ Flake flakes[MAX_FLAKES];
 // Species identities. FISH_SCHOOL = Guppy, FISH_SCHOOL2 = Piranha (legacy enum/telemetry
 // names kept for the persisted slot layout). Schooling is NOT a type — it's the per-species
 // characteristic below: a schooling fish prefers to swim with others of its own type.
-enum FishType : uint8_t { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
-static const bool FISH_SCHOOLS[4] = { false, true, true, false }; // pair, guppy, piranha, angel
-static inline bool typeSchools(FishType t) { return FISH_SCHOOLS[(int)t & 3]; }
+// FISH_PAIR=Clownfish, FISH_SCHOOL=Guppy, FISH_SCHOOL2=Piranha, FISH_SALMON=Salmon (legacy
+// enum/telemetry names kept for the persisted slot layout). Schooling = the FISH_SCHOOL_SIZE
+// characteristic: max fish per school of that type before they split off (0 = solitary).
+enum FishType : uint8_t { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
+static const int  FISH_SCHOOL_SIZE[5] = { 2, 6, 4, 0, 0 }; // clownfish, guppy, piranha, angel, salmon
+static inline bool typeSchools(FishType t) { return t == FISH_SCHOOL || t == FISH_SCHOOL2; }
 
 struct Fish {
   float    x, y, z;
@@ -308,16 +311,18 @@ struct Fish {
 
 // Fixed-slot layout: [0..MAX_PAIR-1] pair, [MAX_PAIR..MAX_PAIR+MAX_SCHOOL-1] school1,
 // [MAX_PAIR+MAX_SCHOOL..MAX_FISH-1] school2.  Only the first num* slots are active.
-#define MAX_PAIR    8
+#define MAX_PAIR    8               // clownfish slots
 #define MAX_SCHOOL  16              // guppy capacity (each is an individual fish)
-#define MAX_SCHOOL2 20
+#define MAX_SCHOOL2 20              // piranha
 #define MAX_ANGEL   12
-#define MAX_FISH    (MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + MAX_ANGEL)
+#define MAX_SALMON  16              // salmon (common starter fish)
+#define MAX_FISH    (MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + MAX_ANGEL + MAX_SALMON)
 
 static int numPair    = 2;
-static int numSchool  = 2;          // demo initial; career starts at 0 via careerStartReset
+static int numSchool  = 2;          // demo initial; career starts via careerStartReset
 static int numSchool2 = 7;
 static int numAngel   = 3;
+static int numSalmon  = 0;
 
 Fish fish[MAX_FISH];
 
@@ -339,8 +344,8 @@ int gameCoins = 0, gameShells = 0, gameFood = 0;
 #define COIN_REST     480               // frames a landed coin sits before vanishing (~24s); timer starts on landing
 #define SHELL_TTL     220
 #define SAND_Y        (SCREEN_H - 20)
-static const int FISH_PRICE[4]     = { 10, 30, 45, 60 };
-static const int FISH_BASE_SELL[4] = {  6,  3, 22, 30 };
+static const int FISH_PRICE[5]     = { 10, 30, 45, 60,  8 }; // clownfish, guppy, piranha, angel, salmon
+static const int FISH_BASE_SELL[5] = {  6,  3, 22, 30,  4 }; // school/salmon cheap (common)
 #define FOOD_PRICE    5
 #define SNAIL_PRICE   50
 #define MAX_SNAILS    6
@@ -523,10 +528,11 @@ float frand()                    { return random(0, 1000) * 0.001f; }
 float frandr(float lo, float hi) { return lo + frand() * (hi - lo); }
 
 inline bool isFishActive(int i) {
-  if (i < MAX_PAIR)                                      return i < numPair;
-  if (i < MAX_PAIR + MAX_SCHOOL)                         return (i - MAX_PAIR) < numSchool;
-  if (i < MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2)           return (i - MAX_PAIR - MAX_SCHOOL) < numSchool2;
-  return (i - MAX_PAIR - MAX_SCHOOL - MAX_SCHOOL2) < numAngel;
+  if (i < MAX_PAIR)                                            return i < numPair;
+  if (i < MAX_PAIR + MAX_SCHOOL)                               return (i - MAX_PAIR) < numSchool;
+  if (i < MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2)                 return (i - MAX_PAIR - MAX_SCHOOL) < numSchool2;
+  if (i < MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + MAX_ANGEL)     return (i - MAX_PAIR - MAX_SCHOOL - MAX_SCHOOL2) < numAngel;
+  return (i - MAX_PAIR - MAX_SCHOOL - MAX_SCHOOL2 - MAX_ANGEL) < numSalmon;
 }
 
 int projX(float x, float z) {
@@ -569,7 +575,7 @@ float tankLuck() {
 // (0..1) blends it toward a warm gold, and a deterministic 1-in-1000 id roll
 // inverts the colour for a "shiny". Identical maths on device + web → identical
 // colours on the panel, in telemetry, and on the dashboard.
-const uint32_t FISH_PRIMARY[4] = { 0x2E8BFFUL, 0x33D17AUL, 0xFF7A33UL, 0xB45CFFUL }; // pair, school, school2, angel
+const uint32_t FISH_PRIMARY[5] = { 0x2E8BFFUL, 0x33D17AUL, 0xFF7A33UL, 0xB45CFFUL, 0xFF9E7AUL }; // clownfish, guppy, piranha, angel, salmon
 #define LUCK_TINT_COLOR    0xFFE14DUL
 #define LUCK_TINT_STRENGTH 0.7f
 #define SHINY_ODDS         1000
@@ -688,6 +694,11 @@ void addFish(FishType type) {
                   frandr(200, 600), frandr(90, 320), frandr(0.25f, 0.65f),
                   frandr(-3.0f, 3.0f), FISH_ANGEL, -1);
     numAngel++;
+  } else if (type == FISH_SALMON && numSalmon < MAX_SALMON) {
+    initFishEntry(MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + MAX_ANGEL + numSalmon,
+                  frandr(120, 680), frandr(90, 340), frandr(0.20f, 0.65f),
+                  frandr(-3.0f, 3.0f), FISH_SALMON, -1);
+    numSalmon++;
   }
 }
 
@@ -702,6 +713,8 @@ void removeFish(FishType type) {
     numSchool2--;
   } else if (type == FISH_ANGEL && numAngel > 0) {
     numAngel--;
+  } else if (type == FISH_SALMON && numSalmon > 0) {
+    numSalmon--;
   }
 }
 
@@ -725,17 +738,21 @@ void removeFishSlot(int idx) {
     int last = MAX_PAIR + MAX_SCHOOL + numSchool2 - 1;
     if (idx != last) fish[idx] = fish[last];
     numSchool2--;
-  } else {
+  } else if (idx < MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + MAX_ANGEL) {
     int last = MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + numAngel - 1;
     if (idx != last) fish[idx] = fish[last];
     numAngel--;
+  } else {
+    int last = MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + MAX_ANGEL + numSalmon - 1;
+    if (idx != last) fish[idx] = fish[last];
+    numSalmon--;
   }
 }
 
 int fishSellValue(int idx) {
   if (!isFishActive(idx)) return 0;
   const Fish& f = fish[idx];
-  int base = FISH_BASE_SELL[(int)f.type < 4 ? (int)f.type : 0];
+  int base = FISH_BASE_SELL[(int)f.type < 5 ? (int)f.type : 0];
   float sc = fishScale(f);
   int val = base
           + (int)(base * sc + 0.5f)
@@ -1261,8 +1278,8 @@ void addSnail() {
 void spawnWanderer(float luck) {
   for (int i = 0; i < MAX_WANDER; i++) if (!wanderers[i].active) {
     float r = frandr(0, 1);
-    // guppy (~8%) is a rare wild catch; angel biased by luck; pair most common
-    uint8_t type = (r < 0.1f + 0.3f * luck) ? 3 : (r < 0.55f) ? 0 : (r < 0.63f) ? 1 : 2;
+    // Salmon (4) is the common wild fish; clownfish (0) is now rare; angel luck-biased.
+    uint8_t type = (r < 0.1f + 0.3f * luck) ? 3 : (r < 0.6f) ? 4 : (r < 0.75f) ? 1 : (r < 0.92f) ? 2 : 0;
     bool fromLeft = (random(0, 2) == 0);
     Wanderer& w = wanderers[i];
     w.active = true; w.type = type; w.id = nextItemId++;
@@ -1278,7 +1295,7 @@ void spawnWanderer(float luck) {
   }
 }
 bool catchWandererById(uint32_t id) {
-  static const FishType T[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
+  static const FishType T[5] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
   for (int i = 0; i < MAX_WANDER; i++)
     if (wanderers[i].active && wanderers[i].id == id) {
       addFish(T[wanderers[i].type]);
@@ -1310,9 +1327,9 @@ bool tapCatch(int tx, int ty) {
   return false;
 }
 void careerStartReset() {
-  numPair = numSchool = numSchool2 = numAngel = 0;
-  addFish(FISH_PAIR); addFish(FISH_PAIR);
-  gameCoins = gameShells = gameFood = 0;
+  numPair = numSchool = numSchool2 = numAngel = numSalmon = 0;
+  addFish(FISH_SALMON); addFish(FISH_SALMON);   // start with 2 salmon
+  gameCoins = gameShells = 0; gameFood = 10;    // career starts stocked with 10 food
   for (int i = 0; i < MAX_WANDER; i++) wanderers[i].active = false;
   for (int i = 0; i < MAX_LOOT; i++)   loot[i].active = false;
   for (int i = 0; i < MAX_FISH; i++)   coinCD[i] = 0;
@@ -1417,8 +1434,8 @@ void telemetryApplyControls() {
   if      (tm == 0) currentTimeMode = TIME_REAL;
   else if (tm == 1) currentTimeMode = TIME_FAST;
 
-  const FishType T[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
-  for (int t = 0; t < 4; t++) {
+  const FishType T[5] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
+  for (int t = 0; t < 5; t++) {
     for (int n = _ctrlFishAddReq[t].exchange(0); n > 0; n--) addFish(T[t]);
     for (int n = _ctrlFishDelReq[t].exchange(0); n > 0; n--) removeFish(T[t]);
   }
@@ -1428,7 +1445,7 @@ void telemetryApplyControls() {
   if      (m == 0) setGameMode(MODE_CREATIVE);
   else if (m == 1) setGameMode(MODE_CAREER);
 
-  for (int t = 0; t < 4; t++)
+  for (int t = 0; t < 5; t++)
     for (int n = _ctrlBuyFishReq[t].exchange(0); n > 0; n--)
       if (gameCoins >= FISH_PRICE[t]) { gameCoins -= FISH_PRICE[t]; addFish(T[t]); }
   for (int n = _ctrlBuyFoodReq.exchange(0); n > 0; n--)
@@ -1659,18 +1676,23 @@ void updateFish() {
       ay += (f.ty - f.y) * seekStr;
       az += (f.tz - f.z) * 0.010f;
 
-      if (typeSchools(f.type)) {                 // schooling: cohere to same-type group
-        float cx = (f.type == FISH_SCHOOL) ? scx  : sc2x;
-        float cy = (f.type == FISH_SCHOOL) ? scy  : sc2y;
-        float cz = (f.type == FISH_SCHOOL) ? scz  : sc2z;
-        int   js = (f.type == FISH_SCHOOL) ? MAX_PAIR : (MAX_PAIR + MAX_SCHOOL);
-        int   je = (f.type == FISH_SCHOOL) ? (MAX_PAIR + numSchool)
-                                           : (MAX_PAIR + MAX_SCHOOL + numSchool2);
-
-        ax += (cx - f.x) * 0.010f;
-        ay += (cy - f.y) * 0.007f;
-        az += (cz - f.z) * 0.007f;
-
+      if (typeSchools(f.type)) {                 // cohere to this fish's sub-school only
+        // Partition the type's slots into schools of FISH_SCHOOL_SIZE; a fish coheres to its
+        // own school's centroid, so beyond the cap fish form a separate school.
+        int typeBase  = (f.type == FISH_SCHOOL) ? MAX_PAIR : (MAX_PAIR + MAX_SCHOOL);
+        int typeCount = (f.type == FISH_SCHOOL) ? numSchool : numSchool2;
+        int sz  = FISH_SCHOOL_SIZE[f.type];        // 6 (guppy) / 4 (piranha)
+        int sub = (i - typeBase) / sz;
+        int js  = typeBase + sub * sz;
+        int je  = typeBase + ((sub + 1) * sz < typeCount ? (sub + 1) * sz : typeCount);
+        float cx = 0, cy = 0, cz = 0; int cnt = 0;
+        for (int j = js; j < je; j++) { if (!isFishActive(j)) continue; cx += fish[j].x; cy += fish[j].y; cz += fish[j].z; cnt++; }
+        if (cnt > 0) {
+          cx /= cnt; cy /= cnt; cz /= cnt;
+          ax += (cx - f.x) * 0.010f;
+          ay += (cy - f.y) * 0.007f;
+          az += (cz - f.z) * 0.007f;
+        }
         for (int j = js; j < je; j++) {
           if (j == i || !isFishActive(j)) continue;
           float dx = f.x - fish[j].x, dy = f.y - fish[j].y;
@@ -2339,13 +2361,13 @@ void drawShopPanel() {
   int pages = (nActive + SP_ROWS - 1) / SP_ROWS;
   if (shopSellPage >= pages) shopSellPage = pages > 0 ? pages - 1 : 0;
   int start = shopSellPage * SP_ROWS;
-  static const char* tNames[4] = { "LARGE","SCHOOL","DEEP","ANGEL" };
+  static const char* tNames[5] = { "CLOWN","GUPPY","PIRANHA","ANGEL","SALMON" };
   for (int r = 0; r < SP_ROWS && (start + r) < nActive; r++) {
     int idx = activeFish[start + r];
     int ry = SP_Y + 28 + r * SP_ROW_H;
     int sv = fishSellValue(idx);
     char line[40];
-    snprintf(line, sizeof(line), "#%-2d %s  %dc", idx, tNames[(int)fish[idx].type < 4 ? (int)fish[idx].type : 0], sv);
+    snprintf(line, sizeof(line), "#%-2d %s  %dc", idx, tNames[(int)fish[idx].type < 5 ? (int)fish[idx].type : 0], sv);
     canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
     canvas.setCursor(SP_X + 8, ry + 4); canvas.print(line);
     canvas.fillRect(SP_X + 270, ry, 52, 28, 0x3A1800UL);
@@ -2401,10 +2423,10 @@ void drawShopPanel() {
     canvas.setCursor(rx + 157, SP_Y + 70); canvas.print("BUY");
   }
   // Fish types — each is an individual fish, all buyable (guppy/piranha too).
-  const char* fNames[4] = { "LARGE FISH","GUPPY","PIRANHA","ANGELFISH" };
-  int cnts[4] = { numPair, numSchool, numSchool2, numAngel };
-  int mxs[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
-  for (int t = 0; t < 4; t++) {
+  const char* fNames[5] = { "CLOWNFISH","GUPPY","PIRANHA","ANGELFISH","SALMON" };
+  int cnts[5] = { numPair, numSchool, numSchool2, numAngel, numSalmon };
+  int mxs[5]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL, MAX_SALMON };
+  for (int t = 0; t < 5; t++) {
     int fy = SP_Y + 108 + t * 44;
     canvas.setTextSize(1);
     bool can = cnts[t] < mxs[t] && gameCoins >= FISH_PRICE[t];
@@ -2470,11 +2492,11 @@ void drawMenu() {
 
   canvas.drawFastHLine(MENU_X + 8, MENU_Y + 34, MENU_W - 16, 0x2244AAUL);
 
-  const char* labels[4] = { "LARGE FISH", "GUPPY", "PIRANHA", "ANGELFISH" };
-  int counts[4]         = { numPair, numSchool, numSchool2, numAngel };
-  int maxes[4]          = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
+  const char* labels[5] = { "CLOWNFISH", "GUPPY", "PIRANHA", "ANGELFISH", "SALMON" };
+  int counts[5]         = { numPair, numSchool, numSchool2, numAngel, numSalmon };
+  int maxes[5]          = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL, MAX_SALMON };
 
-  for (int row = 0; row < 4; row++) {
+  for (int row = 0; row < 5; row++) {
     int ry = MENU_Y + 45 + row * 58;
 
     canvas.setTextSize(1);
@@ -2758,10 +2780,10 @@ void loop() {
         if (tx >= (uint16_t)(rx + 148) && tx < (uint16_t)(rx + 204) &&
             ty >= (uint16_t)(SP_Y + 63) && ty < (uint16_t)(SP_Y + 89))
           if (gameCoins >= SNAIL_PRICE && numSnails < MAX_SNAILS) { gameCoins -= SNAIL_PRICE; addSnail(); }
-        const FishType T[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
-        int cnts[4] = { numPair, numSchool, numSchool2, numAngel };
-        int mxs[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
-        for (int t = 0; t < 4; t++) {
+        const FishType T[5] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
+        int cnts[5] = { numPair, numSchool, numSchool2, numAngel, numSalmon };
+        int mxs[5]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL, MAX_SALMON };
+        for (int t = 0; t < 5; t++) {
           int fy = SP_Y + 108 + t * 44;
           if (tx >= (uint16_t)(rx + 148) && tx < (uint16_t)(rx + 204) &&
               ty >= (uint16_t)fy          && ty < (uint16_t)(fy + 28)) {
@@ -2791,8 +2813,8 @@ void loop() {
         }
       }
       // Route to [-]/[+] buttons; block food drop while menu open
-      const FishType rowType[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
-      for (int row = 0; row < 4; row++) {
+      const FishType rowType[5] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
+      for (int row = 0; row < 5; row++) {
         int ry = MENU_Y + 45 + row * 58;
         if (tx >= (uint16_t)(MENU_X + 148) && tx < (uint16_t)(MENU_X + 178) &&
             ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
@@ -2802,8 +2824,8 @@ void loop() {
         if (tx >= (uint16_t)(MENU_X + 210) && tx < (uint16_t)(MENU_X + 240) &&
             ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
           if (gameMode == MODE_CAREER) {           // buy with coins (guard the cap)
-            int cnt[4] = { numPair, numSchool, numSchool2, numAngel };
-            int mx[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
+            int cnt[5] = { numPair, numSchool, numSchool2, numAngel, numSalmon };
+            int mx[5]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL, MAX_SALMON };
             if (cnt[row] < mx[row] && gameCoins >= FISH_PRICE[row]) {
               gameCoins -= FISH_PRICE[row]; addFish(rowType[row]);
             }

@@ -4,13 +4,16 @@
 // reverse-proxy prefix the deploy service configures.
 
 const WEATHER_NAMES = ['Sunny', 'Partly Cloudy', 'Cloudy', 'Rainy', 'Stormy', 'Snowy', 'Foggy'];
-const FISH_TYPE_NAMES = ['Pair', 'Guppy', 'Piranha', 'Angel'];
+const FISH_TYPE_NAMES = ['Clownfish', 'Guppy', 'Piranha', 'Angel', 'Salmon'];
 // Per-type caps + snapshot count keys, mirroring the firmware (main.cpp / aquarium.ino).
-// Count keys stay pair/school/school2/angel (persisted slot identifiers); school=Guppy,
-// school2=Piranha. Schooling is a characteristic (FISH_SCHOOLS), not the type's identity.
-const FISH_MAX = [8, 16, 20, 12];
-const FISH_COUNT_KEYS = ['pair', 'school', 'school2', 'angel'];
-const FISH_SCHOOLS = [false, true, true, false]; // does this type shoal with its own kind?
+// Count keys stay pair/school/school2/angel/salmon (persisted slot identifiers): pair=Clownfish,
+// school=Guppy, school2=Piranha. Schooling is a characteristic (FISH_SCHOOL_SIZE), not the type.
+const FISH_MAX = [8, 16, 20, 12, 16];
+const FISH_COUNT_KEYS = ['pair', 'school', 'school2', 'angel', 'salmon'];
+// Max school size per type before fish split into a new school. 0 = solitary. Clownfish
+// realize their size-2 schooling via mate-pairing; Guppy/Piranha use centroid sub-schools;
+// Angel keeps its own loose grouping; Salmon are solitary.
+const FISH_SCHOOL_SIZE = [2, 6, 4, 0, 0];
 const TANK_TOP = 72;
 const SCREEN_W = 800;
 const SCREEN_H = 480;
@@ -21,7 +24,7 @@ const SCREEN_H = 480;
 // blend is capped by LUCK_TINT_STRENGTH so even a legendary fish keeps a hint of
 // its type colour. Re-theme the whole tank by editing these four lines; the
 // canvas, legend, tooltips and profiles all follow along.
-const FISH_PRIMARY = [0x2E8BFF, 0x33D17A, 0xFF7A33, 0xB45CFF]; // Pair, Guppy, Piranha, Angel
+const FISH_PRIMARY = [0x2E8BFF, 0x33D17A, 0xFF7A33, 0xB45CFF, 0xFF9E7A]; // Clownfish, Guppy, Piranha, Angel, Salmon
 const LUCK_TINT_COLOR = 0xFFE14D;   // high-luck fish shift toward this (warm gold)
 const LUCK_TINT_STRENGTH = 0.7;     // max blend toward the tint at luck = 1
 const SHINY_ODDS = 1000;            // 1-in-N fish are shiny (inverted + glistening)
@@ -177,14 +180,21 @@ function _extrapolateSnapshot(snap, elapsedMs) {
   }));
 
   for (let frame = 0; frame < n; frame++) {
-    // Recompute centroids (x, y AND z) from current positions each frame.
-    const cent = [0, 1, 2, 3].map((t) => {
-      const g = st.filter((f) => f.type === t);
-      if (!g.length) return { x: 0, y: 0, z: 0 };
-      return { x: g.reduce((s, f) => s + f.x, 0) / g.length,
-               y: g.reduce((s, f) => s + f.y, 0) / g.length,
-               z: g.reduce((s, f) => s + f.z, 0) / g.length };
-    });
+    // Recompute sub-school centroids each frame. Schooling types split into schools of
+    // at most FISH_SCHOOL_SIZE[t]; each fish gets `_sub` = its school index and coheres to
+    // that school's centroid (so beyond the cap, fish form a separate school). Non-schooling
+    // types (size 0, e.g. Angel/Salmon) collapse to one group (_sub 0).
+    const cent = {};                 // key `${type}:${sub}` -> {x,y,z,n}
+    const order = [0, 0, 0, 0, 0];
+    for (const f of st) {
+      const sz = FISH_SCHOOL_SIZE[f.type] || 0;
+      f._sub = sz >= 2 ? Math.floor(order[f.type] / sz) : 0;
+      order[f.type]++;
+      const k = f.type + ':' + f._sub;
+      const c = cent[k] || (cent[k] = { x: 0, y: 0, z: 0, n: 0 });
+      c.x += f.x; c.y += f.y; c.z += f.z; c.n++;
+    }
+    for (const k in cent) { const c = cent[k]; c.x /= c.n; c.y /= c.n; c.z /= c.n; }
 
     for (const f of st) {
       const t = f.type;
@@ -200,23 +210,25 @@ function _extrapolateSnapshot(snap, elapsedMs) {
       let ay = (f.ty - f.y) * seekStr;
       let az = (f.tz - f.z) * 0.010;
 
-      // Cohesion toward group centroid — schooling types shoal with their own kind.
-      if (FISH_SCHOOLS[t]) {
-        ax += (cent[t].x - f.x) * 0.010;
-        ay += (cent[t].y - f.y) * 0.007;
-        az += (cent[t].z - f.z) * 0.007;
+      // Cohesion toward this fish's sub-school centroid — Guppy/Piranha shoal in schools
+      // capped at FISH_SCHOOL_SIZE (beyond it, a new school forms); Angel keeps one loose group.
+      const grp = cent[t + ':' + f._sub];
+      if (t === 1 || t === 2) {
+        ax += (grp.x - f.x) * 0.010;
+        ay += (grp.y - f.y) * 0.007;
+        az += (grp.z - f.z) * 0.007;
       } else if (t === 3) {
-        ax += (cent[3].x - f.x) * 0.012;
-        ay += (cent[3].y - f.y) * 0.010;
-        az += (cent[3].z - f.z) * 0.008;
+        ax += (grp.x - f.x) * 0.012;
+        ay += (grp.y - f.y) * 0.010;
+        az += (grp.z - f.z) * 0.008;
       }
 
-      // Pairwise separation within school / angel groups
+      // Pairwise separation within the same sub-school.
       const sepR2 = (t === 3) ? 60 * 60 : 80 * 80;
       const sepK  = (t === 3) ? 7 : 8;
       if (t === 1 || t === 2 || t === 3) {
         for (const o of st) {
-          if (o === f || o.type !== t) continue;
+          if (o === f || o.type !== t || o._sub !== f._sub) continue;
           const dx = f.x - o.x, dy = f.y - o.y;
           const d2 = dx * dx + dy * dy;
           if (d2 < sepR2 && d2 > 0.01) { const inv = sepK / d2; ax += dx * inv; ay += dy * inv; }
@@ -1044,7 +1056,7 @@ const els = {
 const ctx = els.canvas.getContext('2d');
 
 // Shop prices (coins), mirroring the firmware/mock economy.
-const FISH_PRICE     = [10, 30, 45, 60];
+const FISH_PRICE     = [10, 30, 45, 60, 8]; // clownfish, guppy, piranha, angel, salmon (common→cheap)
 const FISH_BASE_SELL = [6, 3, 22, 30];    // base sell value; school cheap to prevent market farming
 const FOOD_PRICE = 5;
 const SNAIL_PRICE = 50;
@@ -1474,7 +1486,7 @@ function formatAge(ms) {
 
 function fmtCounts(c) {
   if (!c) return '—';
-  return `pair ${c.pair || 0} · guppy ${c.school || 0} · piranha ${c.school2 || 0} · angel ${c.angel || 0}`;
+  return `clownfish ${c.pair || 0} · guppy ${c.school || 0} · piranha ${c.school2 || 0} · angel ${c.angel || 0} · salmon ${c.salmon || 0}`;
 }
 
 // Show/hide the profile-mismatch banner from the snapshot's _conflict field.
@@ -1637,7 +1649,7 @@ async function sendControl(cmd, okMsg, pendingInfo) {
 
 function buildFishControls() {
   els.ctrlFish.innerHTML = '';
-  for (let t = 0; t < 4; t++) {
+  for (let t = 0; t < 5; t++) {
     const row = document.createElement('div');
     row.className = 'ctrl-fish-row';
     const name = document.createElement('span');
@@ -1695,7 +1707,7 @@ function renderControls(snap) {
   // Fish counts + cap-aware enabling.
   if (!_fishRowsBuilt) buildFishControls();
   const counts = snap.counts || {};
-  for (let t = 0; t < 4; t++) {
+  for (let t = 0; t < 5; t++) {
     const c = counts[FISH_COUNT_KEYS[t]] || 0;
     fishCountEls[t].textContent = `${c}/${FISH_MAX[t]}`;
     fishBtns[t].minus.disabled = c <= 0;
@@ -1762,7 +1774,7 @@ function renderGame(snap) {
 
 function buildShop() {
   els.shopFish.innerHTML = '';
-  for (let t = 0; t < 4; t++) {
+  for (let t = 0; t < 5; t++) {
     const b = document.createElement('button');
     b.type = 'button'; b.className = 'shop-buy'; b.dataset.type = String(t);
     b.innerHTML = `<span>🐟 ${escapeHtml(FISH_TYPE_NAMES[t])}</span><span class="price">${FISH_PRICE[t]} <span class="ci"></span></span>`;
@@ -2393,8 +2405,8 @@ function drawStats(s) {
   const cards = [
     ['Weather', weather, s.weather && s.weather.override ? 'manual override' : 'auto'],
     ['Time of day', clock, (s.time && s.time.mode) || ''],
-    ['Fish', String((c.pair || 0) + (c.school || 0) + (c.school2 || 0) + (c.angel || 0)),
-      `pair ${c.pair || 0} · guppy ${c.school || 0} · piranha ${c.school2 || 0} · angel ${c.angel || 0}`],
+    ['Fish', String((c.pair || 0) + (c.school || 0) + (c.school2 || 0) + (c.angel || 0) + (c.salmon || 0)),
+      `clownfish ${c.pair || 0} · guppy ${c.school || 0} · piranha ${c.school2 || 0} · angel ${c.angel || 0} · salmon ${c.salmon || 0}`],
     ['Platform', s.platform || '—', s.fw_version ? 'fw ' + s.fw_version : ''],
     ['Uptime', s.uptime_ms != null ? formatDuration(s.uptime_ms) : '—', ''],
     ['Last seen', lastSeen, s._stale ? '⚠ stale' : ''],

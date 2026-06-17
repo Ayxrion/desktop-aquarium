@@ -92,11 +92,11 @@ static int telemetrySrvPair = 0, telemetrySrvSchool = 0,
 static std::atomic<int> _ctrlWeatherReq{-2};      // -2 none, -1 auto, 0..6 condition
 static std::atomic<int> _ctrlTimeReq{-1};         // -1 none, 0 REAL, 1 FAST
 static std::atomic<int> _ctrlFeedReq{0};          // pending food drops
-static std::atomic<int> _ctrlFishAddReq[4];       // pending adds per fish type 0..3
-static std::atomic<int> _ctrlFishDelReq[4];       // pending removes per fish type 0..3
+static std::atomic<int> _ctrlFishAddReq[5];       // pending adds per fish type 0..4
+static std::atomic<int> _ctrlFishDelReq[5];       // pending removes per fish type 0..4
 // ── Career game directives ──
 static std::atomic<int> _ctrlModeReq{-1};          // -1 none, 0 creative, 1 career
-static std::atomic<int> _ctrlBuyFishReq[4];        // shop fish purchases per type
+static std::atomic<int> _ctrlBuyFishReq[5];        // shop fish purchases per type
 static std::atomic<int> _ctrlBuyFoodReq{0};        // shop food purchases
 static std::atomic<int> _ctrlBuySnailReq{0};       // shop coin-collector snail purchases
 #define CTRL_CATCH_MAX 24
@@ -117,7 +117,7 @@ static void _telemetryParseControls(const char* body) {
     if ((d = strstr(body, "!MODE:"))     != nullptr) _ctrlModeReq.store(atoi(d + 6));
     if ((d = strstr(body, "!BUYFOOD:"))  != nullptr) _ctrlBuyFoodReq.fetch_add(atoi(d + 9));
     if ((d = strstr(body, "!BUYSNAIL:")) != nullptr) _ctrlBuySnailReq.fetch_add(atoi(d + 10));
-    for (int t = 0; t < 4; t++) {
+    for (int t = 0; t < 5; t++) {
         char tok[16];
         snprintf(tok, sizeof(tok), "!FISHADD:%d:", t);
         if ((d = strstr(body, tok)) != nullptr) _ctrlFishAddReq[t].fetch_add(atoi(d + strlen(tok)));
@@ -232,13 +232,13 @@ static int _buildTelemetryJson() {
         "\"screen\":{\"w\":%d,\"h\":%d,\"tank_top\":%d},"
         "\"weather\":{\"condition\":%d,\"name\":\"%s\",\"override\":%s},"
         "\"time\":{\"day_progress\":%.4f,\"mode\":\"%s\"},"
-        "\"counts\":{\"pair\":%d,\"school\":%d,\"school2\":%d,\"angel\":%d},",
+        "\"counts\":{\"pair\":%d,\"school\":%d,\"school2\":%d,\"angel\":%d,\"salmon\":%d},",
         TELEMETRY_AQUARIUM_ID, FIRMWARE_VERSION,
         (unsigned long)millis(), (int)tick, FRAME_MS,
         SCREEN_W, SCREEN_H, TANK_TOP,
         wc, _telemetryWeatherName(wc), (weatherOverrideIdx >= 0) ? "true" : "false",
         getDayProgress(), (currentTimeMode == TIME_FAST) ? "FAST" : "REAL",
-        numPair, numSchool, numSchool2, numAngel);
+        numPair, numSchool, numSchool2, numAngel, numSalmon);
 
     // Fish
     o = _tAppend(o, "\"fish\":[");
@@ -426,7 +426,7 @@ static String _localProfileSig() {
     // plant layout were deliberately dropped: they're cosmetic and caused spurious
     // mismatches (reseeded plants on boot, device↔server color formatting drift).
     return "P:" + String(numPair) + "," + String(numSchool) + "," +
-           String(numSchool2) + "," + String(numAngel);
+           String(numSchool2) + "," + String(numAngel) + "," + String(numSalmon);
 }
 
 // GET /bootstrap into doc. Returns true on HTTP 200 + valid JSON.
@@ -472,11 +472,13 @@ static void _applyServerProfileDoc(DynamicJsonDocument& doc) {
     JsonObject counts = doc["counts"];
     int wantP = counts["pair"] | numPair, wantS = counts["school"] | numSchool;
     int wantS2 = counts["school2"] | numSchool2, wantA = counts["angel"] | numAngel;
-    numPair = numSchool = numSchool2 = numAngel = 0;
+    int wantSa = counts["salmon"] | numSalmon;
+    numPair = numSchool = numSchool2 = numAngel = numSalmon = 0;
     for (int i = 0; i < wantP  && numPair    < MAX_PAIR;    i++) addFish(FISH_PAIR);
     for (int i = 0; i < wantS  && numSchool  < MAX_SCHOOL;  i++) addFish(FISH_SCHOOL);
     for (int i = 0; i < wantS2 && numSchool2 < MAX_SCHOOL2; i++) addFish(FISH_SCHOOL2);
     for (int i = 0; i < wantA  && numAngel   < MAX_ANGEL;   i++) addFish(FISH_ANGEL);
+    for (int i = 0; i < wantSa && numSalmon  < MAX_SALMON;  i++) addFish(FISH_SALMON);
 
     JsonObject plants = doc["plants"];
     if (!plants.isNull()) {

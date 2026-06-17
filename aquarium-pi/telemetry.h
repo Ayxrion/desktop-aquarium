@@ -104,11 +104,11 @@ static int telemetrySrvPair = 0, telemetrySrvSchool = 0,
 static std::atomic<int> _ctrlWeatherReq{-2};      // -2 none, -1 auto, 0..6 condition
 static std::atomic<int> _ctrlTimeReq{-1};         // -1 none, 0 REAL, 1 FAST
 static std::atomic<int> _ctrlFeedReq{0};          // pending food drops
-static std::atomic<int> _ctrlFishAddReq[4];       // pending adds per fish type 0..3
-static std::atomic<int> _ctrlFishDelReq[4];       // pending removes per fish type 0..3
+static std::atomic<int> _ctrlFishAddReq[5];       // pending adds per fish type 0..4
+static std::atomic<int> _ctrlFishDelReq[5];       // pending removes per fish type 0..4
 // ── Career game directives ──
 static std::atomic<int> _ctrlModeReq{-1};          // -1 none, 0 creative, 1 career
-static std::atomic<int> _ctrlBuyFishReq[4];        // shop fish purchases per type
+static std::atomic<int> _ctrlBuyFishReq[5];        // shop fish purchases per type
 static std::atomic<int> _ctrlBuyFoodReq{0};        // shop food purchases
 static std::atomic<int> _ctrlBuySnailReq{0};       // shop coin-collector snail purchases
 #define CTRL_CATCH_MAX 24
@@ -129,7 +129,7 @@ static void _telemetryParseControls(const char* body) {
     if ((d = strstr(body, "!MODE:"))     != nullptr) _ctrlModeReq.store(atoi(d + 6));
     if ((d = strstr(body, "!BUYFOOD:"))  != nullptr) _ctrlBuyFoodReq.fetch_add(atoi(d + 9));
     if ((d = strstr(body, "!BUYSNAIL:")) != nullptr) _ctrlBuySnailReq.fetch_add(atoi(d + 10));
-    for (int t = 0; t < 4; t++) {
+    for (int t = 0; t < 5; t++) {
         char tok[16];
         snprintf(tok, sizeof(tok), "!FISHADD:%d:", t);
         if ((d = strstr(body, tok)) != nullptr) _ctrlFishAddReq[t].fetch_add(atoi(d + strlen(tok)));
@@ -239,13 +239,13 @@ static std::string _buildTelemetryJson() {
         "\"screen\":{\"w\":%d,\"h\":%d,\"tank_top\":%d},"
         "\"weather\":{\"condition\":%d,\"name\":\"%s\",\"override\":%s},"
         "\"time\":{\"day_progress\":%.4f,\"mode\":\"%s\"},"
-        "\"counts\":{\"pair\":%d,\"school\":%d,\"school2\":%d,\"angel\":%d},",
+        "\"counts\":{\"pair\":%d,\"school\":%d,\"school2\":%d,\"angel\":%d,\"salmon\":%d},",
         TELEMETRY_AQUARIUM_ID, FIRMWARE_VERSION,
         (unsigned)millis(), (int)tick, FRAME_MS,
         SCREEN_W, SCREEN_H, TANK_TOP,
         wc, _weatherName(wc), (weatherOverrideIdx >= 0) ? "true" : "false",
         getDayProgress(), (currentTimeMode == TIME_FAST) ? "FAST" : "REAL",
-        numPair, numSchool, numSchool2, numAngel);
+        numPair, numSchool, numSchool2, numAngel, numSalmon);
     j += tmp;
 
     // Fish
@@ -513,7 +513,7 @@ static std::string _localProfileSig() {
     // plant layout were deliberately dropped: they're cosmetic and caused spurious
     // mismatches (reseeded plants on boot, device↔server color formatting drift).
     char tmp[48];
-    snprintf(tmp, sizeof(tmp), "P:%d,%d,%d,%d", numPair, numSchool, numSchool2, numAngel);
+    snprintf(tmp, sizeof(tmp), "P:%d,%d,%d,%d,%d", numPair, numSchool, numSchool2, numAngel, numSalmon);
     return std::string(tmp);
 }
 
@@ -650,19 +650,21 @@ static void _applyServerProfile(const char* json) {
     // 1) Fish composition from saved counts — rebuild via addFish (handles slots
     //    + pair partners), then positions get overlaid by _applyBootstrap below.
     const char* cp = strstr(json, "\"counts\":");
-    int wantP = numPair, wantS = numSchool, wantS2 = numSchool2, wantA = numAngel;
+    int wantP = numPair, wantS = numSchool, wantS2 = numSchool2, wantA = numAngel, wantSa = numSalmon;
     if (cp) {
         int v;
         if (_jGetInt(cp, "pair",    &v)) wantP  = v;
         if (_jGetInt(cp, "school",  &v)) wantS  = v;
         if (_jGetInt(cp, "school2", &v)) wantS2 = v;
         if (_jGetInt(cp, "angel",   &v)) wantA  = v;
+        if (_jGetInt(cp, "salmon",  &v)) wantSa = v;
     }
-    numPair = numSchool = numSchool2 = numAngel = 0;
+    numPair = numSchool = numSchool2 = numAngel = numSalmon = 0;
     for (int i = 0; i < wantP  && numPair    < MAX_PAIR;    i++) addFish(FISH_PAIR);
     for (int i = 0; i < wantS  && numSchool  < MAX_SCHOOL;  i++) addFish(FISH_SCHOOL);
     for (int i = 0; i < wantS2 && numSchool2 < MAX_SCHOOL2; i++) addFish(FISH_SCHOOL2);
     for (int i = 0; i < wantA  && numAngel   < MAX_ANGEL;   i++) addFish(FISH_ANGEL);
+    for (int i = 0; i < wantSa && numSalmon  < MAX_SALMON;  i++) addFish(FISH_SALMON);
 
     // 2) Plant layout from the server (regenerate seaweed branches locally —
     //    they aren't part of the profile signature).
