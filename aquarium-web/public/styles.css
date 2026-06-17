@@ -568,6 +568,16 @@ main {
   border-radius: 6px;
   padding: 3px 8px;
 }
+.ci {
+  display: inline-block;
+  width: 0.85em;
+  height: 0.85em;
+  background: radial-gradient(circle at 38% 35%, #ffe680, #ffc700, #b8860b);
+  border-radius: 50%;
+  border: 1px solid #b8860b;
+  vertical-align: middle;
+  margin: 0 1px -1px;
+}
 .mode-row { display: flex; align-items: center; gap: 10px; }
 .mode-row .ctrl-label {
   font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted);

@@ -515,7 +515,7 @@ static void _applyServerProfileDoc(DynamicJsonDocument& doc) {
 bool telemetryProfileLoaded = false;
 
 static bool telemetryFetchAndApplyProfile() {
-    DynamicJsonDocument doc(12288);
+    DynamicJsonDocument doc(49152);  // 48 KB — MAX_FISH=56 × ~300B/fish ≈ 17 KB JSON; ArduinoJson needs ~2-3× internally
     if (!_fetchBootstrapDoc(doc) || !doc["exists"].as<bool>()) return false;
     _applyServerProfileDoc(doc);
     telemetryProfileLoaded = true;
@@ -532,7 +532,7 @@ static void telemetryBootstrap() {
 // Runtime re-enable: compare local profile to the server's; prompt if different.
 static void telemetryReenableCheck() {
     if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
-    DynamicJsonDocument doc(12288);
+    DynamicJsonDocument doc(49152);  // 48 KB — MAX_FISH=56 × ~300B/fish ≈ 17 KB JSON; ArduinoJson needs ~2-3× internally
     if (!_fetchBootstrapDoc(doc) || !doc["exists"].as<bool>()) return;
     const char* ss = doc["profile_sig"] | "";
     if (_localProfileSig() == String(ss)) return; // matches → no conflict

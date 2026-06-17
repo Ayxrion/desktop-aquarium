@@ -78,8 +78,10 @@ const uint32_t FLAKE_COLS[7] = {
 };
 
 // ─── Bubbles ─────────────────────────────────────────────────────────────────
-#define NUM_BUBBLES 20
-struct Bubble { float x, y, spd; uint8_t r; };
+// 6 total: [0..1] bg (behind fg plants, sand-floor origin, rare)
+//          [2..5] fg (in front of fg plants, fish/water origin, occasional)
+#define NUM_BUBBLES 6
+struct Bubble { float x, y, spd; uint8_t r; bool fg; int16_t dormant; };
 Bubble bubbles[NUM_BUBBLES];
 
 // ─── Background plants ────────────────────────────────────────────────────────
@@ -345,11 +347,48 @@ float tankLuck() {
     return n ? s / n : 0.0f;
 }
 
+// ── Fish appearance: luck-driven colouring + shiny rarity ──────────────────────
+// MUST stay byte-for-byte in sync with aquarium-web/public/app.js
+// (FISH_PRIMARY, LUCK_TINT_COLOR, LUCK_TINT_STRENGTH, SHINY_ODDS, hash32,
+// isShiny, fishColorInt). Each fish TYPE has a primary hue; the fish's luck
+// (0..1) blends it toward a warm gold, and a deterministic 1-in-1000 id roll
+// inverts the colour for a "shiny". Identical maths on device + web → identical
+// colours on the panel, in telemetry, and on the dashboard.
+const uint32_t FISH_PRIMARY[4] = { 0x2E8BFFUL, 0x33D17AUL, 0xFF7A33UL, 0xB45CFFUL }; // pair, school, school2, angel
+#define LUCK_TINT_COLOR    0xFFE14DUL
+#define LUCK_TINT_STRENGTH 0.7f
+#define SHINY_ODDS         1000
+
+// Linear blend of two 24-bit RGB colours (mirrors app.js lerpColorInt; t clamped).
+static uint32_t lerpColor888(uint32_t a, uint32_t b, float t) {
+    if (t < 0) t = 0; if (t > 1) t = 1;
+    int ar = (a >> 16) & 0xFF, ag = (a >> 8) & 0xFF, ab = a & 0xFF;
+    int br = (b >> 16) & 0xFF, bg = (b >> 8) & 0xFF, bb = b & 0xFF;
+    uint32_t r = (uint32_t)(ar + (br - ar) * t + 0.5f);
+    uint32_t g = (uint32_t)(ag + (bg - ag) * t + 0.5f);
+    uint32_t bl = (uint32_t)(ab + (bb - ab) * t + 0.5f);
+    return (r << 16) | (g << 8) | bl;
+}
+// 32-bit integer hash (mirrors app.js hash32) — stable per-id shiny roll.
+static uint32_t hash32u(uint32_t n) {
+    n = n ^ 0x9e3779b9u;
+    n = (n ^ (n >> 16)) * 0x45d9f3bu;
+    n = (n ^ (n >> 16)) * 0x45d9f3bu;
+    return n ^ (n >> 16);
+}
+bool fishIsShiny(uint32_t id) { return hash32u(id ^ 0x5bd1e995u) % SHINY_ODDS == 0; }
+
+// Canonical fish colour from type + luck + id (resident fish and wild wanderers).
+uint32_t syncedFishColor(int type, float luck, uint32_t id) {
+    if (type < 0 || type > 3) type = 1;
+    if (luck < 0) luck = 0; if (luck > 1) luck = 1;
+    uint32_t c = lerpColor888(FISH_PRIMARY[type], LUCK_TINT_COLOR, luck * LUCK_TINT_STRENGTH);
+    if (fishIsShiny(id)) c = (~c) & 0xFFFFFFUL;
+    return c;
+}
+
 uint32_t fishColor(int idx) {
-    if (idx < MAX_PAIR)                              return PAIR_COLS[idx % 8];
-    if (idx < MAX_PAIR + MAX_SCHOOL)                 return SCHOOL_COLS[(idx - MAX_PAIR) % 16];
-    if (idx < MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2)   return SCHOOL2_COLS[(idx - MAX_PAIR - MAX_SCHOOL) % 20];
-    return ANGEL_COLS[(idx - MAX_PAIR - MAX_SCHOOL - MAX_SCHOOL2) % MAX_ANGEL];
+    return syncedFishColor((int)fish[idx].type, fish[idx].fishLuck, (uint32_t)idx);
 }
 
 float boundAccel(float val, float lo, float hi, float k = 0.30f) {
@@ -363,10 +402,24 @@ float boundAccel(float val, float lo, float hi, float k = 0.30f) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 void resetBubble(int i, bool scatter) {
-    bubbles[i].x   = frandr(5.0f, SCREEN_W - 5.0f);
-    bubbles[i].y   = scatter ? frandr((float)TANK_TOP, (float)SCREEN_H) : (float)(SCREEN_H + 10);
-    bubbles[i].spd = frandr(0.8f, 2.5f);
-    bubbles[i].r   = (uint8_t)random(3, 9);
+    bubbles[i].fg = (i >= 2);
+    bubbles[i].x  = frandr(10.0f, SCREEN_W - 10.0f);
+    if (scatter) {
+        // Initial scatter: stagger across the water column with random head-start
+        bubbles[i].dormant = (int16_t)random(0, bubbles[i].fg ? 80 : 400);
+        bubbles[i].y = frandr((float)TANK_TOP + 20, (float)SCREEN_H - 10);
+    } else {
+        // After exiting at top: bg bubbles wait a long time (very occasional),
+        // fg bubbles wait a shorter time and respawn at mid-water depth.
+        bubbles[i].dormant = bubbles[i].fg
+            ? (int16_t)random(35, 100)
+            : (int16_t)random(200, 550);
+        bubbles[i].y = bubbles[i].fg
+            ? frandr((float)TANK_TOP + 60, (float)SCREEN_H - 70)
+            : (float)SCREEN_H;
+    }
+    bubbles[i].spd = frandr(0.5f, 1.3f);
+    bubbles[i].r   = (uint8_t)random(2, 5);
 }
 
 void initFishEntry(int idx, float x, float y, float z, float vx,
@@ -837,9 +890,10 @@ void spawnWanderer(float luck) {
         w.y = frandr(TANK_TOP + 40, SCREEN_H - 120);
         w.vx = fromLeft ? frandr(1.2f, 2.2f) : -frandr(1.2f, 2.2f);
         w.facingRight = fromLeft; w.bob = frandr(0, 6.28f);
-        w.color = (type == 0) ? PAIR_COLS[random(0, 8)]
-                : (type == 1) ? SCHOOL_COLS[random(0, 16)]
-                : (type == 2) ? SCHOOL2_COLS[random(0, 20)] : ANGEL_COLS[random(0, 12)];
+        // Wild fish carry no stored luck, so derive a stable pseudo-luck from the id —
+        // identical to the dashboard's fishLuck() for wanderers — so colours match.
+        float wluck = (float)(hash32u(w.id + 1u) % 1000u) / 1000.0f;
+        w.color = syncedFishColor(type, wluck, w.id);
         return;
     }
 }
@@ -1028,8 +1082,9 @@ void updateStarfish() {
 
 void updateBubbles() {
     for (int i = 0; i < NUM_BUBBLES; i++) {
+        if (bubbles[i].dormant > 0) { bubbles[i].dormant--; continue; }
         bubbles[i].y -= bubbles[i].spd;
-        bubbles[i].x += sinf(tick * 0.06f + i * 1.57f) * 0.8f;
+        bubbles[i].x += sinf(tick * 0.06f + i * 1.57f) * 0.6f;
         bubbles[i].x  = constrain(bubbles[i].x, 2.0f, (float)(SCREEN_W - 2));
         if (bubbles[i].y < TANK_TOP) resetBubble(i, false);
     }
@@ -1313,8 +1368,10 @@ void drawTankRim() {
     canvas.fillRect(0, TANK_TOP,      SCREEN_W,  4, 0x061018UL);
 }
 
-void drawBubbles() {
+// fg=false: bg bubbles (drawn before fg plants); fg=true: fg bubbles (after fg plants)
+void drawBubbles(bool fg) {
     for (int i = 0; i < NUM_BUBBLES; i++) {
+        if (bubbles[i].fg != fg || bubbles[i].dormant > 0) continue;
         int bx = (int)bubbles[i].x, by = (int)bubbles[i].y;
         if (by - (int)bubbles[i].r < TANK_TOP) continue;
         canvas.drawCircle(bx, by, bubbles[i].r,     COL_BUBBLE);
@@ -1907,15 +1964,16 @@ void loop() {
     drawBackground();
     drawWeatherSky();
     drawBoat();
-    drawBgPlants();
+    drawBgPlants();            // far-back silhouettes
+    drawBubbles(false);        // bg bubbles rise behind fg plants and fish
     drawFishShadows();
-    drawSnail();
-    drawStarfish();
-    drawSeaweed();
+    drawFish();                // fish in front of bg bubbles, behind fg plants
+    drawSeaweed();             // fg plants in front of fish
     drawFgHornwort();
-    drawBubbles();
+    drawBubbles(true);         // fg bubbles in front of fg plants
     drawFlakes();
-    drawFish();
+    drawSnail();               // floor objects on top of all plants
+    drawStarfish();
     drawCoinSnails();          // purchased coin-collector snails
     drawLootItems();           // coins + shells (career collectibles)
     drawWanderers();           // wandering fish with catch halo

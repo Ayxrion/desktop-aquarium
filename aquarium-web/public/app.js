@@ -1716,7 +1716,7 @@ function renderGame(snap) {
   const career = g.mode === 'career';
   els.hudMode.textContent = career ? 'Career' : 'Creative';
   els.hudMode.className = 'hud-mode' + (career ? '' : ' creative');
-  els.hudCoins.textContent = '🪙 ' + (g.coins || 0);
+  els.hudCoins.innerHTML = '<span class="ci"></span> ' + (g.coins || 0);
   els.hudShells.textContent = '🐚 ' + (g.shells || 0);
   els.hudFood.textContent = '🍤 ' + (g.food || 0);
   els.hudSnails.textContent = '🐌 ' + ((snap.snails && snap.snails.length) || 0);
@@ -1739,7 +1739,7 @@ function buildShop() {
   for (let t = 0; t < 4; t++) {
     const b = document.createElement('button');
     b.type = 'button'; b.className = 'shop-buy'; b.dataset.type = String(t);
-    b.innerHTML = `<span>🐟 ${escapeHtml(FISH_TYPE_NAMES[t])}</span><span class="price">${FISH_PRICE[t]} 🪙</span>`;
+    b.innerHTML = `<span>🐟 ${escapeHtml(FISH_TYPE_NAMES[t])}</span><span class="price">${FISH_PRICE[t]} <span class="ci"></span></span>`;
     b.addEventListener('click', () => buyFish(t));
     els.shopFish.appendChild(b);
   }
@@ -1890,7 +1890,7 @@ els.canvas.addEventListener('click', (e) => {
   spawnPulse(t.x, t.y, 'collect', pcol);   // celebratory burst on obtaining it
   sendControl({ type: 'catch', itemId: best.id },
     t.kind === 'wanderer' ? 'Caught a fish! 🎣'
-      : (best.kind === 'coin' ? 'Grabbed a coin 🪙' : 'Grabbed a shell 🐚'));
+      : (best.kind === 'coin' ? 'Grabbed a coin!' : 'Grabbed a shell 🐚'));
   // Optimistic: remove locally so it vanishes at once; next snapshot reconciles.
   if (t.kind === 'wanderer')
     latestSnapshot.wanderers = (latestSnapshot.wanderers || []).filter((w) => w.id !== best.id);
@@ -1934,7 +1934,7 @@ function lootTooltipHTML(it) {
   if (it.kind === 'coin')
     return ttTitle('Gold Coin', '#ffd23f', false) +
       `<div class="tt-sub">Spend it in the shop</div>` +
-      `<div class="tt-action grab">Click to collect 🪙</div>`;
+      `<div class="tt-action grab">Click to collect <span class="ci"></span></div>`;
   const names = ['Common Shell', 'Pink Shell', 'Golden Shell'];
   const cols = ['#e7c9a0', '#ff9ec4', '#ffd23f'];
   const ti = it.tier || 0;
