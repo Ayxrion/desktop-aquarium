@@ -153,12 +153,13 @@ app.post('/api/aquariums/:id/resolve', (req, res) => {
 // Dashboard control: buffer a directive for the device's next telemetry response.
 // Open like the other dashboard APIs (the dashboard holds no API key). Body:
 //   { type:'weather', value:-1..6 }
-//   { type:'time', value:'REAL'|'FAST' }
-//   { type:'fish', action:'add'|'remove', fishType:0..3, count?:1 }
+//   { type:'time', value:'REAL'|'FAST' }            (legacy)
+//   { type:'timescale', value:1..5 }                (simulation speed multiplier)
+//   { type:'fish', action:'add'|'remove', fishType:0..4, count?:1 }
 //   { type:'feed', count?:1 }
 //   { type:'mode', value:'creative'|'career' }
 //   { type:'catch', itemId:<number> }                  (wanderer/loot id)
-//   { type:'buy', what:'fish', fishType:0..3, count?:1 } | { what:'food', count?:1 }
+//   { type:'buy', what:'fish', fishType:0..4, count?:1 } | { what:'food', count?:1 }
 app.post('/api/aquariums/:id/control', (req, res) => {
   const result = store.queueControl(req.params.id, req.body || {});
   if (!result.ok) return res.status(400).json(result);
@@ -169,6 +170,37 @@ app.post('/api/aquariums/:id/control', (req, res) => {
 // live device re-creates it on its next POST; a stale one stays gone.
 app.delete('/api/aquariums/:id', (req, res) => {
   return res.json(store.remove(req.params.id));
+});
+
+// ─── Aquarium management (open like the other dashboard APIs) ──────────────────
+// Create a brand-new aquarium. It has no physical device, so the server runs it as a
+// visual web simulation right away. Body: { name? }. Returns the new aquarium id.
+app.post('/api/aquariums', (req, res) => {
+  const result = store.createAquarium((req.body && req.body.name) || '');
+  if (!result.ok) return res.status(429).json(result);
+  return res.json(result);
+});
+
+// Rename an aquarium (display name only — the id/slug is immutable). Body: { name }.
+app.patch('/api/aquariums/:id', (req, res) => {
+  const result = store.renameAquarium(req.params.id, (req.body && req.body.name) ?? '');
+  if (!result.ok) return res.status(404).json(result);
+  return res.json(result);
+});
+
+// ─── Device registry (read + manage physical Pi/ESP hardware) ──────────────────
+// Devices appear here only when real hardware self-registers via telemetry; the
+// dashboard can rename one, point it at a different aquarium, or forget a stale one.
+// (There is no "create device" route — virtual devices were removed in favour of the
+// always-on server web simulation for any aquarium without live hardware.)
+app.get('/api/devices', (_req, res) => res.json(store.listDevices()));
+app.patch('/api/devices/:id', (req, res) => {
+  const d = store.updateDevice(req.params.id, req.body || {});
+  if (!d) return res.status(404).json({ ok: false, error: 'not_found' });
+  return res.json({ ok: true, device: d });
+});
+app.delete('/api/devices/:id', (req, res) => {
+  return res.json({ ok: store.removeDevice(req.params.id) });
 });
 
 // ─── Read APIs ───────────────────────────────────────────────────────────────
@@ -231,6 +263,9 @@ app.get(['/', '/index.html'], sendIndex);
 // their bare paths (/app.js, /styles.css) and are served from public/.
 app.use(express.static(PUBLIC_DIR));
 
+const deviceManager = require('./deviceManager');
+
 app.listen(PORT, () => {
   console.log(`aquarium-web listening on :${PORT} (stale after ${store.STALE_MS}ms)`);
+  deviceManager.start();   // web-simulate every aquarium without live hardware (always-on)
 });

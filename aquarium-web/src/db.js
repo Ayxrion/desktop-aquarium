@@ -25,6 +25,23 @@ function _ensureDir() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
+// Devices live in a single JSON file in the parent data dir (kept OUT of the
+// aquariums dir so loadAll() doesn't treat it as an aquarium).
+const DEVICES_FILE = path.join(DATA_DIR, '..', 'devices.json');
+
+function loadDevices() {
+  try { return JSON.parse(fs.readFileSync(DEVICES_FILE, 'utf8')); }
+  catch { return []; }
+}
+function saveDevices(devices) {
+  try {
+    fs.mkdirSync(path.dirname(DEVICES_FILE), { recursive: true });
+    const tmp = DEVICES_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(devices), 'utf8');
+    fs.renameSync(tmp, DEVICES_FILE);
+  } catch (err) { console.warn(`DB: failed to write devices: ${err.message}`); }
+}
+
 function _filePath(id) {
   // Sanitize id to prevent directory traversal: keep only safe chars.
   const safe = id.replace(/[^a-zA-Z0-9_\-]/g, '_');
@@ -55,15 +72,34 @@ function _write(id, data) {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/** Persist a new/updated snapshot alongside current names. */
+/** Persist a new/updated snapshot alongside current names (preserving the name). */
 function saveSnapshot(aquariumId, snapshot, lastSeenMs, createdAt, names) {
   const existing = _read(aquariumId) || {};
   _write(aquariumId, {
     id: aquariumId,
     createdAt: existing.createdAt || createdAt,
     lastSeenMs,
+    name: existing.name || null,
     names: existing.names || {},
     snapshot,
+  });
+}
+
+/**
+ * Persist aquarium metadata (display name) without requiring a snapshot. Used when
+ * the dashboard creates a brand-new aquarium: the file exists immediately (so the
+ * name survives a restart) and the server-side simulator fills in the snapshot on
+ * its first tick.
+ */
+function saveAquariumMeta(aquariumId, { name, createdAt } = {}) {
+  const existing = _read(aquariumId) || {};
+  _write(aquariumId, {
+    id: aquariumId,
+    createdAt: existing.createdAt || createdAt || Date.now(),
+    lastSeenMs: existing.lastSeenMs || 0,
+    name: name != null ? name : (existing.name || null),
+    names: existing.names || {},
+    snapshot: existing.snapshot || null,
   });
 }
 
@@ -96,11 +132,14 @@ function loadAll() {
   for (const file of files) {
     try {
       const data = JSON.parse(fs.readFileSync(path.join(DATA_DIR, file), 'utf8'));
-      if (!data || !data.snapshot) continue;
+      // Restore any aquarium that has a snapshot OR a saved name (a name-only record
+      // is a freshly-created tank whose simulator hadn't ticked before the restart).
+      if (!data || (!data.snapshot && !data.name)) continue;
       const names = new Map(Object.entries(data.names || {}).map(([k, v]) => [parseInt(k, 10), v]));
       results.push({
         id: data.id,
-        snapshot: data.snapshot,
+        snapshot: data.snapshot || null,
+        name: data.name || null,
         lastSeenMs: data.lastSeenMs || 0,
         createdAt: data.createdAt || data.lastSeenMs || 0,
         names,
@@ -126,4 +165,4 @@ function loadOne(aquariumId) {
   };
 }
 
-module.exports = { saveSnapshot, saveName, deleteAquarium, loadAll, loadOne };
+module.exports = { saveSnapshot, saveAquariumMeta, saveName, deleteAquarium, loadAll, loadOne, loadDevices, saveDevices };

@@ -282,7 +282,15 @@ struct Flake {
 Flake flakes[MAX_FLAKES];
 
 // ─── Fish ────────────────────────────────────────────────────────────────────
-enum FishType : uint8_t { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
+// Species identities. FISH_SCHOOL = Guppy, FISH_SCHOOL2 = Piranha (legacy enum/telemetry
+// names kept for the persisted slot layout). Schooling is NOT a type — it's the per-species
+// characteristic below: a schooling fish prefers to swim with others of its own type.
+// FISH_PAIR=Clownfish, FISH_SCHOOL=Guppy, FISH_SCHOOL2=Piranha, FISH_SALMON=Salmon (legacy
+// enum/telemetry names kept for the persisted slot layout). Schooling = the FISH_SCHOOL_SIZE
+// characteristic: max fish per school of that type before they split off (0 = solitary).
+enum FishType : uint8_t { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
+static const int  FISH_SCHOOL_SIZE[5] = { 2, 6, 4, 0, 0 }; // clownfish, guppy, piranha, angel, salmon
+static inline bool typeSchools(FishType t) { return t == FISH_SCHOOL || t == FISH_SCHOOL2; }
 
 struct Fish {
   float    x, y, z;
@@ -303,16 +311,18 @@ struct Fish {
 
 // Fixed-slot layout: [0..MAX_PAIR-1] pair, [MAX_PAIR..MAX_PAIR+MAX_SCHOOL-1] school1,
 // [MAX_PAIR+MAX_SCHOOL..MAX_FISH-1] school2.  Only the first num* slots are active.
-#define MAX_PAIR    8
-#define MAX_SCHOOL  16
-#define MAX_SCHOOL2 20
+#define MAX_PAIR    8               // clownfish slots
+#define MAX_SCHOOL  16              // guppy capacity (each is an individual fish)
+#define MAX_SCHOOL2 20              // piranha
 #define MAX_ANGEL   12
-#define MAX_FISH    (MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + MAX_ANGEL)
+#define MAX_SALMON  16              // salmon (common starter fish)
+#define MAX_FISH    (MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + MAX_ANGEL + MAX_SALMON)
 
 static int numPair    = 2;
-static int numSchool  = 5;
+static int numSchool  = 2;          // demo initial; career starts via careerStartReset
 static int numSchool2 = 7;
 static int numAngel   = 3;
+static int numSalmon  = 0;
 
 Fish fish[MAX_FISH];
 
@@ -334,13 +344,30 @@ int gameCoins = 0, gameShells = 0, gameFood = 0;
 #define COIN_REST     480               // frames a landed coin sits before vanishing (~24s); timer starts on landing
 #define SHELL_TTL     220
 #define SAND_Y        (SCREEN_H - 20)
-static const int FISH_PRICE[4]     = { 10, 30, 45, 60 };
-static const int FISH_BASE_SELL[4] = {  6, 16, 22, 30 };
+static const int FISH_PRICE[5]     = { 10, 30, 45, 60,  8 }; // clownfish, guppy, piranha, angel, salmon
+static const int FISH_BASE_SELL[5] = {  6,  3, 22, 30,  4 }; // school/salmon cheap (common)
 #define FOOD_PRICE    5
 #define SNAIL_PRICE   50
 #define MAX_SNAILS    6
 #define SNAIL_REACH   36
 static const int SHELL_VALUE[3] = { 2, 5, 12 };
+
+// Feeding schedule: fish expect one feeding per third-of-day → 3 meals/day. A clean
+// 3-meal day (no overfeeding) nudges every fish's luck up at day's end; missing meals
+// (going hungry) or overfeeding pushes it down. Drives the on-screen "feed me" bubbles.
+#define MEALS_PER_DAY          3
+#define HUNGER_GRACE           0.35f   // fraction into an unfed slot before fish look hungry
+#define FEED_PERFECT_BONUS     0.08f   // daily luck gain for a perfectly-fed day
+#define FEED_MISS_PENALTY      0.05f   // daily luck loss per missed meal
+#define FEED_OVERFEED_PENALTY  0.03f   // daily luck loss per overfeeding
+#define FEED_DELTA_MIN         (-0.20f)
+#define FEED_DELTA_MAX         0.08f
+
+// Feeding-schedule state (career). mealFed[s] = slot s satisfied today; tankHungry
+// drives the "feed me" thought bubbles; counters feed the day-end luck evaluation.
+bool  mealFed[MEALS_PER_DAY] = { false, false, false };
+int   mealsToday = 0, overfeedToday = 0, lastMealSlot = 0;
+bool  feedSchedInit = false, tankHungry = false;
 
 #define MAX_WANDER 4
 struct Wanderer { float x, y, vx, bob; uint8_t type; uint32_t color; bool facingRight; bool active; uint32_t id; };
@@ -353,6 +380,16 @@ Loot loot[MAX_LOOT] = {};
 // Purchased coin-collector snails — patrol the floor and grab coins nearing it.
 struct CoinSnail { float x, spd; bool facingRight, active; };
 CoinSnail coinSnails[MAX_SNAILS] = {};
+
+// "Feed me" thought bubbles — ride above a specific hungry fish (career) to prompt
+// feeding. Bound to a fish slot + a small rising offset so they follow the fish.
+// Deliberately infrequent (a few per ~5 min) + jittered so the prompt stays subtle —
+// the player is meant to keep a feeding routine, not be nagged constantly.
+#define MAX_FOODBUBBLES 6
+#define BUBBLE_SPAWN_CD 1500            // ~75s @20fps base interval; ×0.7–1.3 jitter applied
+struct FoodBubble { int fish; float rise; int ttl; bool active; };
+FoodBubble foodBubbles[MAX_FOODBUBBLES] = {};
+static float bubbleSpawnCd = 0;
 
 // ── Tap / collect feedback pulses ──────────────────────────────────────────────
 // Transient expanding rings drawn over the tank: a "glass tap" ripple wherever
@@ -405,6 +442,46 @@ void drawPulses() {
       canvas.drawLine(cx - s, cy, cx - s - 4, cy, col);
       canvas.drawLine(cx + s, cy, cx + s + 4, cy, col);
     }
+  }
+}
+
+// ── Floating action text ────────────────────────────────────────────────────
+// A short label ("Caught Salmon!", "+1 coin", "+5 shells") that rises + fades where a
+// tap (or a dashboard !CATCH) caught a wanderer or collected loot.
+#define MAX_FLOATTEXT 5
+struct FloatText { float x, y; int age, life; uint32_t col; char msg[20]; bool active; };
+static FloatText floatTexts[MAX_FLOATTEXT] = {};
+void spawnFloatText(float x, float y, uint32_t col, const char* msg) {
+  int slot = -1, oldest = 0, oldestAge = -1;
+  for (int i = 0; i < MAX_FLOATTEXT; i++) {
+    if (!floatTexts[i].active) { slot = i; break; }
+    if (floatTexts[i].age > oldestAge) { oldestAge = floatTexts[i].age; oldest = i; }
+  }
+  if (slot < 0) slot = oldest;
+  FloatText& f = floatTexts[slot];
+  f.x = x; f.y = y; f.age = 0; f.life = 44;   // ~2.2s @20fps
+  f.col = col; f.active = true;
+  strncpy(f.msg, msg, sizeof(f.msg) - 1); f.msg[sizeof(f.msg) - 1] = '\0';
+}
+void updateFloatTexts() {
+  for (int i = 0; i < MAX_FLOATTEXT; i++)
+    if (floatTexts[i].active && ++floatTexts[i].age >= floatTexts[i].life) floatTexts[i].active = false;
+}
+void drawFloatTexts() {
+  for (int i = 0; i < MAX_FLOATTEXT; i++) {
+    if (!floatTexts[i].active) continue;
+    FloatText& f = floatTexts[i];
+    float t = (float)f.age / (float)f.life;
+    int w = (int)strlen(f.msg) * 6;
+    int x = (int)f.x - w / 2;
+    if (x < 4) x = 4; if (x > SCREEN_W - w - 4) x = SCREEN_W - w - 4;
+    int y = (int)(f.y - 16.0f - t * 22.0f);
+    if (y < TANK_TOP + 2) y = TANK_TOP + 2;
+    canvas.setTextSize(1);
+    canvas.setTextColor(pulseFade(0x04070AUL, t));   // dark shadow
+    canvas.setCursor(x + 1, y + 1); canvas.print(f.msg);
+    canvas.setTextColor(pulseFade(f.col, t));        // colored text, fading out
+    canvas.setCursor(x, y); canvas.print(f.msg);
   }
 }
 int numSnails = 0;
@@ -535,10 +612,11 @@ static void _markSkyCacheDirty() { _skyCacheDirty = true; }
 // ═══════════════════════════════════════════════════════════════════════════════
 
 inline bool isFishActive(int i) {
-  if (i < MAX_PAIR)                                      return i < numPair;
-  if (i < MAX_PAIR + MAX_SCHOOL)                         return (i - MAX_PAIR) < numSchool;
-  if (i < MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2)           return (i - MAX_PAIR - MAX_SCHOOL) < numSchool2;
-  return (i - MAX_PAIR - MAX_SCHOOL - MAX_SCHOOL2) < numAngel;
+  if (i < MAX_PAIR)                                            return i < numPair;
+  if (i < MAX_PAIR + MAX_SCHOOL)                               return (i - MAX_PAIR) < numSchool;
+  if (i < MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2)                 return (i - MAX_PAIR - MAX_SCHOOL) < numSchool2;
+  if (i < MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + MAX_ANGEL)     return (i - MAX_PAIR - MAX_SCHOOL - MAX_SCHOOL2) < numAngel;
+  return (i - MAX_PAIR - MAX_SCHOOL - MAX_SCHOOL2 - MAX_ANGEL) < numSalmon;
 }
 
 int projX(float x, float z) {
@@ -581,7 +659,7 @@ float tankLuck() {
 // (0..1) blends it toward a warm gold, and a deterministic 1-in-1000 id roll
 // inverts the colour for a "shiny". Identical maths on device + web → identical
 // colours on the panel, in telemetry, and on the dashboard.
-const uint32_t FISH_PRIMARY[4] = { 0x2E8BFFUL, 0x33D17AUL, 0xFF7A33UL, 0xB45CFFUL }; // pair, school, school2, angel
+const uint32_t FISH_PRIMARY[5] = { 0x2E8BFFUL, 0x33D17AUL, 0xFF7A33UL, 0xB45CFFUL, 0xFF9E7AUL }; // clownfish, guppy, piranha, angel, salmon
 #define LUCK_TINT_COLOR    0xFFE14DUL
 #define LUCK_TINT_STRENGTH 0.7f
 #define SHINY_ODDS         1000
@@ -607,7 +685,7 @@ bool fishIsShiny(uint32_t id) { return hash32u(id ^ 0x5bd1e995u) % SHINY_ODDS ==
 
 // Canonical fish colour from type + luck + id (resident fish and wild wanderers).
 uint32_t syncedFishColor(int type, float luck, uint32_t id) {
-  if (type < 0 || type > 3) type = 1;
+  if (type < 0 || type > 4) type = 1;   // 0..4 (incl. salmon); clamp strays to guppy
   if (luck < 0) luck = 0; if (luck > 1) luck = 1;
   uint32_t c = lerpColor888(FISH_PRIMARY[type], LUCK_TINT_COLOR, luck * LUCK_TINT_STRENGTH);
   if (fishIsShiny(id)) c = (~c) & 0xFFFFFFUL;
@@ -700,6 +778,11 @@ void addFish(FishType type) {
                   frandr(200, 600), frandr(90, 320), frandr(0.25f, 0.65f),
                   frandr(-3.0f, 3.0f), FISH_ANGEL, -1);
     numAngel++;
+  } else if (type == FISH_SALMON && numSalmon < MAX_SALMON) {
+    initFishEntry(MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + MAX_ANGEL + numSalmon,
+                  frandr(120, 680), frandr(90, 340), frandr(0.20f, 0.65f),
+                  frandr(-3.0f, 3.0f), FISH_SALMON, -1);
+    numSalmon++;
   }
 }
 
@@ -714,6 +797,8 @@ void removeFish(FishType type) {
     numSchool2--;
   } else if (type == FISH_ANGEL && numAngel > 0) {
     numAngel--;
+  } else if (type == FISH_SALMON && numSalmon > 0) {
+    numSalmon--;
   }
 }
 
@@ -737,17 +822,21 @@ void removeFishSlot(int idx) {
     int last = MAX_PAIR + MAX_SCHOOL + numSchool2 - 1;
     if (idx != last) fish[idx] = fish[last];
     numSchool2--;
-  } else {
+  } else if (idx < MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + MAX_ANGEL) {
     int last = MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + numAngel - 1;
     if (idx != last) fish[idx] = fish[last];
     numAngel--;
+  } else {
+    int last = MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + MAX_ANGEL + numSalmon - 1;
+    if (idx != last) fish[idx] = fish[last];
+    numSalmon--;
   }
 }
 
 int fishSellValue(int idx) {
   if (!isFishActive(idx)) return 0;
   const Fish& f = fish[idx];
-  int base = FISH_BASE_SELL[(int)f.type < 4 ? (int)f.type : 0];
+  int base = FISH_BASE_SELL[(int)f.type < 5 ? (int)f.type : 0];
   float sc = fishScale(f);
   int val = base
           + (int)(base * sc + 0.5f)
@@ -1191,7 +1280,51 @@ void setup() {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Food drop
 // ═══════════════════════════════════════════════════════════════════════════════
+// ── Feeding schedule: 3 meals/day, with hunger + daily luck consequences ────────
+static int currentMealSlot() {
+  float p = getDayProgress();                 // 0..1 across the (real or FAST) day
+  int s = (int)(p * MEALS_PER_DAY);
+  return s < 0 ? 0 : (s >= MEALS_PER_DAY ? MEALS_PER_DAY - 1 : s);
+}
+void resetFeedingDay() {
+  for (int i = 0; i < MEALS_PER_DAY; i++) mealFed[i] = false;
+  mealsToday = 0; overfeedToday = 0;
+}
+// At day's end, reward a disciplined schedule and penalise neglect/overfeeding.
+void evaluateFeedingDay() {
+  int missed = 0;
+  for (int i = 0; i < MEALS_PER_DAY; i++) if (!mealFed[i]) missed++;
+  float delta = (missed == 0 && overfeedToday == 0)
+      ? FEED_PERFECT_BONUS
+      : -(FEED_MISS_PENALTY * missed) - (FEED_OVERFEED_PENALTY * overfeedToday);
+  if (delta < FEED_DELTA_MIN) delta = FEED_DELTA_MIN;
+  if (delta > FEED_DELTA_MAX) delta = FEED_DELTA_MAX;
+  for (int i = 0; i < MAX_FISH; i++) if (isFishActive(i)) {
+    float l = fish[i].fishLuck + delta;
+    fish[i].fishLuck = l < 0 ? 0.0f : (l > 1 ? 1.0f : l);
+  }
+}
+// One feeding event (career): satisfies the current slot, or counts as overfeeding.
+void registerFeeding() {
+  int s = currentMealSlot();
+  if (!mealFed[s]) { mealFed[s] = true; mealsToday++; }
+  else             { overfeedToday++; }
+  tankHungry = false;                         // immediate visual relief
+}
+// Per-publish: advance the meal clock, roll the day over, derive hunger.
+void updateFeedingSchedule() {
+  int s = currentMealSlot();
+  if (!feedSchedInit) { lastMealSlot = s; feedSchedInit = true; }
+  if (s != lastMealSlot) {
+    if (s < lastMealSlot) { evaluateFeedingDay(); resetFeedingDay(); } // wrapped → new day
+    lastMealSlot = s;
+  }
+  float frac = getDayProgress() * MEALS_PER_DAY - s;
+  tankHungry = (!mealFed[s]) && (frac > HUNGER_GRACE);
+}
+
 void dropFood(int touchX = -1, int touchY = -1) {
+  if (gameMode == MODE_CAREER) registerFeeding();   // count this feeding toward the schedule
   int n = irandom(5, 11);
   int spawned = 0;
   bool hasTouch = (touchX >= 0);
@@ -1246,7 +1379,8 @@ void addSnail() {
 void spawnWanderer(float luck) {
   for (int i = 0; i < MAX_WANDER; i++) if (!wanderers[i].active) {
     float r = frandr(0, 1);
-    uint8_t type = (r < 0.1f + 0.3f * luck) ? 3 : (r < 0.4f) ? 0 : (r < 0.7f) ? 1 : 2;
+    // Salmon (4) is the common wild fish; clownfish (0) is now rare; angel luck-biased.
+    uint8_t type = (r < 0.1f + 0.3f * luck) ? 3 : (r < 0.6f) ? 4 : (r < 0.75f) ? 1 : (r < 0.92f) ? 2 : 0;
     bool fromLeft = (random(0, 2) == 0);
     Wanderer& w = wanderers[i];
     w.active = true; w.type = type; w.id = nextItemId++;
@@ -1261,12 +1395,21 @@ void spawnWanderer(float luck) {
     return;
   }
 }
+static const char* FISH_DISPLAY[5] = { "Clownfish", "Guppy", "Piranha", "Angelfish", "Salmon" };
 bool catchWandererById(uint32_t id) {
-  static const FishType T[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
+  static const FishType T[5] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
   for (int i = 0; i < MAX_WANDER; i++)
     if (wanderers[i].active && wanderers[i].id == id) {
-      addFish(T[wanderers[i].type]);
+      int ty = wanderers[i].type < 5 ? wanderers[i].type : 0;
+      int cnts[5] = { numPair, numSchool, numSchool2, numAngel, numSalmon };
+      int mxs[5]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL, MAX_SALMON };
+      bool added = cnts[ty] < mxs[ty];           // false if that species is at capacity
+      addFish(T[ty]);
       spawnPulse(wanderers[i].x, wanderers[i].y, 1, 0x88E0FFUL);
+      char msg[20];
+      if (added) snprintf(msg, sizeof(msg), "Caught %s!", FISH_DISPLAY[ty]);
+      else       snprintf(msg, sizeof(msg), "%s full", FISH_DISPLAY[ty]);
+      spawnFloatText(wanderers[i].x, wanderers[i].y, added ? 0x88E0FFUL : 0xFF8866UL, msg);
       wanderers[i].active = false; return true;
     }
   return false;
@@ -1276,8 +1419,11 @@ bool collectLootById(uint32_t id) {
     if (loot[i].active && loot[i].id == id) {
       uint32_t pc = loot[i].kind == 0 ? 0xFFD23FUL
         : (loot[i].tier == 2 ? 0xFFD23FUL : loot[i].tier == 1 ? 0xFF9EC4UL : 0xE7C9A0UL);
-      if (loot[i].kind == 0) gameCoins++; else gameShells += SHELL_VALUE[loot[i].tier];
+      char msg[20];
+      if (loot[i].kind == 0) { gameCoins++; snprintf(msg, sizeof(msg), "+1 coin"); }
+      else { int v = SHELL_VALUE[loot[i].tier]; gameShells += v; snprintf(msg, sizeof(msg), "+%d shell%s", v, v == 1 ? "" : "s"); }
       spawnPulse(loot[i].x, loot[i].y, 1, pc);
+      spawnFloatText(loot[i].x, loot[i].y, pc, msg);
       loot[i].active = false; return true;
     }
   return false;
@@ -1294,14 +1440,16 @@ bool tapCatch(int tx, int ty) {
   return false;
 }
 void careerStartReset() {
-  numPair = numSchool = numSchool2 = numAngel = 0;
-  addFish(FISH_PAIR); addFish(FISH_PAIR);
-  gameCoins = gameShells = gameFood = 0;
+  numPair = numSchool = numSchool2 = numAngel = numSalmon = 0;
+  addFish(FISH_SALMON); addFish(FISH_SALMON);   // start with 2 salmon
+  gameCoins = gameShells = 0; gameFood = 10;    // career starts stocked with 10 food
   for (int i = 0; i < MAX_WANDER; i++) wanderers[i].active = false;
   for (int i = 0; i < MAX_LOOT; i++)   loot[i].active = false;
   for (int i = 0; i < MAX_FISH; i++)   coinCD[i] = 0;
   numSnails = 0;
   for (int i = 0; i < MAX_SNAILS; i++) coinSnails[i].active = false;
+  resetFeedingDay(); feedSchedInit = false; tankHungry = false; bubbleSpawnCd = 0;
+  for (int i = 0; i < MAX_FOODBUBBLES; i++) foodBubbles[i].active = false;
 }
 void setGameMode(GameMode m) {
   if (m == MODE_CAREER) { gameMode = MODE_CAREER; careerStartReset(); }
@@ -1309,6 +1457,7 @@ void setGameMode(GameMode m) {
 }
 void updateCareer() {
   if (gameMode != MODE_CAREER) return;
+  updateFeedingSchedule();            // meal clock + hunger + day-end luck eval
   float luck = tankLuck();
   for (int i = 0; i < MAX_FISH; i++) {
     if (!isFishActive(i)) continue;
@@ -1351,23 +1500,32 @@ void updateCareer() {
     } else if (--it.ttl <= 0) { it.active = false; }
   }
 
-  // Coin-collector snails: intercept any coin (predict landing x = current x since coins
-  // fall straight down); sprint 4× for landed coins, fast-walk 2× for falling coins.
+  // Coin-collector snails: only react to a falling coin once it is halfway to the sand
+  // (y >= SAND_Y/2); sprint 4× for landed coins, fast-walk 2× for falling.
+  // Use moveToward so the snail stops exactly at the target x without direction jitter.
   for (int s = 0; s < numSnails; s++) {
     if (!coinSnails[s].active) continue;
     CoinSnail& sn = coinSnails[s];
     int tgt = -1; float td = 1e9f; bool tgtLanded = false;
     for (int i = 0; i < MAX_LOOT; i++) {
       if (!loot[i].active || loot[i].kind != 0) continue;
+      if (!loot[i].landed && loot[i].y < (float)SAND_Y * 0.5f) continue;
       float d = fabsf(loot[i].x - sn.x);
       if (loot[i].landed) {
         if (!tgtLanded || d < td) { td = d; tgt = i; tgtLanded = true; }
       } else if (!tgtLanded && d < td) { td = d; tgt = i; }
     }
     if (tgt >= 0) {
-      sn.facingRight = loot[tgt].x > sn.x;
-      float mult = tgtLanded ? 4.0f : 2.0f;
-      sn.x += (sn.facingRight ? 1 : -1) * sn.spd * mult;
+      float dx   = loot[tgt].x - sn.x;
+      float dist = fabsf(dx);
+      float step = sn.spd * (tgtLanded ? 4.0f : 2.0f);
+      if (dist <= step) {
+        sn.x = loot[tgt].x;              // arrived — stop exactly, no direction jitter
+        sn.facingRight = (dx >= 0);
+      } else {
+        sn.facingRight = (dx > 0);
+        sn.x += sn.facingRight ? step : -step;
+      }
     } else {
       sn.x += (sn.facingRight ? 1 : -1) * sn.spd;
       if (sn.x > SCREEN_W - 55) { sn.x = SCREEN_W - 55; sn.facingRight = false; }
@@ -1389,8 +1547,8 @@ void telemetryApplyControls() {
   if      (tm == 0) currentTimeMode = TIME_REAL;
   else if (tm == 1) currentTimeMode = TIME_FAST;
 
-  const FishType T[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
-  for (int t = 0; t < 4; t++) {
+  const FishType T[5] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
+  for (int t = 0; t < 5; t++) {
     for (int n = _ctrlFishAddReq[t].exchange(0); n > 0; n--) addFish(T[t]);
     for (int n = _ctrlFishDelReq[t].exchange(0); n > 0; n--) removeFish(T[t]);
   }
@@ -1400,7 +1558,7 @@ void telemetryApplyControls() {
   if      (m == 0) setGameMode(MODE_CREATIVE);
   else if (m == 1) setGameMode(MODE_CAREER);
 
-  for (int t = 0; t < 4; t++)
+  for (int t = 0; t < 5; t++)
     for (int n = _ctrlBuyFishReq[t].exchange(0); n > 0; n--)
       if (gameCoins >= FISH_PRICE[t]) { gameCoins -= FISH_PRICE[t]; addFish(T[t]); }
   for (int n = _ctrlBuyFoodReq.exchange(0); n > 0; n--)
@@ -1439,6 +1597,35 @@ void updateSnail() {
   snail.x += move;
   if (snail.x > SCREEN_W - 55) { snail.x = SCREEN_W - 55; snail.facingRight = false; }
   if (snail.x < 55)             { snail.x = 55;             snail.facingRight = true;  }
+}
+
+// Float existing "feed me" bubbles up + fade; spawn a new one over a random fish
+// every few seconds while the tank is hungry (career only).
+void updateFoodBubbles() {
+  for (int i = 0; i < MAX_FOODBUBBLES; i++) if (foodBubbles[i].active) {
+    if (!isFishActive(foodBubbles[i].fish)) { foodBubbles[i].active = false; continue; }
+    foodBubbles[i].rise += 0.4f;     // lift slightly above the fish it rides
+    if (--foodBubbles[i].ttl <= 0) foodBubbles[i].active = false;
+  }
+  if (gameMode == MODE_CAREER && tankHungry) {
+    if ((bubbleSpawnCd -= 1.0f) <= 0.0f) {
+      int picks[MAX_FISH], n = 0;
+      for (int i = 0; i < MAX_FISH; i++) if (isFishActive(i)) picks[n++] = i;
+      if (n > 0) {
+        int idx = picks[irandom(0, n)];
+        for (int b = 0; b < MAX_FOODBUBBLES; b++) if (!foodBubbles[b].active) {
+          foodBubbles[b].fish = idx;
+          foodBubbles[b].rise = 0.0f;
+          foodBubbles[b].ttl  = 95;
+          foodBubbles[b].active = true;
+          break;
+        }
+      }
+      bubbleSpawnCd = BUBBLE_SPAWN_CD * frandr(0.7f, 1.3f);   // subtle, jittered cadence
+    }
+  } else {
+    bubbleSpawnCd = 0.0f;
+  }
 }
 
 void updateStarfish() {
@@ -1587,11 +1774,16 @@ void updateFish() {
           f.tx = constrain(sc2x + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
           f.ty = constrain(sc2y + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
           f.tz = constrain(sc2z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
-        } else {
+        } else if (f.type == FISH_ANGEL) {
           // Angelfish — tighter spread, more vertical range
           f.tx = constrain(sacx + frandr(-120, 120), 30.0f, (float)(SCREEN_W - 30));
           f.ty = constrain(sacy + frandr(-110, 110), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
           f.tz = constrain(sacz + frandr(-0.18f, 0.18f), 0.05f, 0.72f);
+        } else {
+          // Salmon (school size 0) + any solitary type: roam the whole tank independently.
+          f.tx = frandr(30.0f, (float)(SCREEN_W - 30));
+          f.ty = frandr((float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+          f.tz = constrain(f.tz + frandr(-0.12f, 0.12f), 0.05f, 0.72f);
         }
       }
 
@@ -1602,18 +1794,23 @@ void updateFish() {
       ay += (f.ty - f.y) * seekStr;
       az += (f.tz - f.z) * 0.010f;
 
-      if (f.type == FISH_SCHOOL || f.type == FISH_SCHOOL2) {
-        float cx = (f.type == FISH_SCHOOL) ? scx  : sc2x;
-        float cy = (f.type == FISH_SCHOOL) ? scy  : sc2y;
-        float cz = (f.type == FISH_SCHOOL) ? scz  : sc2z;
-        int   js = (f.type == FISH_SCHOOL) ? MAX_PAIR : (MAX_PAIR + MAX_SCHOOL);
-        int   je = (f.type == FISH_SCHOOL) ? (MAX_PAIR + numSchool)
-                                           : (MAX_PAIR + MAX_SCHOOL + numSchool2);
-
-        ax += (cx - f.x) * 0.010f;
-        ay += (cy - f.y) * 0.007f;
-        az += (cz - f.z) * 0.007f;
-
+      if (typeSchools(f.type)) {                 // cohere to this fish's sub-school only
+        // Partition the type's slots into schools of FISH_SCHOOL_SIZE; a fish coheres to its
+        // own school's centroid, so beyond the cap fish form a separate school.
+        int typeBase  = (f.type == FISH_SCHOOL) ? MAX_PAIR : (MAX_PAIR + MAX_SCHOOL);
+        int typeCount = (f.type == FISH_SCHOOL) ? numSchool : numSchool2;
+        int sz  = FISH_SCHOOL_SIZE[f.type];        // 6 (guppy) / 4 (piranha)
+        int sub = (i - typeBase) / sz;
+        int js  = typeBase + sub * sz;
+        int je  = typeBase + ((sub + 1) * sz < typeCount ? (sub + 1) * sz : typeCount);
+        float cx = 0, cy = 0, cz = 0; int cnt = 0;
+        for (int j = js; j < je; j++) { if (!isFishActive(j)) continue; cx += fish[j].x; cy += fish[j].y; cz += fish[j].z; cnt++; }
+        if (cnt > 0) {
+          cx /= cnt; cy /= cnt; cz /= cnt;
+          ax += (cx - f.x) * 0.010f;
+          ay += (cy - f.y) * 0.007f;
+          az += (cz - f.z) * 0.007f;
+        }
         for (int j = js; j < je; j++) {
           if (j == i || !isFishActive(j)) continue;
           float dx = f.x - fish[j].x, dy = f.y - fish[j].y;
@@ -1759,6 +1956,28 @@ void drawSnail() { drawSnailShape((int)snail.x, snail.facingRight); }
 void drawCoinSnails() {                          // purchased coin collectors
   for (int i = 0; i < numSnails; i++)
     if (coinSnails[i].active) drawSnailShape((int)coinSnails[i].x, coinSnails[i].facingRight, true);
+}
+// "Feed me" thought bubble: a small white cloud with a fork + food pellets inside.
+void drawFoodBubbles() {
+  for (int i = 0; i < MAX_FOODBUBBLES; i++) {
+    if (!foodBubbles[i].active) continue;
+    int idx = foodBubbles[i].fish;
+    if (!isFishActive(idx)) continue;
+    // Re-anchor to the fish's live position each frame so the bubble follows it.
+    int x = projX(fish[idx].x, fish[idx].z);
+    int y = (int)(projY(fish[idx].y, fish[idx].z) - 22.0f - foodBubbles[i].rise);
+    const uint32_t FILL = 0xF4FBFFUL, EDGE = 0x88B8D8UL, FORK = 0xE0762AUL;
+    canvas.fillRect(x - 11, y - 9, 22, 18, FILL);     // bubble body
+    canvas.drawRect(x - 11, y - 9, 22, 18, EDGE);
+    canvas.fillCircle(x - 8,  y + 12, 2, FILL);       // trailing tail dots
+    canvas.fillCircle(x - 12, y + 15, 1, FILL);
+    canvas.drawFastVLine(x - 4, y - 5, 11, FORK);     // fork: stem + 2 tines
+    canvas.drawFastVLine(x - 6, y - 5, 4,  FORK);
+    canvas.drawFastVLine(x - 2, y - 5, 4,  FORK);
+    canvas.drawFastHLine(x - 6, y - 5, 5,  FORK);
+    canvas.fillCircle(x + 4, y - 1, 2, 0x49C24AUL);   // food pellets
+    canvas.fillCircle(x + 7, y + 4, 1, 0xFFD23FUL);
+  }
 }
 
 void drawStarfish() {
@@ -2260,13 +2479,13 @@ void drawShopPanel() {
   int pages = (nActive + SP_ROWS - 1) / SP_ROWS;
   if (shopSellPage >= pages) shopSellPage = pages > 0 ? pages - 1 : 0;
   int start = shopSellPage * SP_ROWS;
-  static const char* tNames[4] = { "LARGE","SCHOOL","DEEP","ANGEL" };
+  static const char* tNames[5] = { "CLOWN","GUPPY","PIRANHA","ANGEL","SALMON" };
   for (int r = 0; r < SP_ROWS && (start + r) < nActive; r++) {
     int idx = activeFish[start + r];
     int ry = SP_Y + 28 + r * SP_ROW_H;
     int sv = fishSellValue(idx);
     char line[40];
-    snprintf(line, sizeof(line), "#%-2d %s  %dc", idx, tNames[(int)fish[idx].type < 4 ? (int)fish[idx].type : 0], sv);
+    snprintf(line, sizeof(line), "#%-2d %s  %dc", idx, tNames[(int)fish[idx].type < 5 ? (int)fish[idx].type : 0], sv);
     canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
     canvas.setCursor(SP_X + 8, ry + 4); canvas.print(line);
     canvas.fillRect(SP_X + 270, ry, 52, 28, 0x3A1800UL);
@@ -2321,16 +2540,17 @@ void drawShopPanel() {
     canvas.setTextColor(can ? 0xCCFFDDUL : 0x334455UL);
     canvas.setCursor(rx + 157, SP_Y + 70); canvas.print("BUY");
   }
-  // Fish types
-  const char* fNames[4] = { "LARGE FISH","SCHOOL FISH","DEEP FISH","ANGELFISH" };
-  int cnts[4] = { numPair, numSchool, numSchool2, numAngel };
-  int mxs[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
-  for (int row = 0; row < 4; row++) {
-    int fy = SP_Y + 108 + row * 44;
-    bool can = cnts[row] < mxs[row] && gameCoins >= FISH_PRICE[row];
-    canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
-    canvas.setCursor(rx, fy + 8); canvas.print(fNames[row]);
-    char pbuf[8]; snprintf(pbuf, sizeof(pbuf), "%dc", FISH_PRICE[row]);
+  // Fish types — each is an individual fish, all buyable (guppy/piranha too).
+  const char* fNames[5] = { "CLOWNFISH","GUPPY","PIRANHA","ANGELFISH","SALMON" };
+  int cnts[5] = { numPair, numSchool, numSchool2, numAngel, numSalmon };
+  int mxs[5]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL, MAX_SALMON };
+  for (int t = 0; t < 5; t++) {
+    int fy = SP_Y + 108 + t * 44;
+    canvas.setTextSize(1);
+    bool can = cnts[t] < mxs[t] && gameCoins >= FISH_PRICE[t];
+    canvas.setTextColor(0xAADDFFUL);
+    canvas.setCursor(rx, fy + 8); canvas.print(fNames[t]);
+    char pbuf[8]; snprintf(pbuf, sizeof(pbuf), "%dc", FISH_PRICE[t]);
     canvas.setTextColor(can ? 0xFFD23FUL : 0x556677UL);
     canvas.setCursor(rx + 100, fy + 8); canvas.print(pbuf);
     canvas.fillRect(rx + 148, fy, 56, 28, can ? 0x3A2E0AUL : 0x0C1A2AUL);
@@ -2390,11 +2610,11 @@ void drawMenu() {
 
   canvas.drawFastHLine(MENU_X + 8, MENU_Y + 34, MENU_W - 16, 0x2244AAUL);
 
-  const char* labels[4] = { "LARGE FISH", "SCHOOL FISH", "DEEP FISH", "ANGELFISH" };
-  int counts[4]         = { numPair, numSchool, numSchool2, numAngel };
-  int maxes[4]          = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
+  const char* labels[5] = { "CLOWNFISH", "GUPPY", "PIRANHA", "ANGELFISH", "SALMON" };
+  int counts[5]         = { numPair, numSchool, numSchool2, numAngel, numSalmon };
+  int maxes[5]          = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL, MAX_SALMON };
 
-  for (int row = 0; row < 4; row++) {
+  for (int row = 0; row < 5; row++) {
     int ry = MENU_Y + 45 + row * 58;
 
     canvas.setTextSize(1);
@@ -2678,15 +2898,15 @@ void loop() {
         if (tx >= (uint16_t)(rx + 148) && tx < (uint16_t)(rx + 204) &&
             ty >= (uint16_t)(SP_Y + 63) && ty < (uint16_t)(SP_Y + 89))
           if (gameCoins >= SNAIL_PRICE && numSnails < MAX_SNAILS) { gameCoins -= SNAIL_PRICE; addSnail(); }
-        const FishType T[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
-        int cnts[4] = { numPair, numSchool, numSchool2, numAngel };
-        int mxs[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
-        for (int row = 0; row < 4; row++) {
-          int fy = SP_Y + 108 + row * 44;
+        const FishType T[5] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
+        int cnts[5] = { numPair, numSchool, numSchool2, numAngel, numSalmon };
+        int mxs[5]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL, MAX_SALMON };
+        for (int t = 0; t < 5; t++) {
+          int fy = SP_Y + 108 + t * 44;
           if (tx >= (uint16_t)(rx + 148) && tx < (uint16_t)(rx + 204) &&
               ty >= (uint16_t)fy          && ty < (uint16_t)(fy + 28)) {
-            if (cnts[row] < mxs[row] && gameCoins >= FISH_PRICE[row]) {
-              gameCoins -= FISH_PRICE[row]; addFish(T[row]);
+            if (cnts[t] < mxs[t] && gameCoins >= FISH_PRICE[t]) {
+              gameCoins -= FISH_PRICE[t]; addFish(T[t]);
             }
             break;
           }
@@ -2711,8 +2931,8 @@ void loop() {
         }
       }
       // Route to [-]/[+] buttons; block food drop while menu open
-      const FishType rowType[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
-      for (int row = 0; row < 4; row++) {
+      const FishType rowType[5] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
+      for (int row = 0; row < 5; row++) {
         int ry = MENU_Y + 45 + row * 58;
         if (tx >= (uint16_t)(MENU_X + 148) && tx < (uint16_t)(MENU_X + 178) &&
             ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
@@ -2722,8 +2942,8 @@ void loop() {
         if (tx >= (uint16_t)(MENU_X + 210) && tx < (uint16_t)(MENU_X + 240) &&
             ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
           if (gameMode == MODE_CAREER) {           // buy with coins (guard the cap)
-            int cnt[4] = { numPair, numSchool, numSchool2, numAngel };
-            int mx[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
+            int cnt[5] = { numPair, numSchool, numSchool2, numAngel, numSalmon };
+            int mx[5]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL, MAX_SALMON };
             if (cnt[row] < mx[row] && gameCoins >= FISH_PRICE[row]) {
               gameCoins -= FISH_PRICE[row]; addFish(rowType[row]);
             }
@@ -2812,6 +3032,7 @@ void loop() {
   telemetryUpdate();
   telemetryProcessFlags();   // act on server directives (rebuild / re-check)
   telemetryApplyControls();  // apply dashboard weather/time/fish/feed directives
+  telemetryApplyAquariumSwitch(); // honor a !SWITCHAQ reassignment (re-bootstrap new tank)
 
   updateTraffic();
   updateEacFish();
@@ -2822,7 +3043,9 @@ void loop() {
   updateFlakes();
   updateFish();
   updateCareer();     // age fish + spawn coins/shells/wanderers (career only)
+  updateFoodBubbles(); // float/spawn "feed me" bubbles while hungry
   updatePulses();     // advance tap/collect feedback rings
+  updateFloatTexts(); // advance floating action labels
 
   drawBackground();
   drawWeatherSky();   // overwrites the top TANK_TOP px with sky + weather effects
@@ -2841,7 +3064,9 @@ void loop() {
   drawStarfish();
   drawLootItems();    // coins + shells (career collectibles)
   drawWanderers();    // wandering fish with catch halo
+  drawFoodBubbles();  // "feed me" thought bubbles above hungry fish
   drawPulses();       // tap ripples + collect bursts (over entities, under rim)
+  drawFloatTexts();   // "Caught Salmon!" / "+1 coin" action feedback
   drawTankRim();      // draws over the bottom of the sky, giving a clean rim
   drawGameHud();      // mode + wallet readout
   drawTelemetryStatus();

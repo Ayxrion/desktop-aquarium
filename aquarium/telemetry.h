@@ -42,6 +42,14 @@
 #ifndef TELEMETRY_AQUARIUM_ID
 #define TELEMETRY_AQUARIUM_ID "esp-aquarium"
 #endif
+// Stable per-DEVICE id so the server registers this physical unit as a first-class
+// device (separate from the aquarium it currently shows). Override in wifi_config.h.
+#ifndef TELEMETRY_DEVICE_ID
+#define TELEMETRY_DEVICE_ID "esp-device-1"
+#endif
+// Which aquarium this device currently shows — mutable at runtime via !SWITCHAQ:<id>.
+static char activeAquariumId[64] = TELEMETRY_AQUARIUM_ID;
+static char _pendingSwitchAq[64] = "";
 #ifndef TELEMETRY_INTERVAL_MS
 #define TELEMETRY_INTERVAL_MS 1000
 #endif
@@ -92,11 +100,11 @@ static int telemetrySrvPair = 0, telemetrySrvSchool = 0,
 static std::atomic<int> _ctrlWeatherReq{-2};      // -2 none, -1 auto, 0..6 condition
 static std::atomic<int> _ctrlTimeReq{-1};         // -1 none, 0 REAL, 1 FAST
 static std::atomic<int> _ctrlFeedReq{0};          // pending food drops
-static std::atomic<int> _ctrlFishAddReq[4];       // pending adds per fish type 0..3
-static std::atomic<int> _ctrlFishDelReq[4];       // pending removes per fish type 0..3
+static std::atomic<int> _ctrlFishAddReq[5];       // pending adds per fish type 0..4
+static std::atomic<int> _ctrlFishDelReq[5];       // pending removes per fish type 0..4
 // ── Career game directives ──
 static std::atomic<int> _ctrlModeReq{-1};          // -1 none, 0 creative, 1 career
-static std::atomic<int> _ctrlBuyFishReq[4];        // shop fish purchases per type
+static std::atomic<int> _ctrlBuyFishReq[5];        // shop fish purchases per type
 static std::atomic<int> _ctrlBuyFoodReq{0};        // shop food purchases
 static std::atomic<int> _ctrlBuySnailReq{0};       // shop coin-collector snail purchases
 #define CTRL_CATCH_MAX 24
@@ -111,13 +119,21 @@ static std::atomic<int> _ctrlSellFishCount{0};
 // so a single substring match per token is sufficient.
 static void _telemetryParseControls(const char* body) {
     const char* d;
+    // !SWITCHAQ:<id> — dashboard reassigned this device to another aquarium (applied on
+    // the render thread by telemetryApplyAquariumSwitch()).
+    if ((d = strstr(body, "!SWITCHAQ:")) != nullptr) {
+        d += 10;
+        size_t i = 0;
+        while (d[i] && d[i] != '\n' && d[i] != '\t' && i < sizeof(_pendingSwitchAq) - 1) { _pendingSwitchAq[i] = d[i]; i++; }
+        _pendingSwitchAq[i] = '\0';
+    }
     if ((d = strstr(body, "!WEATHER:")) != nullptr) _ctrlWeatherReq.store(atoi(d + 9));
     if ((d = strstr(body, "!TIME:"))    != nullptr) _ctrlTimeReq.store(atoi(d + 6));
     if ((d = strstr(body, "!FEED:"))    != nullptr) _ctrlFeedReq.fetch_add(atoi(d + 6));
     if ((d = strstr(body, "!MODE:"))     != nullptr) _ctrlModeReq.store(atoi(d + 6));
     if ((d = strstr(body, "!BUYFOOD:"))  != nullptr) _ctrlBuyFoodReq.fetch_add(atoi(d + 9));
     if ((d = strstr(body, "!BUYSNAIL:")) != nullptr) _ctrlBuySnailReq.fetch_add(atoi(d + 10));
-    for (int t = 0; t < 4; t++) {
+    for (int t = 0; t < 5; t++) {
         char tok[16];
         snprintf(tok, sizeof(tok), "!FISHADD:%d:", t);
         if ((d = strstr(body, tok)) != nullptr) _ctrlFishAddReq[t].fetch_add(atoi(d + strlen(tok)));
@@ -227,18 +243,18 @@ static int _buildTelemetryJson() {
     int wc = (int)currentWeather;
 
     o = _tAppend(o,
-        "{\"aquarium_id\":\"%s\",\"platform\":\"esp32\",\"fw_version\":\"%s\","
+        "{\"aquarium_id\":\"%s\",\"device_id\":\"%s\",\"platform\":\"esp32\",\"fw_version\":\"%s\","
         "\"uptime_ms\":%lu,\"tick\":%d,\"frame_ms\":%d,"
         "\"screen\":{\"w\":%d,\"h\":%d,\"tank_top\":%d},"
         "\"weather\":{\"condition\":%d,\"name\":\"%s\",\"override\":%s},"
         "\"time\":{\"day_progress\":%.4f,\"mode\":\"%s\"},"
-        "\"counts\":{\"pair\":%d,\"school\":%d,\"school2\":%d,\"angel\":%d},",
-        TELEMETRY_AQUARIUM_ID, FIRMWARE_VERSION,
+        "\"counts\":{\"pair\":%d,\"school\":%d,\"school2\":%d,\"angel\":%d,\"salmon\":%d},",
+        activeAquariumId, TELEMETRY_DEVICE_ID, FIRMWARE_VERSION,
         (unsigned long)millis(), (int)tick, FRAME_MS,
         SCREEN_W, SCREEN_H, TANK_TOP,
         wc, _telemetryWeatherName(wc), (weatherOverrideIdx >= 0) ? "true" : "false",
         getDayProgress(), (currentTimeMode == TIME_FAST) ? "FAST" : "REAL",
-        numPair, numSchool, numSchool2, numAngel);
+        numPair, numSchool, numSchool2, numAngel, numSalmon);
 
     // Fish
     o = _tAppend(o, "\"fish\":[");
@@ -303,11 +319,15 @@ static int _buildTelemetryJson() {
             i ? "," : "", (int)fgHornworts[i].baseX, fgHornworts[i].segs);
     o = _tAppend(o, "]},");
 
-    // Career game state
+    // Career game state (+ feeding schedule: fed/meals today, hunger, overfeeding)
+    int mealbits = 0;
+    for (int i = 0; i < MEALS_PER_DAY; i++) if (mealFed[i]) mealbits |= (1 << i);
     o = _tAppend(o,
-        "\"game\":{\"mode\":\"%s\",\"coins\":%d,\"shells\":%d,\"food\":%d,\"luck\":%.3f},",
+        "\"game\":{\"mode\":\"%s\",\"coins\":%d,\"shells\":%d,\"food\":%d,\"luck\":%.3f,"
+        "\"fed\":%d,\"meals\":%d,\"hungry\":%d,\"overfed\":%d,\"mealbits\":%d},",
         (gameMode == MODE_CAREER) ? "career" : "creative",
-        gameCoins, gameShells, gameFood, tankLuck());
+        gameCoins, gameShells, gameFood, tankLuck(),
+        mealsToday, MEALS_PER_DAY, tankHungry ? 1 : 0, overfeedToday, mealbits);
 
     // Wandering fish (catchable)
     o = _tAppend(o, "\"wanderers\":[");
@@ -422,7 +442,7 @@ static String _localProfileSig() {
     // plant layout were deliberately dropped: they're cosmetic and caused spurious
     // mismatches (reseeded plants on boot, device↔server color formatting drift).
     return "P:" + String(numPair) + "," + String(numSchool) + "," +
-           String(numSchool2) + "," + String(numAngel);
+           String(numSchool2) + "," + String(numAngel) + "," + String(numSalmon);
 }
 
 // GET /bootstrap into doc. Returns true on HTTP 200 + valid JSON.
@@ -430,7 +450,7 @@ static bool _fetchBootstrapDoc(DynamicJsonDocument& doc) {
     if (TELEMETRY_HOST[0] == '\0' || !_wifiEnsureConnected()) return false;
     String base = String(TELEMETRY_HOST);
     if (base.endsWith("/api/telemetry")) base = base.substring(0, base.length() - 14);
-    String url = base + "/api/aquariums/" + TELEMETRY_AQUARIUM_ID + "/bootstrap";
+    String url = base + "/api/aquariums/" + activeAquariumId + "/bootstrap";
     WiFiClient client;
     HTTPClient http;
     if (!http.begin(client, url)) return false;
@@ -457,16 +477,24 @@ static void _applyServerProfileDoc(DynamicJsonDocument& doc) {
         gameCoins  = game["coins"]  | 0;
         gameShells = game["shells"] | 0;
         gameFood   = game["food"]   | 0;
+        // Restore today's feeding progress so reboot mid-day doesn't reset the schedule.
+        mealsToday    = game["fed"]     | 0;
+        overfeedToday = game["overfed"] | 0;
+        int mealbits  = game["mealbits"] | 0;
+        for (int i = 0; i < MEALS_PER_DAY; i++) mealFed[i] = (mealbits >> i) & 1;
+        feedSchedInit = false;   // re-sync the slot clock on the next tick (no spurious day-eval)
     }
 
     JsonObject counts = doc["counts"];
     int wantP = counts["pair"] | numPair, wantS = counts["school"] | numSchool;
     int wantS2 = counts["school2"] | numSchool2, wantA = counts["angel"] | numAngel;
-    numPair = numSchool = numSchool2 = numAngel = 0;
+    int wantSa = counts["salmon"] | numSalmon;
+    numPair = numSchool = numSchool2 = numAngel = numSalmon = 0;
     for (int i = 0; i < wantP  && numPair    < MAX_PAIR;    i++) addFish(FISH_PAIR);
     for (int i = 0; i < wantS  && numSchool  < MAX_SCHOOL;  i++) addFish(FISH_SCHOOL);
     for (int i = 0; i < wantS2 && numSchool2 < MAX_SCHOOL2; i++) addFish(FISH_SCHOOL2);
     for (int i = 0; i < wantA  && numAngel   < MAX_ANGEL;   i++) addFish(FISH_ANGEL);
+    for (int i = 0; i < wantSa && numSalmon  < MAX_SALMON;  i++) addFish(FISH_SALMON);
 
     JsonObject plants = doc["plants"];
     if (!plants.isNull()) {
@@ -498,6 +526,20 @@ static void _applyServerProfileDoc(DynamicJsonDocument& doc) {
             fgHornworts[i].segs  = (uint8_t)(p["segs"] | fgHornworts[i].segs);
             i++;
         }
+    }
+
+    // Coin-collector snails — purchased & durable, so restore them across a reboot.
+    // (Loot/wanderers are transient with short TTLs and are intentionally not restored.)
+    numSnails = 0;
+    for (int i = 0; i < MAX_SNAILS; i++) coinSnails[i].active = false;
+    for (JsonObject s : doc["snails"].as<JsonArray>()) {
+        if (numSnails >= MAX_SNAILS) break;
+        CoinSnail& cs = coinSnails[numSnails];
+        cs.x           = s["x"]            | (float)(SCREEN_W / 2);
+        cs.spd         = s["spd"]          | 2.0f;
+        cs.facingRight = s["facing_right"] | true;
+        cs.active      = true;
+        numSnails++;
     }
 
     for (JsonObject jf : doc["fish"].as<JsonArray>()) {
@@ -545,6 +587,17 @@ static void telemetryBootstrap() {
         Serial.println("Telemetry: no saved profile on server (keeping local tank)");
 }
 
+// Apply a pending !SWITCHAQ reassignment: point at the new aquarium + load its state.
+// Call from the render loop (core 1) — it rebuilds fish[] via the bootstrap restore.
+static void telemetryApplyAquariumSwitch() {
+    if (_pendingSwitchAq[0] == '\0') return;
+    strncpy(activeAquariumId, _pendingSwitchAq, sizeof(activeAquariumId) - 1);
+    activeAquariumId[sizeof(activeAquariumId) - 1] = '\0';
+    _pendingSwitchAq[0] = '\0';
+    Serial.printf("Telemetry: switching to aquarium '%s'\n", activeAquariumId);
+    telemetryFetchAndApplyProfile();
+}
+
 // Runtime re-enable: compare local profile to the server's; prompt if different.
 static void telemetryReenableCheck() {
     if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
@@ -564,7 +617,7 @@ static void _postResolve(const char* choice) {
     if (TELEMETRY_HOST[0] == '\0' || !_wifiEnsureConnected()) return;
     String base = String(TELEMETRY_HOST);
     if (base.endsWith("/api/telemetry")) base = base.substring(0, base.length() - 14);
-    String url  = base + "/api/aquariums/" + TELEMETRY_AQUARIUM_ID + "/resolve";
+    String url  = base + "/api/aquariums/" + activeAquariumId + "/resolve";
     String body = String("{\"choice\":\"") + choice + "\"}";
     WiFiClient client;
     HTTPClient http;

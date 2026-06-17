@@ -42,9 +42,20 @@
 #ifndef TELEMETRY_AQUARIUM_ID
 #define TELEMETRY_AQUARIUM_ID "pi-aquarium"
 #endif
+// Stable per-DEVICE id so the server can register this physical unit as a first-class
+// device (separate from the aquarium it currently shows). Set per-board in wifi_config.h.
+#ifndef TELEMETRY_DEVICE_ID
+#define TELEMETRY_DEVICE_ID "pi-device-1"
+#endif
 #ifndef TELEMETRY_INTERVAL_MS
 #define TELEMETRY_INTERVAL_MS 1000
 #endif
+
+// Which aquarium this device is currently showing. Mutable at runtime: the dashboard
+// can reassign the device to another tank via a !SWITCHAQ:<id> directive, after which
+// the device re-bootstraps and POSTs under the new id. Seeded from the compile-time id.
+static char activeAquariumId[64] = TELEMETRY_AQUARIUM_ID;
+static char _pendingSwitchAq[64] = "";   // set by the control parser; applied on the render thread
 
 static uint32_t _lastTelemetryMs = 0;
 
@@ -104,11 +115,11 @@ static int telemetrySrvPair = 0, telemetrySrvSchool = 0,
 static std::atomic<int> _ctrlWeatherReq{-2};      // -2 none, -1 auto, 0..6 condition
 static std::atomic<int> _ctrlTimeReq{-1};         // -1 none, 0 REAL, 1 FAST
 static std::atomic<int> _ctrlFeedReq{0};          // pending food drops
-static std::atomic<int> _ctrlFishAddReq[4];       // pending adds per fish type 0..3
-static std::atomic<int> _ctrlFishDelReq[4];       // pending removes per fish type 0..3
+static std::atomic<int> _ctrlFishAddReq[5];       // pending adds per fish type 0..4
+static std::atomic<int> _ctrlFishDelReq[5];       // pending removes per fish type 0..4
 // ── Career game directives ──
 static std::atomic<int> _ctrlModeReq{-1};          // -1 none, 0 creative, 1 career
-static std::atomic<int> _ctrlBuyFishReq[4];        // shop fish purchases per type
+static std::atomic<int> _ctrlBuyFishReq[5];        // shop fish purchases per type
 static std::atomic<int> _ctrlBuyFoodReq{0};        // shop food purchases
 static std::atomic<int> _ctrlBuySnailReq{0};       // shop coin-collector snail purchases
 #define CTRL_CATCH_MAX 24
@@ -123,13 +134,21 @@ static std::atomic<int> _ctrlSellFishCount{0};
 // so a single substring match per token is sufficient.
 static void _telemetryParseControls(const char* body) {
     const char* d;
+    // !SWITCHAQ:<id> — dashboard reassigned this device to another aquarium. Stash the id;
+    // the render thread applies it (re-bootstrap) via telemetryApplyAquariumSwitch().
+    if ((d = strstr(body, "!SWITCHAQ:")) != nullptr) {
+        d += 10;
+        size_t i = 0;
+        while (d[i] && d[i] != '\n' && d[i] != '\t' && i < sizeof(_pendingSwitchAq) - 1) { _pendingSwitchAq[i] = d[i]; i++; }
+        _pendingSwitchAq[i] = '\0';
+    }
     if ((d = strstr(body, "!WEATHER:")) != nullptr) _ctrlWeatherReq.store(atoi(d + 9));
     if ((d = strstr(body, "!TIME:"))    != nullptr) _ctrlTimeReq.store(atoi(d + 6));
     if ((d = strstr(body, "!FEED:"))    != nullptr) _ctrlFeedReq.fetch_add(atoi(d + 6));
     if ((d = strstr(body, "!MODE:"))     != nullptr) _ctrlModeReq.store(atoi(d + 6));
     if ((d = strstr(body, "!BUYFOOD:"))  != nullptr) _ctrlBuyFoodReq.fetch_add(atoi(d + 9));
     if ((d = strstr(body, "!BUYSNAIL:")) != nullptr) _ctrlBuySnailReq.fetch_add(atoi(d + 10));
-    for (int t = 0; t < 4; t++) {
+    for (int t = 0; t < 5; t++) {
         char tok[16];
         snprintf(tok, sizeof(tok), "!FISHADD:%d:", t);
         if ((d = strstr(body, tok)) != nullptr) _ctrlFishAddReq[t].fetch_add(atoi(d + strlen(tok)));
@@ -234,18 +253,18 @@ static std::string _buildTelemetryJson() {
 
     int wc = (int)currentWeather;
     snprintf(tmp, sizeof(tmp),
-        "{\"aquarium_id\":\"%s\",\"platform\":\"pi\",\"fw_version\":\"%s\","
+        "{\"aquarium_id\":\"%s\",\"device_id\":\"%s\",\"platform\":\"pi\",\"fw_version\":\"%s\","
         "\"uptime_ms\":%u,\"tick\":%d,\"frame_ms\":%d,"
         "\"screen\":{\"w\":%d,\"h\":%d,\"tank_top\":%d},"
         "\"weather\":{\"condition\":%d,\"name\":\"%s\",\"override\":%s},"
         "\"time\":{\"day_progress\":%.4f,\"mode\":\"%s\"},"
-        "\"counts\":{\"pair\":%d,\"school\":%d,\"school2\":%d,\"angel\":%d},",
-        TELEMETRY_AQUARIUM_ID, FIRMWARE_VERSION,
+        "\"counts\":{\"pair\":%d,\"school\":%d,\"school2\":%d,\"angel\":%d,\"salmon\":%d},",
+        activeAquariumId, TELEMETRY_DEVICE_ID, FIRMWARE_VERSION,
         (unsigned)millis(), (int)tick, FRAME_MS,
         SCREEN_W, SCREEN_H, TANK_TOP,
         wc, _weatherName(wc), (weatherOverrideIdx >= 0) ? "true" : "false",
         getDayProgress(), (currentTimeMode == TIME_FAST) ? "FAST" : "REAL",
-        numPair, numSchool, numSchool2, numAngel);
+        numPair, numSchool, numSchool2, numAngel, numSalmon);
     j += tmp;
 
     // Fish
@@ -323,11 +342,15 @@ static std::string _buildTelemetryJson() {
     }
     j += "]},";
 
-    // Career game state
+    // Career game state (+ feeding schedule: fed/meals today, hunger, overfeeding)
+    int mealbits = 0;
+    for (int i = 0; i < MEALS_PER_DAY; i++) if (mealFed[i]) mealbits |= (1 << i);
     snprintf(tmp, sizeof(tmp),
-        "\"game\":{\"mode\":\"%s\",\"coins\":%d,\"shells\":%d,\"food\":%d,\"luck\":%.3f},",
+        "\"game\":{\"mode\":\"%s\",\"coins\":%d,\"shells\":%d,\"food\":%d,\"luck\":%.3f,"
+        "\"fed\":%d,\"meals\":%d,\"hungry\":%d,\"overfed\":%d,\"mealbits\":%d},",
         (gameMode == MODE_CAREER) ? "career" : "creative",
-        gameCoins, gameShells, gameFood, tankLuck());
+        gameCoins, gameShells, gameFood, tankLuck(),
+        mealsToday, MEALS_PER_DAY, tankHungry ? 1 : 0, overfeedToday, mealbits);
     j += tmp;
 
     // Wandering fish (catchable)
@@ -509,7 +532,7 @@ static std::string _localProfileSig() {
     // plant layout were deliberately dropped: they're cosmetic and caused spurious
     // mismatches (reseeded plants on boot, device↔server color formatting drift).
     char tmp[48];
-    snprintf(tmp, sizeof(tmp), "P:%d,%d,%d,%d", numPair, numSchool, numSchool2, numAngel);
+    snprintf(tmp, sizeof(tmp), "P:%d,%d,%d,%d,%d", numPair, numSchool, numSchool2, numAngel, numSalmon);
     return std::string(tmp);
 }
 
@@ -536,7 +559,7 @@ static int _parseObjArray(const char* p, char outObjs[][256], int maxObjs) {
 static bool _fetchBootstrap() {
     if (TELEMETRY_HOST[0] == '\0') return false;
     std::string url = std::string(TELEMETRY_HOST)
-        + "/api/aquariums/" + TELEMETRY_AQUARIUM_ID + "/bootstrap";
+        + "/api/aquariums/" + activeAquariumId + "/bootstrap";
     std::string keyHeader = std::string("X-Api-Key: ") + TELEMETRY_API_KEY;
     CURL* curl = curl_easy_init();
     if (!curl) return false;
@@ -635,24 +658,32 @@ static void _applyServerProfile(const char* json) {
         if (_jGetInt(gp, "coins",  &v)) gameCoins  = v;
         if (_jGetInt(gp, "shells", &v)) gameShells = v;
         if (_jGetInt(gp, "food",   &v)) gameFood   = v;
+        // Restore today's feeding progress so reboot mid-day doesn't reset the schedule.
+        if (_jGetInt(gp, "fed",     &v)) mealsToday    = v;
+        if (_jGetInt(gp, "overfed", &v)) overfeedToday = v;
+        if (_jGetInt(gp, "mealbits", &v))
+            for (int i = 0; i < MEALS_PER_DAY; i++) mealFed[i] = (v >> i) & 1;
+        feedSchedInit = false;   // re-sync the slot clock on the next tick (no spurious day-eval)
     }
 
     // 1) Fish composition from saved counts — rebuild via addFish (handles slots
     //    + pair partners), then positions get overlaid by _applyBootstrap below.
     const char* cp = strstr(json, "\"counts\":");
-    int wantP = numPair, wantS = numSchool, wantS2 = numSchool2, wantA = numAngel;
+    int wantP = numPair, wantS = numSchool, wantS2 = numSchool2, wantA = numAngel, wantSa = numSalmon;
     if (cp) {
         int v;
         if (_jGetInt(cp, "pair",    &v)) wantP  = v;
         if (_jGetInt(cp, "school",  &v)) wantS  = v;
         if (_jGetInt(cp, "school2", &v)) wantS2 = v;
         if (_jGetInt(cp, "angel",   &v)) wantA  = v;
+        if (_jGetInt(cp, "salmon",  &v)) wantSa = v;
     }
-    numPair = numSchool = numSchool2 = numAngel = 0;
+    numPair = numSchool = numSchool2 = numAngel = numSalmon = 0;
     for (int i = 0; i < wantP  && numPair    < MAX_PAIR;    i++) addFish(FISH_PAIR);
     for (int i = 0; i < wantS  && numSchool  < MAX_SCHOOL;  i++) addFish(FISH_SCHOOL);
     for (int i = 0; i < wantS2 && numSchool2 < MAX_SCHOOL2; i++) addFish(FISH_SCHOOL2);
     for (int i = 0; i < wantA  && numAngel   < MAX_ANGEL;   i++) addFish(FISH_ANGEL);
+    for (int i = 0; i < wantSa && numSalmon  < MAX_SALMON;  i++) addFish(FISH_SALMON);
 
     // 2) Plant layout from the server (regenerate seaweed branches locally —
     //    they aren't part of the profile signature).
@@ -695,6 +726,26 @@ static void _applyServerProfile(const char* json) {
         }
     }
 
+    // 2b) Coin-collector snails — a purchased, durable object, so restore them
+    //     instead of letting a reboot wipe the player's investment. (Loot/wanderers
+    //     are transient with short TTLs and are intentionally not restored.)
+    numSnails = 0;
+    for (int i = 0; i < MAX_SNAILS; i++) coinSnails[i].active = false;
+    const char* snp = strstr(json, "\"snails\":");
+    if (snp) {
+        char sobjs[MAX_SNAILS][256];
+        int nc = _parseObjArray(snp, sobjs, MAX_SNAILS);
+        for (int i = 0; i < nc && numSnails < MAX_SNAILS; i++) {
+            int x; float spd; bool fr;
+            CoinSnail& s = coinSnails[numSnails];
+            s.x           = _jGetInt(sobjs[i], "x", &x)              ? (float)x : frandr(80, SCREEN_W - 80);
+            s.spd         = _jGetFloat(sobjs[i], "spd", &spd)        ? spd      : frandr(1.5f, 2.5f);
+            s.facingRight = _jGetBool(sobjs[i], "facing_right", &fr) ? fr       : true;
+            s.active      = true;
+            numSnails++;
+        }
+    }
+
     // 3) Overlay the saved fish positions + names.
     _applyBootstrap(json);
     telemetryProfileLoaded = true;
@@ -710,6 +761,17 @@ static void telemetryBootstrap() {
         _applyServerProfile(_bootstrapJson);
     else
         printf("Telemetry: no saved profile on server (keeping local tank)\n");
+}
+
+// Apply a pending !SWITCHAQ: point this device at a new aquarium and load its state.
+// Call from the render thread (it rebuilds fish[] via the bootstrap restore).
+static void telemetryApplyAquariumSwitch() {
+    if (_pendingSwitchAq[0] == '\0') return;
+    strncpy(activeAquariumId, _pendingSwitchAq, sizeof(activeAquariumId) - 1);
+    activeAquariumId[sizeof(activeAquariumId) - 1] = '\0';
+    _pendingSwitchAq[0] = '\0';
+    printf("Telemetry: switching to aquarium '%s'\n", activeAquariumId);
+    telemetryBootstrap();   // load the new tank's saved state (or keep current if brand-new)
 }
 
 // Runtime re-enable: compare the local profile to the server's saved one and, if
@@ -736,7 +798,7 @@ static void telemetryReenableCheck() {
 static void _postResolve(const char* choice) {
     if (TELEMETRY_HOST[0] == '\0') return;
     std::string url  = std::string(TELEMETRY_HOST)
-        + "/api/aquariums/" + TELEMETRY_AQUARIUM_ID + "/resolve";
+        + "/api/aquariums/" + activeAquariumId + "/resolve";
     std::string body = std::string("{\"choice\":\"") + choice + "\"}";
     CURL* curl = curl_easy_init();
     if (!curl) return;

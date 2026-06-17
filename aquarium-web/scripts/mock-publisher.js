@@ -13,7 +13,8 @@ const apiKey = process.env.API_KEY || 'change-me';
 
 const W = 800, H = 480, TOP = 72;
 const PALETTE = [0x00ee66, 0xffdd00, 0xff6600, 0xcc44ff, 0x44ddff, 0xff44aa, 0x00ffff, 0xeeeeee];
-const FISH_MAX = [8, 16, 20, 12];           // pair, school, school2, angel
+const FISH_MAX = [8, 16, 20, 12, 16];       // clownfish(pair), guppy(school), piranha(school2), angel, salmon
+const FISH_SCHOOL_SIZE = [2, 6, 4, 0, 0];   // max school size before splitting; 0 = solitary
 
 const FRAME_MS = 50;
 const FRAMES_PER_PUBLISH = 1000 / FRAME_MS; // 20 frames per 1Hz publish
@@ -29,13 +30,21 @@ const COIN_MAX_VY = 1.4;                        // terminal sink speed so coins 
 const COIN_REST = 480;                         // frames a landed coin sits before vanishing (~24s); timer starts on landing
 const SHELL_TTL = 220;                         // shells linger on the sand a bit longer
 const SAND_Y = H - 20;                         // resting line on the sea floor
-const FISH_PRICE    = [10, 30, 45, 60];         // shop fish price (coins) by type
-const FISH_BASE_SELL = [6, 16, 22, 30];         // base sell value by type (≈55% of buy)
+const FISH_PRICE    = [10, 30, 45, 60, 8];      // clownfish, guppy, piranha, angel, salmon (common→cheap)
+const FISH_BASE_SELL = [6, 3, 22, 30, 4];       // base sell value by type; school/salmon cheap (common, no market farming)
 const FOOD_PRICE = 5;                          // coins per food unit
 const SNAIL_PRICE = 50;                        // coins per coin-collector snail
 const MAX_SNAILS = 6;
 const SNAIL_REACH = 36;                        // px a snail can grab a coin from
 const SHELL_VALUE = [2, 5, 12];               // shells granted per shell tier
+
+// Feeding schedule: 3 meals/day; a clean day raises luck, neglect/overfeeding lowers it.
+const MEALS_PER_DAY = 3;
+const HUNGER_GRACE = 0.35;                    // fraction into an unfed slot before fish look hungry
+const FEED_PERFECT_BONUS = 0.08;
+const FEED_MISS_PENALTY = 0.05;
+const FEED_OVERFEED_PENALTY = 0.03;
+const FEED_DELTA_MIN = -0.20, FEED_DELTA_MAX = 0.08;
 
 function bound(v, lo, hi) {
   if (v < lo) return (lo - v) * 0.30;
@@ -77,6 +86,11 @@ let coinTimers = new Map();        // fishId → frames until next coin roll
 let shellCD = SHELL_BASE_CD;
 let wanderCD = WANDER_BASE_CD;
 
+// Feeding-schedule state (career). mealFed[s] = slot s satisfied today.
+let mealFed = [false, false, false];
+let mealsToday = 0, overfeedToday = 0, lastMealSlot = 0;
+let feedSchedInit = false, tankHungry = false;
+
 function addSnail() {
   if (snails.length >= MAX_SNAILS) return false;
   snails.push({ x: rnd(80, W - 80), spd: rnd(1.5, 2.5), facing_right: Math.random() > 0.5 });
@@ -84,12 +98,45 @@ function addSnail() {
 }
 
 function resetCareer() {
-  fish = [makeFish(0, 200, 220), makeFish(0, 360, 240)]; // 2 pair fish
+  fish = [makeFish(4, 200, 220), makeFish(4, 360, 240)]; // start with 2 salmon
   wanderers = []; loot = []; snails = [];
-  coins = 0; shells = 0; food = 0;
+  coins = 0; shells = 0; food = 10;          // career starts stocked with 10 food
+
   coinTimers.clear();
+  mealFed = [false, false, false];
+  mealsToday = 0; overfeedToday = 0; feedSchedInit = false; tankHungry = false;
 }
 resetCareer();
+
+// ── Feeding schedule: 3 meals/day off the (1-minute) sim day ──
+function dayProgress() { return ((Date.now() - startMs) / 60000) % 1; }
+function currentMealSlot() {
+  return clamp(Math.floor(dayProgress() * MEALS_PER_DAY), 0, MEALS_PER_DAY - 1);
+}
+function evaluateFeedingDay() {
+  const missed = mealFed.filter((m) => !m).length;
+  let delta = (missed === 0 && overfeedToday === 0)
+    ? FEED_PERFECT_BONUS
+    : -(FEED_MISS_PENALTY * missed) - (FEED_OVERFEED_PENALTY * overfeedToday);
+  delta = clamp(delta, FEED_DELTA_MIN, FEED_DELTA_MAX);
+  for (const f of fish) f.fishLuck = clamp((f.fishLuck || 0) + delta, 0, 1);
+}
+function resetFeedingDay() { mealFed = [false, false, false]; mealsToday = 0; overfeedToday = 0; }
+function registerFeeding() {                 // one feeding event satisfies a slot, else overfeeds
+  const s = currentMealSlot();
+  if (!mealFed[s]) { mealFed[s] = true; mealsToday++; } else { overfeedToday++; }
+  tankHungry = false;
+}
+function updateFeedingSchedule() {
+  const s = currentMealSlot();
+  if (!feedSchedInit) { lastMealSlot = s; feedSchedInit = true; }
+  if (s !== lastMealSlot) {
+    if (s < lastMealSlot) { evaluateFeedingDay(); resetFeedingDay(); } // wrapped → new day
+    lastMealSlot = s;
+  }
+  const frac = dayProgress() * MEALS_PER_DAY - s;
+  tankHungry = !mealFed[s] && frac > HUNGER_GRACE;
+}
 
 const plants = {
   bg: [60, 150, 240, 620, 720].map((x) => ({ x, segs: 6 + (x % 4), type: x % 2 })),
@@ -106,15 +153,15 @@ function tankLuck() {
 }
 
 function counts() {
-  const c = { pair: 0, school: 0, school2: 0, angel: 0 };
-  const key = ['pair', 'school', 'school2', 'angel'];
+  const c = { pair: 0, school: 0, school2: 0, angel: 0, salmon: 0 };
+  const key = ['pair', 'school', 'school2', 'angel', 'salmon'];
   for (const f of fish) c[key[f.type]]++;
   return c;
 }
 
 function addFish(type) {
   const c = counts();
-  const have = [c.pair, c.school, c.school2, c.angel][type];
+  const have = [c.pair, c.school, c.school2, c.angel, c.salmon][type];
   if (have >= FISH_MAX[type]) return false;
   fish.push(makeFish(type));
   return true;
@@ -140,12 +187,20 @@ function fishSellValue(f) {
 function stepPhysics() {
   for (let frame = 0; frame < FRAMES_PER_PUBLISH; frame++) {
     tick++;
-    const cent = [0, 1, 2, 3].map((t) => {
-      const g = fish.filter((f) => f.type === t);
-      if (!g.length) return { x: W / 2, y: (TOP + H) / 2 };
-      return { x: g.reduce((s, f) => s + f.x, 0) / g.length,
-               y: g.reduce((s, f) => s + f.y, 0) / g.length };
-    });
+    // Sub-school centroids: schooling types split into schools capped at FISH_SCHOOL_SIZE;
+    // each fish gets `_sub` = its school index and coheres to that school (a new school forms
+    // beyond the cap). Solitary types (size 0) collapse to one group (_sub 0, no cohesion).
+    const cent = {};
+    const order = [0, 0, 0, 0, 0];
+    for (const f of fish) {
+      const sz = FISH_SCHOOL_SIZE[f.type] || 0;
+      f._sub = sz >= 2 ? Math.floor(order[f.type] / sz) : 0;
+      order[f.type]++;
+      const k = f.type + ':' + f._sub;
+      const c = cent[k] || (cent[k] = { x: 0, y: 0, n: 0 });
+      c.x += f.x; c.y += f.y; c.n++;
+    }
+    for (const k in cent) { const c = cent[k]; c.x /= c.n; c.y /= c.n; }
     for (const f of fish) {
       const t = f.type;
       f.age += 1;
@@ -156,25 +211,31 @@ function stepPhysics() {
           f.wanderCD = f.chasing ? 30 + Math.random() * 40 : 40 + Math.random() * 50;
         } else if (t === 3) { f.wanderCD = 8 + Math.random() * 20; }
         else { f.wanderCD = 15 + Math.random() * 35; }
-        const cx = cent[t].x, cy = cent[t].y;
-        const spread = t === 3 ? 120 : t === 0 ? 0 : 160;
-        f.tx = clamp(cx + (Math.random() * 2 - 1) * spread, 30, W - 30);
-        f.ty = clamp(cy + (Math.random() * 2 - 1) * (t === 3 ? 110 : 90), TOP + 20, H - 80);
+        if (t === 4) {                         // salmon: solitary — roam the tank independently
+          f.tx = rnd(30, W - 30);
+          f.ty = rnd(TOP + 20, H - 80);
+        } else {
+          const cg = cent[t + ':' + f._sub];
+          const spread = t === 3 ? 120 : t === 0 ? 0 : 160;
+          f.tx = clamp(cg.x + (Math.random() * 2 - 1) * spread, 30, W - 30);
+          f.ty = clamp(cg.y + (Math.random() * 2 - 1) * (t === 3 ? 110 : 90), TOP + 20, H - 80);
+        }
       }
       const chasing = t === 0 && f.chasing;
       const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
       const maxV = chasing || t === 3 ? 7.0 : 5.5;
       let ax = (f.tx - f.x) * seekStr;
       let ay = (f.ty - f.y) * seekStr;
-      if (t === 1 || t === 2) {
-        ax += (cent[t].x - f.x) * 0.010; ay += (cent[t].y - f.y) * 0.007;
+      const grp = cent[t + ':' + f._sub];
+      if (t === 1 || t === 2) {                 // Guppy / Piranha shoal within their sub-school
+        ax += (grp.x - f.x) * 0.010; ay += (grp.y - f.y) * 0.007;
         for (const o of fish) {
-          if (o === f || o.type !== t) continue;
+          if (o === f || o.type !== t || o._sub !== f._sub) continue;
           const dx = f.x - o.x, dy = f.y - o.y, d2 = dx * dx + dy * dy;
           if (d2 < 80 * 80 && d2 > 0.01) { const inv = 8 / d2; ax += dx * inv; ay += dy * inv; }
         }
-      } else if (t === 3) {
-        ax += (cent[3].x - f.x) * 0.012; ay += (cent[3].y - f.y) * 0.010;
+      } else if (t === 3) {                     // Angel keeps its own single loose group
+        ax += (grp.x - f.x) * 0.012; ay += (grp.y - f.y) * 0.010;
         for (const o of fish) {
           if (o === f || o.type !== t) continue;
           const dx = f.x - o.x, dy = f.y - o.y, d2 = dx * dx + dy * dy;
@@ -195,6 +256,7 @@ function stepPhysics() {
 // ── Career item simulation (per publish, ~1s) ──
 function stepCareer() {
   if (mode !== 'career') { wanderers = []; loot = []; return; }
+  updateFeedingSchedule();             // meal clock + hunger + day-end luck eval
   const luck = tankLuck();
   const dt = FRAMES_PER_PUBLISH;
 
@@ -221,11 +283,12 @@ function stepCareer() {
     shellCD = SHELL_BASE_CD * rnd(0.7, 1.3);
   }
 
-  // Wandering fish are very rare; type biased toward rarer by luck.
+  // Wandering fish are very rare; guppy (~8%) is a rare wild catch. Type biased by luck.
   wanderCD -= dt;
   if (wanderCD <= 0 && wanderers.length < 2) {
     const r = Math.random();
-    const type = r < 0.1 + 0.3 * luck ? 3 : r < 0.4 ? 0 : r < 0.7 ? 1 : 2;
+    // Salmon (4) is the common wild fish; clownfish (0) is now rare; angel luck-biased.
+    const type = r < 0.1 + 0.3 * luck ? 3 : r < 0.6 ? 4 : r < 0.75 ? 1 : r < 0.92 ? 2 : 0;
     const fromLeft = Math.random() > 0.5;
     wanderers.push({
       id: nextItemId++, type,
@@ -320,6 +383,7 @@ function applyDirectives(text) {
       let n = parseInt(line.slice(6), 10) || 1;
       while (n-- > 0) {
         if (mode === 'career') { if (food <= 0) break; food -= 1; }
+        if (mode === 'career') registerFeeding();   // count toward the 3-meals/day schedule
         const f = fish[Math.floor(Math.random() * fish.length)];
         if (f) { f.xp += 10; f.fishLuck = clamp(f.fishLuck + 0.06, 0, 1); f.age += 40; }
       }
@@ -355,6 +419,10 @@ async function step() {
   const cond = weatherOverride >= 0 ? weatherOverride : Math.floor((tick / 100) % 7);
   const snapshot = {
     aquarium_id: aquariumId,
+    // Self-register as an external device so the server treats this publisher as live
+    // hardware and its built-in web simulator defers (no double-driving the same tank).
+    device_id: 'mock-' + aquariumId,
+    device_name: 'Mock publisher (' + aquariumId + ')',
     platform: 'mock',
     fw_version: '1.5.5',
     uptime_ms: Date.now() - startMs,
@@ -364,7 +432,10 @@ async function step() {
     time: { day_progress: dayProgress, mode: timeMode },
     counts: counts(),
     frame_ms: FRAME_MS,
-    game: { mode, coins, shells, food, luck: parseFloat(tankLuck().toFixed(3)) },
+    game: {
+      mode, coins, shells, food, luck: parseFloat(tankLuck().toFixed(3)),
+      fed: mealsToday, meals: MEALS_PER_DAY, hungry: tankHungry ? 1 : 0, overfed: overfeedToday,
+    },
     fish: fish.map((f) => ({
       id: f.id,
       x: parseFloat(f.x.toFixed(1)), y: parseFloat(f.y.toFixed(1)), z: f.z,

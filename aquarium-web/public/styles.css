@@ -96,7 +96,15 @@ main {
 .aq-del:hover { background: #c8593f33; color: var(--stale); opacity: 1; }
 
 .aq-name { font-weight: 600; display: flex; align-items: center; gap: 7px; padding-right: 20px; }
-.aq-meta { font-size: 12px; color: var(--muted); margin-top: 3px; }
+.aq-meta { font-size: 12px; color: var(--muted); margin-top: 3px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* Source badge: which thing is driving the tank (live hardware vs server web sim) */
+.aq-src {
+  font-size: 10px; font-weight: 600; letter-spacing: 0.3px;
+  border-radius: 5px; padding: 1px 6px; white-space: nowrap;
+  max-width: 140px; overflow: hidden; text-overflow: ellipsis;
+}
+.aq-src.device { background: #1f6b4733; color: #7ee0a8; border: 1px solid #2e8a5f55; }
+.aq-src.sim    { background: #2a456f55; color: #9fc2ff; border: 1px solid #3a6abf55; }
 .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
 .dot.live { background: var(--live); box-shadow: 0 0 6px var(--live); }
 .dot.stale { background: var(--stale); }
@@ -199,14 +207,15 @@ main {
 .view-sub { color: var(--muted); font-size: 13px; }
 
 .tank-wrap {
-  flex: 1 1 auto;
+  flex: 0 0 auto;
   align-self: flex-start;
-  width: auto;
+  width: 100%;
   min-width: 0;
   aspect-ratio: 800 / 480;
   /* Cap width so canvas height fits within tank-col. Overhead: header+padding
-     (85px) + viewTitle (27px) + stats strip (~90px) + gaps (18px) = 220px. */
-  max-width: min(100%, calc((100vh - 220px) * 800 / 480));
+     (85px) + viewTitle (27px) + compact stats strip (~30px) + gaps (18px) =
+     ~160px. The slimmer info strip lets the tank reclaim its full size. */
+  max-width: min(100%, calc((100vh - 160px) * 800 / 480));
   position: relative;
   border-radius: 12px;
   overflow: hidden;
@@ -323,23 +332,30 @@ main {
   text-align: right;
 }
 
+/* Compact info strip beneath the tank — short chips that wrap (never scroll) so
+   the section stays inside the view and the canvas keeps its full size. */
 .stats {
-  flex: 1 1 0;
+  flex: 0 0 auto;
   min-width: 0;
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+  display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   margin-top: 0;
-  align-content: start;
 }
 .stat {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
   background: var(--panel);
-  border-radius: 7px;
-  padding: 6px 10px;
+  border-radius: 6px;
+  padding: 5px 10px;
+  white-space: nowrap;
 }
 .stat .label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); }
-.stat .value { font-size: 15px; font-weight: 600; margin-top: 2px; }
-.stat .sub { font-size: 11px; color: var(--muted); margin-top: 1px; }
+.stat .value { font-size: 13px; font-weight: 600; }
+.stat .sub { font-size: 11px; color: var(--muted); }
+.stat .sub:empty { display: none; }
 
 /* Device control panel (weather / timescale / fish / feed). */
 .controls {
@@ -401,6 +417,57 @@ main {
 .seg button + button { border-left: 1px solid #ffffff18; }
 .seg button:hover { color: var(--text); }
 .seg button.active { background: var(--accent); color: #00131f; font-weight: 600; }
+
+/* Timescale slider (1–5×): stacked label + range + tick labels */
+.ctrl-time-group {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+.ctrl-time-group .ctrl-label { width: auto; }
+.ctrl-time-val {
+  color: var(--accent);
+  font-weight: 600;
+  margin-left: 2px;
+}
+.ctrl-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 6px;
+  border-radius: 4px;
+  background: var(--panel-2);
+  outline: none;
+  cursor: pointer;
+  margin: 2px 0;
+}
+.ctrl-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #00131f;
+  cursor: pointer;
+  box-shadow: 0 1px 4px #0008;
+}
+.ctrl-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #00131f;
+  cursor: pointer;
+}
+.ctrl-slider:focus { box-shadow: 0 0 0 2px var(--accent); }
+.ctrl-ticks {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--muted);
+  padding: 0 2px;
+}
 
 .ctrl-fish { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 3px 6px; }
 .ctrl-fish-row {
@@ -492,6 +559,48 @@ main {
 .pending-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pending-age   { flex-shrink: 0; font-size: 11px; color: var(--muted); }
 
+/* Sidebar action button (New aquarium) */
+.side-btn {
+  width: 100%;
+  margin-top: 8px;
+  padding: 7px 10px;
+  background: #1b6cff22;
+  color: #cfe0ff;
+  border: 1px solid #3a6abf;
+  border-radius: 7px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.side-btn:hover { background: #1b6cff44; }
+
+/* Devices section */
+.devices-section { margin-top: 20px; border-top: 1px solid #ffffff14; padding-top: 14px; }
+.devices-section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+#device-list { list-style: none; padding: 0; margin: 8px 0 0; }
+.dev-row {
+  position: relative;
+  padding: 8px 10px; margin-bottom: 6px;
+  background: var(--panel-2); border-radius: 8px;
+}
+.dev-row.stale-row { opacity: 0.65; }
+.dev-name { font-weight: 600; display: flex; align-items: center; gap: 7px; padding-right: 20px; cursor: pointer; }
+.dev-name:hover { color: #fff; }
+.dev-kind {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+  color: var(--muted); background: #ffffff10; border-radius: 4px; padding: 1px 5px;
+}
+.dev-assign { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+.dev-assign label { font-size: 11px; color: var(--muted); }
+.dev-aq { flex: 1; min-width: 0; background: #0c1726; color: #cfe0ff; border: 1px solid #2a456f; border-radius: 6px; padding: 3px 5px; font-size: 12px; }
+.dev-del {
+  position: absolute; top: 6px; right: 6px;
+  width: 18px; height: 18px; line-height: 16px; text-align: center;
+  background: transparent; color: var(--muted); border: none; border-radius: 4px;
+  cursor: pointer; opacity: 0.5;
+}
+.dev-row:hover .dev-del { opacity: 1; }
+.dev-del:hover { background: #c8593f33; color: var(--stale); }
+
 .traffic-section {
   margin-top: 20px;
   border-top: 1px solid #ffffff14;
@@ -569,6 +678,17 @@ main {
   background: var(--panel-2);
   border-radius: 6px;
   padding: 3px 8px;
+}
+/* Meals indicator turns into a pulsing amber warning while the fish are hungry. */
+.hud-item.hungry {
+  background: #5a2a12;
+  color: #ffd9a8;
+  box-shadow: 0 0 0 1px #c8651f inset;
+  animation: hungry-pulse 1.1s ease-in-out infinite;
+}
+@keyframes hungry-pulse {
+  0%, 100% { box-shadow: 0 0 0 1px #c8651f inset; }
+  50%      { box-shadow: 0 0 6px 1px rgba(255, 150, 60, 0.7), 0 0 0 1px #ff8a3c inset; }
 }
 .ci {
   display: inline-block;
@@ -702,6 +822,57 @@ main {
   cursor: pointer;
 }
 .profile-close:hover { background: #ffffff1f; color: var(--text); }
+
+/* ─── Reusable modal dialog (name entry + confirms) ─────────────────────────── */
+.app-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #04080cad;
+  backdrop-filter: blur(3px);
+}
+.app-dialog[hidden] { display: none; }
+.dialog-card {
+  width: min(380px, calc(100vw - 32px));
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
+  border: 1px solid #ffffff1f;
+  border-radius: 14px;
+  box-shadow: 0 24px 70px #000c;
+  padding: 22px;
+}
+.dialog-title { margin: 0 0 10px; font-size: 17px; }
+.dialog-message { margin: 0 0 14px; font-size: 13px; color: var(--muted); line-height: 1.5; }
+.dialog-message[hidden] { display: none; }
+.dialog-input {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 16px;
+  padding: 9px 11px;
+  background: #0b1622;
+  color: var(--text);
+  border: 1px solid #2a456f;
+  border-radius: 8px;
+  font-size: 14px;
+}
+.dialog-input[hidden] { display: none; }
+.dialog-input:focus { outline: none; border-color: var(--accent); }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 10px; }
+.dialog-btn {
+  padding: 8px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.dialog-btn.cancel { background: #ffffff10; color: var(--text); border-color: #ffffff20; }
+.dialog-btn.cancel:hover { background: #ffffff1f; }
+.dialog-btn.ok { background: var(--accent); color: #00131f; }
+.dialog-btn.ok:hover { filter: brightness(1.08); }
+.dialog-btn.ok.danger { background: var(--stale); color: #1a0805; }
 .pf-head { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }
 .pf-chip {
   width: 52px;

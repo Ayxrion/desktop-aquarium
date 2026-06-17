@@ -4,10 +4,16 @@
 // reverse-proxy prefix the deploy service configures.
 
 const WEATHER_NAMES = ['Sunny', 'Partly Cloudy', 'Cloudy', 'Rainy', 'Stormy', 'Snowy', 'Foggy'];
-const FISH_TYPE_NAMES = ['Pair', 'School', 'School 2', 'Angel'];
+const FISH_TYPE_NAMES = ['Clownfish', 'Guppy', 'Piranha', 'Angel', 'Salmon'];
 // Per-type caps + snapshot count keys, mirroring the firmware (main.cpp / aquarium.ino).
-const FISH_MAX = [8, 16, 20, 12];
-const FISH_COUNT_KEYS = ['pair', 'school', 'school2', 'angel'];
+// Count keys stay pair/school/school2/angel/salmon (persisted slot identifiers): pair=Clownfish,
+// school=Guppy, school2=Piranha. Schooling is a characteristic (FISH_SCHOOL_SIZE), not the type.
+const FISH_MAX = [8, 16, 20, 12, 16];
+const FISH_COUNT_KEYS = ['pair', 'school', 'school2', 'angel', 'salmon'];
+// Max school size per type before fish split into a new school. 0 = solitary. Clownfish
+// realize their size-2 schooling via mate-pairing; Guppy/Piranha use centroid sub-schools;
+// Angel keeps its own loose grouping; Salmon are solitary.
+const FISH_SCHOOL_SIZE = [2, 6, 4, 0, 0];
 const TANK_TOP = 72;
 const SCREEN_W = 800;
 const SCREEN_H = 480;
@@ -18,7 +24,7 @@ const SCREEN_H = 480;
 // blend is capped by LUCK_TINT_STRENGTH so even a legendary fish keeps a hint of
 // its type colour. Re-theme the whole tank by editing these four lines; the
 // canvas, legend, tooltips and profiles all follow along.
-const FISH_PRIMARY = [0x2E8BFF, 0x33D17A, 0xFF7A33, 0xB45CFF]; // Pair, School, School 2, Angel
+const FISH_PRIMARY = [0x2E8BFF, 0x33D17A, 0xFF7A33, 0xB45CFF, 0xFF9E7A]; // Clownfish, Guppy, Piranha, Angel, Salmon
 const LUCK_TINT_COLOR = 0xFFE14D;   // high-luck fish shift toward this (warm gold)
 const LUCK_TINT_STRENGTH = 0.7;     // max blend toward the tint at luck = 1
 const SHINY_ODDS = 1000;            // 1-in-N fish are shiny (inverted + glistening)
@@ -174,14 +180,21 @@ function _extrapolateSnapshot(snap, elapsedMs) {
   }));
 
   for (let frame = 0; frame < n; frame++) {
-    // Recompute centroids (x, y AND z) from current positions each frame.
-    const cent = [0, 1, 2, 3].map((t) => {
-      const g = st.filter((f) => f.type === t);
-      if (!g.length) return { x: 0, y: 0, z: 0 };
-      return { x: g.reduce((s, f) => s + f.x, 0) / g.length,
-               y: g.reduce((s, f) => s + f.y, 0) / g.length,
-               z: g.reduce((s, f) => s + f.z, 0) / g.length };
-    });
+    // Recompute sub-school centroids each frame. Schooling types split into schools of
+    // at most FISH_SCHOOL_SIZE[t]; each fish gets `_sub` = its school index and coheres to
+    // that school's centroid (so beyond the cap, fish form a separate school). Non-schooling
+    // types (size 0, e.g. Angel/Salmon) collapse to one group (_sub 0).
+    const cent = {};                 // key `${type}:${sub}` -> {x,y,z,n}
+    const order = [0, 0, 0, 0, 0];
+    for (const f of st) {
+      const sz = FISH_SCHOOL_SIZE[f.type] || 0;
+      f._sub = sz >= 2 ? Math.floor(order[f.type] / sz) : 0;
+      order[f.type]++;
+      const k = f.type + ':' + f._sub;
+      const c = cent[k] || (cent[k] = { x: 0, y: 0, z: 0, n: 0 });
+      c.x += f.x; c.y += f.y; c.z += f.z; c.n++;
+    }
+    for (const k in cent) { const c = cent[k]; c.x /= c.n; c.y /= c.n; c.z /= c.n; }
 
     for (const f of st) {
       const t = f.type;
@@ -197,23 +210,25 @@ function _extrapolateSnapshot(snap, elapsedMs) {
       let ay = (f.ty - f.y) * seekStr;
       let az = (f.tz - f.z) * 0.010;
 
-      // Cohesion toward group centroid (school / angel), x, y and z.
+      // Cohesion toward this fish's sub-school centroid — Guppy/Piranha shoal in schools
+      // capped at FISH_SCHOOL_SIZE (beyond it, a new school forms); Angel keeps one loose group.
+      const grp = cent[t + ':' + f._sub];
       if (t === 1 || t === 2) {
-        ax += (cent[t].x - f.x) * 0.010;
-        ay += (cent[t].y - f.y) * 0.007;
-        az += (cent[t].z - f.z) * 0.007;
+        ax += (grp.x - f.x) * 0.010;
+        ay += (grp.y - f.y) * 0.007;
+        az += (grp.z - f.z) * 0.007;
       } else if (t === 3) {
-        ax += (cent[3].x - f.x) * 0.012;
-        ay += (cent[3].y - f.y) * 0.010;
-        az += (cent[3].z - f.z) * 0.008;
+        ax += (grp.x - f.x) * 0.012;
+        ay += (grp.y - f.y) * 0.010;
+        az += (grp.z - f.z) * 0.008;
       }
 
-      // Pairwise separation within school / angel groups
+      // Pairwise separation within the same sub-school.
       const sepR2 = (t === 3) ? 60 * 60 : 80 * 80;
       const sepK  = (t === 3) ? 7 : 8;
       if (t === 1 || t === 2 || t === 3) {
         for (const o of st) {
-          if (o === f || o.type !== t) continue;
+          if (o === f || o.type !== t || o._sub !== f._sub) continue;
           const dx = f.x - o.x, dy = f.y - o.y;
           const d2 = dx * dx + dy * dy;
           if (d2 < sepR2 && d2 > 0.01) { const inv = sepK / d2; ax += dx * inv; ay += dy * inv; }
@@ -992,6 +1007,9 @@ let _blendBoatFrom = null;
 const els = {
   list: document.getElementById('aquarium-list'),
   emptyHint: document.getElementById('empty-hint'),
+  newAquarium: document.getElementById('new-aquarium'),
+  deviceList: document.getElementById('device-list'),
+  deviceEmpty: document.getElementById('device-empty'),
   viewEmpty: document.getElementById('view-empty'),
   viewContent: document.getElementById('view-content'),
   stats: document.getElementById('stats'),
@@ -1010,6 +1028,7 @@ const els = {
   controls: document.getElementById('controls'),
   ctrlWeather: document.getElementById('ctrl-weather'),
   ctrlTime: document.getElementById('ctrl-time'),
+  ctrlTimeVal: document.getElementById('ctrl-time-val'),
   ctrlFish: document.getElementById('ctrl-fish'),
   ctrlFeed: document.getElementById('ctrl-feed'),
   ctrlPending: document.getElementById('ctrl-pending'),
@@ -1022,6 +1041,7 @@ const els = {
   hudFood: document.getElementById('hud-food'),
   hudSnails: document.getElementById('hud-snails'),
   hudLuck: document.getElementById('hud-luck'),
+  hudMeals: document.getElementById('hud-meals'),
   modeSeg: document.getElementById('mode-seg'),
   shop: document.getElementById('shop'),
   shopFish: document.getElementById('shop-fish'),
@@ -1036,26 +1056,183 @@ const els = {
   profile: document.getElementById('entity-profile'),
   profileBody: document.getElementById('profile-body'),
   profileClose: document.getElementById('profile-close'),
+  dialog: document.getElementById('app-dialog'),
+  dialogForm: document.getElementById('dialog-form'),
+  dialogTitle: document.getElementById('dialog-title'),
+  dialogMessage: document.getElementById('dialog-message'),
+  dialogInput: document.getElementById('dialog-input'),
+  dialogOk: document.getElementById('dialog-ok'),
+  dialogCancel: document.getElementById('dialog-cancel'),
 };
 const ctx = els.canvas.getContext('2d');
 
 // Shop prices (coins), mirroring the firmware/mock economy.
-const FISH_PRICE     = [10, 30, 45, 60];
-const FISH_BASE_SELL = [6, 16, 22, 30];   // base sell value by type (≈55-60% of buy price)
+const FISH_PRICE     = [10, 30, 45, 60, 8]; // clownfish, guppy, piranha, angel, salmon (common→cheap)
+const FISH_BASE_SELL = [6, 3, 22, 30];    // base sell value; school cheap to prevent market farming
 const FOOD_PRICE = 5;
 const SNAIL_PRICE = 50;
 const MAX_SNAILS = 6;
 
+// ─── Modal dialog (replaces native prompt/confirm) ───────────────────────────
+// A single reusable modal handles both name entry (input mode) and yes/no confirms.
+// openDialog() resolves to the typed string (input mode) / true (confirm mode) on OK,
+// or null on cancel/escape/backdrop. Convenience wrappers: promptDialog / confirmDialog.
+let _dialogState = null; // { resolve, input } while a dialog is open
+
+function _closeDialog(result) {
+  if (!_dialogState) return;
+  const { resolve } = _dialogState;
+  _dialogState = null;
+  els.dialog.hidden = true;
+  document.removeEventListener('keydown', _dialogKeydown, true);
+  resolve(result);
+}
+function _dialogKeydown(e) {
+  if (e.key === 'Escape') { e.preventDefault(); _closeDialog(null); }
+}
+function openDialog(opts = {}) {
+  if (_dialogState) _closeDialog(null); // a new dialog supersedes any open one
+  return new Promise((resolve) => {
+    _dialogState = { resolve, input: !!opts.input };
+    els.dialogTitle.textContent = opts.title || '';
+    if (opts.message) { els.dialogMessage.textContent = opts.message; els.dialogMessage.hidden = false; }
+    else els.dialogMessage.hidden = true;
+    if (opts.input) {
+      els.dialogInput.hidden = false;
+      els.dialogInput.value = opts.value || '';
+      els.dialogInput.placeholder = opts.placeholder || '';
+      els.dialogInput.maxLength = 24; // matches server MAX_NAME_LEN
+    } else {
+      els.dialogInput.hidden = true;
+    }
+    els.dialogOk.textContent = opts.okLabel || 'OK';
+    els.dialogCancel.textContent = opts.cancelLabel || 'Cancel';
+    els.dialogOk.classList.toggle('danger', !!opts.danger);
+    els.dialog.hidden = false;
+    document.addEventListener('keydown', _dialogKeydown, true);
+    if (opts.input) { els.dialogInput.focus(); els.dialogInput.select(); }
+    else els.dialogOk.focus();
+  });
+}
+function promptDialog(title, value, opts = {}) {
+  return openDialog({ title, input: true, value, ...opts }).then((r) => (r == null ? null : String(r).trim()));
+}
+function confirmDialog(title, message, opts = {}) {
+  return openDialog({ title, message, ...opts }).then((r) => r === true);
+}
+els.dialogForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  if (!_dialogState) return;
+  _closeDialog(_dialogState.input ? els.dialogInput.value : true);
+});
+els.dialogCancel.addEventListener('click', () => _closeDialog(null));
+els.dialog.addEventListener('mousedown', (e) => { if (e.target === els.dialog) _closeDialog(null); });
+
 // ─── Sidebar / list polling ────────────────────────────────────────────────
+let _aquariums = [];   // latest aquarium list (also used to build device assignment menus)
+
 async function refreshList() {
   try {
     const res = await fetch('api/aquariums');
     const items = await res.json();
+    _aquariums = items;
     renderList(items);
     setConn(true);
   } catch {
     setConn(false);
   }
+  refreshDevices();
+}
+
+// ─── Devices ───────────────────────────────────────────────────────────────
+async function refreshDevices() {
+  try {
+    const res = await fetch('api/devices');
+    renderDevices(await res.json());
+  } catch { /* leave the last render up */ }
+}
+
+function renderDevices(devices) {
+  if (!els.deviceList) return;
+  els.deviceEmpty.hidden = devices.length > 0;
+  els.deviceList.innerHTML = '';
+  for (const d of devices) {
+    const li = document.createElement('li');
+    li.className = 'dev-row' + (d.online ? '' : ' stale-row');
+    const kindBadge = escapeHtml(d.kind || 'device'); // physical platform (esp32 / pi / …)
+    // Assignment menu: every known aquarium + this device's own (in case it's stale)
+    // + the unassigned option. Lets you point a real device at a different tank.
+    const ids = new Set(_aquariums.map((a) => a.aquarium_id));
+    if (d.aquariumId) ids.add(d.aquariumId);
+    const opts = ['<option value="">— unassigned —</option>'].concat(
+      [...ids].map((id) => {
+        const a = _aquariums.find((x) => x.aquarium_id === id);
+        const label = a && a.name ? `${a.name} (${id})` : id;
+        return `<option value="${escapeHtml(id)}"${id === d.aquariumId ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+      })
+    ).join('');
+    li.innerHTML = `
+      <button class="dev-del" title="Forget this device" aria-label="Forget device">×</button>
+      <div class="dev-name">
+        <span class="dot ${d.online ? 'live' : 'stale'}"></span>${escapeHtml(d.name)}
+        <span class="dev-kind">${kindBadge}</span>
+      </div>
+      <div class="dev-assign">
+        <label>Aquarium</label>
+        <select class="dev-aq">${opts}</select>
+      </div>`;
+    li.querySelector('.dev-aq').addEventListener('change', (e) => assignDevice(d.id, e.target.value || null));
+    li.querySelector('.dev-name').addEventListener('click', () => renameDevice(d));
+    li.querySelector('.dev-del').addEventListener('click', (e) => { e.stopPropagation(); deleteDevice(d); });
+    els.deviceList.appendChild(li);
+  }
+}
+
+async function createAquarium() {
+  const name = await promptDialog('New aquarium', '', {
+    placeholder: 'My tank', okLabel: 'Create',
+  });
+  if (!name) return; // cancelled or empty
+  try {
+    const res = await fetch('api/aquariums', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const data = await res.json();
+    await refreshList();
+    if (data.aquariumId) { setRoute(data.aquariumId); select(data.aquariumId); } // jump to the new tank
+  } catch { /* refresh will reflect reality */ }
+}
+
+async function assignDevice(id, aquariumId) {
+  try {
+    await fetch('api/devices/' + encodeURIComponent(id), {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ aquariumId }),
+    });
+  } catch { /* ignore */ }
+  refreshList();   // also refreshes devices (one-per-aquarium may have moved another)
+}
+
+async function renameDevice(d) {
+  const name = await promptDialog('Rename device', d.name, { okLabel: 'Save' });
+  if (!name || name === d.name) return;
+  try {
+    await fetch('api/devices/' + encodeURIComponent(d.id), {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+  } catch { /* ignore */ }
+  refreshDevices();
+}
+
+async function deleteDevice(d) {
+  const ok = await confirmDialog('Forget device?',
+    `Forget "${d.name}"? Its aquarium keeps running as a server simulation. The device reappears automatically if the hardware reports in again.`,
+    { okLabel: 'Forget', danger: true });
+  if (!ok) return;
+  try { await fetch('api/devices/' + encodeURIComponent(d.id), { method: 'DELETE' }); } catch { /* ignore */ }
+  refreshDevices();
 }
 
 function setConn(online) {
@@ -1079,13 +1256,18 @@ function setRoute(id) {
   }
 }
 
-// Forget an aquarium (stale device gone for good, or just decluttering). A live
-// device re-appears on its next telemetry post.
-async function removeAquarium(id, stale) {
-  const msg = `Remove aquarium "${id}"?` + (stale
-    ? '\n\nIt appears to be offline (stale).'
-    : '\n\nIt is still reporting and will reappear on its next update.');
-  if (!window.confirm(msg)) return;
+// Forget an aquarium (delete it permanently, or just declutter). A simulated tank is
+// gone for good; a hardware-backed one re-appears on the device's next telemetry post.
+async function removeAquarium(a) {
+  const id = a.aquarium_id;
+  const label = a.name || id;
+  const msg = (a.device
+    ? 'It is backed by a device and will reappear when the hardware next reports in.'
+    : 'It is simulated on the server and will be permanently removed.');
+  const ok = await confirmDialog('Remove aquarium?', `Remove "${label}"? ${msg}`, {
+    okLabel: 'Remove', danger: true,
+  });
+  if (!ok) return;
   try {
     await fetch('api/aquariums/' + encodeURIComponent(id), { method: 'DELETE' });
   } catch { /* ignore — the list refresh below reflects reality */ }
@@ -1107,16 +1289,21 @@ function renderList(items) {
     const li = document.createElement('li');
     li.className = (a.aquarium_id === selectedId ? 'active' : '') + (a.stale ? ' stale-row' : '');
     const weather = a.weather ? (WEATHER_NAMES[a.weather.condition] || '?') : '—';
+    const title = a.name || a.aquarium_id;
+    // Source badge: a live device drives the tank, otherwise the server web-simulates it.
+    const src = (a.device && a.device.online)
+      ? `<span class="aq-src device" title="Driven by ${escapeHtml(a.device.name)}">📟 ${escapeHtml(a.device.name)}</span>`
+      : `<span class="aq-src sim" title="Simulated on the server">🖥 web sim</span>`;
     li.innerHTML = `
       <button class="aq-del" title="Remove this aquarium" aria-label="Remove aquarium">×</button>
       <div class="aq-name">
-        <span class="dot ${a.stale ? 'stale' : 'live'}"></span>${escapeHtml(a.aquarium_id)}${a.conflict ? '<span class="aq-conflict">⚠ mismatch</span>' : ''}
+        <span class="dot ${a.stale ? 'stale' : 'live'}"></span>${escapeHtml(title)}${a.conflict ? '<span class="aq-conflict">⚠ mismatch</span>' : ''}
       </div>
-      <div class="aq-meta">${escapeHtml(a.platform)} · ${a.fishCount} fish · ${weather}</div>`;
+      <div class="aq-meta">${a.fishCount} fish · ${weather} ${src}</div>`;
     li.addEventListener('click', () => select(a.aquarium_id));
     li.querySelector('.aq-del').addEventListener('click', (e) => {
       e.stopPropagation();
-      removeAquarium(a.aquarium_id, a.stale);
+      removeAquarium(a);
     });
     els.list.appendChild(li);
   }
@@ -1470,7 +1657,7 @@ function formatAge(ms) {
 
 function fmtCounts(c) {
   if (!c) return '—';
-  return `pair ${c.pair || 0} · school ${c.school || 0}/${c.school2 || 0} · angel ${c.angel || 0}`;
+  return `clownfish ${c.pair || 0} · guppy ${c.school || 0} · piranha ${c.school2 || 0} · angel ${c.angel || 0} · salmon ${c.salmon || 0}`;
 }
 
 // Show/hide the profile-mismatch banner from the snapshot's _conflict field.
@@ -1560,8 +1747,8 @@ function resolvePending(snap) {
         if (wv === p.cmd.value) { p.confirmed = true; changed = true; }
         break;
       }
-      case 'time':
-        if (snap.time && snap.time.mode === p.cmd.value) { p.confirmed = true; changed = true; }
+      case 'timescale':
+        if (snap.time && ((snap.time.scale || 1) === p.cmd.value)) { p.confirmed = true; changed = true; }
         break;
       case 'fish': {
         if (p.baseline) {
@@ -1633,7 +1820,7 @@ async function sendControl(cmd, okMsg, pendingInfo) {
 
 function buildFishControls() {
   els.ctrlFish.innerHTML = '';
-  for (let t = 0; t < 4; t++) {
+  for (let t = 0; t < 5; t++) {
     const row = document.createElement('div');
     row.className = 'ctrl-fish-row';
     const name = document.createElement('span');
@@ -1680,18 +1867,17 @@ function renderControls(snap) {
     els.ctrlWeather.value = String(wv);
   }
 
-  // Timescale active button.
-  if (now - _ctrlHold.time > CTRL_HOLD_MS) {
-    const mode = (snap.time && snap.time.mode) || 'REAL';
-    for (const b of els.ctrlTime.querySelectorAll('button')) {
-      b.classList.toggle('active', b.dataset.mode === mode);
-    }
+  // Timescale slider (1–5×). Don't fight the user while they're dragging or just set it.
+  if (now - _ctrlHold.time > CTRL_HOLD_MS && document.activeElement !== els.ctrlTime) {
+    const scale = Math.max(1, Math.min(5, (snap.time && snap.time.scale) || 1));
+    els.ctrlTime.value = String(scale);
+    if (els.ctrlTimeVal) els.ctrlTimeVal.textContent = scale + '×';
   }
 
   // Fish counts + cap-aware enabling.
   if (!_fishRowsBuilt) buildFishControls();
   const counts = snap.counts || {};
-  for (let t = 0; t < 4; t++) {
+  for (let t = 0; t < 5; t++) {
     const c = counts[FISH_COUNT_KEYS[t]] || 0;
     fishCountEls[t].textContent = `${c}/${FISH_MAX[t]}`;
     fishBtns[t].minus.disabled = c <= 0;
@@ -1705,13 +1891,15 @@ els.ctrlWeather.addEventListener('change', () => {
   const wLabel = wv === -1 ? 'Auto' : (WEATHER_NAMES[wv] || String(wv));
   sendControl({ type: 'weather', value: wv }, 'Weather set ✓', { label: `Weather: ${wLabel}` });
 });
-els.ctrlTime.addEventListener('click', (e) => {
-  const btn = e.target.closest('button');
-  if (!btn) return;
+// Live label while dragging; commit the directive on release (change).
+els.ctrlTime.addEventListener('input', () => {
   _ctrlHold.time = Date.now();
-  for (const b of els.ctrlTime.querySelectorAll('button')) b.classList.toggle('active', b === btn);
-  const mode = btn.dataset.mode;
-  sendControl({ type: 'time', value: mode }, `Timescale: ${mode} ✓`, { label: `Timescale: ${mode}` });
+  if (els.ctrlTimeVal) els.ctrlTimeVal.textContent = els.ctrlTime.value + '×';
+});
+els.ctrlTime.addEventListener('change', () => {
+  _ctrlHold.time = Date.now();
+  const v = parseInt(els.ctrlTime.value, 10) || 1;
+  sendControl({ type: 'timescale', value: v }, `Timescale: ${v}× ✓`, { label: `Timescale: ${v}×` });
 });
 els.ctrlFeed.addEventListener('click', () =>
   sendControl({ type: 'feed', count: 1 }, 'Fed the fish 🐟', { label: 'Feed ×1' }));
@@ -1736,7 +1924,14 @@ function renderGame(snap) {
   els.hudFood.textContent = '🍤 ' + (g.food || 0);
   els.hudSnails.textContent = '🐌 ' + ((snap.snails && snap.snails.length) || 0);
   els.hudLuck.textContent = '🍀 ' + Math.round((g.luck || 0) * 100) + '%';
-  for (const el of [els.hudCoins, els.hudShells, els.hudFood, els.hudSnails, els.hudLuck])
+  // Meals fed today (target 3). Turns into a pulsing warning while the fish are hungry.
+  const meals = g.meals || 3, fed = g.fed || 0, hungry = g.hungry === 1 || g.hungry === true;
+  els.hudMeals.textContent = (hungry ? '🍴 ' : '🍽️ ') + fed + '/' + meals;
+  els.hudMeals.classList.toggle('hungry', hungry);
+  els.hudMeals.title = hungry
+    ? 'Fish are hungry — feed them! (3 meals/day keeps them healthy)'
+    : 'Meals fed today' + (g.overfed ? ` · overfed ${g.overfed}× (hurts quality)` : '');
+  for (const el of [els.hudCoins, els.hudShells, els.hudFood, els.hudSnails, els.hudLuck, els.hudMeals])
     el.style.display = career ? '' : 'none';
 
   for (const b of els.modeSeg.querySelectorAll('button'))
@@ -1751,7 +1946,7 @@ function renderGame(snap) {
 
 function buildShop() {
   els.shopFish.innerHTML = '';
-  for (let t = 0; t < 4; t++) {
+  for (let t = 0; t < 5; t++) {
     const b = document.createElement('button');
     b.type = 'button'; b.className = 'shop-buy'; b.dataset.type = String(t);
     b.innerHTML = `<span>🐟 ${escapeHtml(FISH_TYPE_NAMES[t])}</span><span class="price">${FISH_PRICE[t]} <span class="ci"></span></span>`;
@@ -2018,7 +2213,7 @@ async function sellFish(fishId) {
   const f = snap && snap.fish && snap.fish.find((x) => x.id === fishId);
   if (!f) return;
   const val = fishSellValue(f);
-  if (!confirm(`Sell ${fishName(f)} for ${val} coins?`)) return;
+  if (!(await confirmDialog('Sell fish?', `Sell ${fishName(f)} for ${val} coins?`, { okLabel: 'Sell' }))) return;
   closeProfile();
   await sendControl({ type: 'sell', fishId }, `Sold ${fishName(f)} for ${val} coins`, { label: 'Sell fish' });
 }
@@ -2114,7 +2309,7 @@ els.profile.addEventListener('click', (e) => { if (e.target === els.profile) clo
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeProfile(); });
 
 function drawTitle(s) {
-  els.viewName.textContent = s.aquarium_id || selectedId || '—';
+  els.viewName.textContent = s._name || s.aquarium_id || selectedId || '—';
   const weather = s.weather ? (WEATHER_NAMES[s.weather.condition] || '') : '';
   els.viewSub.textContent = [s.platform, s.fw_version ? 'fw ' + s.fw_version : '', weather]
     .filter(Boolean)
@@ -2176,6 +2371,7 @@ function drawTank(s) {
   // Career collectibles, drawn on top so they're clearly visible + tappable.
   if (Array.isArray(s.loot)) for (const it of s.loot) drawLoot(it);
   if (Array.isArray(s.wanderers)) for (const w of s.wanderers) drawWanderer(w);
+  drawFoodBubbles(s);              // "feed me" bubbles above hungry fish
 
   if (cond === 3 || cond === 4) drawRain(cond, bright);
   else if (cond === 5) drawSnow(bright);
@@ -2205,6 +2401,61 @@ function drawSelectionHighlights() {
   if (hoveredKey) {
     const t = hitTargets.find((h) => h.key === hoveredKey);
     if (t) ring(t, 0.5 + 0.5 * Math.sin(animTick * 0.18));
+  }
+}
+
+// "Feed me" thought bubbles: spawned over a random fish while the tank is hungry
+// (career), they drift up and fade. Advanced in device-frame units (animTick) so the
+// cadence matches the firmware regardless of browser frame rate.
+let foodBubbles = [];
+let _bubbleCd = 0;
+let _bubbleLastTick = 0;
+const BUBBLE_SPAWN_CD = 1500;          // ~75s @20fps base interval; ×0.7–1.3 jitter (subtle, matches firmware)
+function drawFoodBubbles(s) {
+  const df = _bubbleLastTick ? clamp(animTick - _bubbleLastTick, 0, 5) : 1;
+  _bubbleLastTick = animTick;
+  const g = s && s.game;
+  const hungry = !!g && g.mode === 'career' && (g.hungry === 1 || g.hungry === true);
+
+  // Bubbles are bound to a fish id and re-anchored to its live position each frame, so
+  // they ride along as the fish swims; `rise` only lifts the bubble a little above it.
+  const fishById = new Map();
+  if (Array.isArray(s.fish)) for (const f of s.fish) fishById.set(f.id, f);
+
+  for (const b of foodBubbles) { b.rise += 0.4 * df; b.life -= df; }
+  foodBubbles = foodBubbles.filter((b) => b.life > 0 && fishById.has(b.fishId));
+
+  if (hungry && Array.isArray(s.fish) && s.fish.length) {
+    _bubbleCd -= df;
+    if (_bubbleCd <= 0) {
+      const f = s.fish[Math.floor(Math.random() * s.fish.length)];
+      foodBubbles.push({ fishId: f.id, rise: 0, life: 95, max: 95 });
+      _bubbleCd = BUBBLE_SPAWN_CD * (0.7 + Math.random() * 0.6);   // subtle, jittered (matches firmware)
+    }
+  } else {
+    _bubbleCd = 0;
+  }
+
+  for (const b of foodBubbles) {
+    const f = fishById.get(b.fishId);
+    if (!f) continue;
+    const x = projX(f.x, f.z || 0);
+    const y = projY(f.y, f.z || 0) - 24 - b.rise;
+    const a = clamp(b.life / b.max, 0, 1);
+    ctx.save();
+    ctx.globalAlpha = 0.9 * a;
+    ctx.fillStyle = '#f4fbff';
+    ctx.strokeStyle = 'rgba(80,150,190,0.9)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.ellipse(x, y, 14, 11, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    // tail dots trail back down toward the fish so the bubble reads as attached
+    ctx.beginPath(); ctx.arc(x - 10, y + 12, 2.4, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.arc(x - 14, y + 16, 1.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.globalAlpha = a;
+    ctx.font = '15px system-ui, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('🍴', x, y);
+    ctx.restore();
   }
 }
 
@@ -2326,8 +2577,7 @@ function drawStats(s) {
   const cards = [
     ['Weather', weather, s.weather && s.weather.override ? 'manual override' : 'auto'],
     ['Time of day', clock, (s.time && s.time.mode) || ''],
-    ['Fish', String((c.pair || 0) + (c.school || 0) + (c.school2 || 0) + (c.angel || 0)),
-      `pair ${c.pair || 0} · school ${c.school || 0}/${c.school2 || 0} · angel ${c.angel || 0}`],
+    ['Fish', String((c.pair || 0) + (c.school || 0) + (c.school2 || 0) + (c.angel || 0) + (c.salmon || 0)), ''],
     ['Platform', s.platform || '—', s.fw_version ? 'fw ' + s.fw_version : ''],
     ['Uptime', s.uptime_ms != null ? formatDuration(s.uptime_ms) : '—', ''],
     ['Last seen', lastSeen, s._stale ? '⚠ stale' : ''],
@@ -2447,6 +2697,7 @@ window.addEventListener('hashchange', () => {
   const id = routeId();
   if (id && id !== selectedId) select(id);
 });
+if (els.newAquarium) els.newAquarium.addEventListener('click', createAquarium);
 refreshList(); // first load honours the hash via renderList's default selection
 setInterval(refreshList, 5000);
 startWatchdog();

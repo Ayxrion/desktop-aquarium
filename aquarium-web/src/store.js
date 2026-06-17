@@ -21,17 +21,19 @@ function freshPending() {
   return {
     restore: false,            // !RESTORE — re-fetch + adopt the server profile
     weather: null,             // !WEATHER:<-1..6>  (null = nothing queued)
-    time: null,                // !TIME:<0|1>       (0 REAL, 1 FAST)
-    fishAdd: [0, 0, 0, 0],     // !FISHADD:<type>:<count>  per type 0..3
-    fishDel: [0, 0, 0, 0],     // !FISHDEL:<type>:<count>
+    time: null,                // !TIME:<0|1>       (0 REAL, 1 FAST) — legacy
+    timescale: null,           // !TIMESCALE:<1..5> (sim speed multiplier; null = nothing queued)
+    fishAdd: [0, 0, 0, 0, 0],  // !FISHADD:<type>:<count>  per type 0..4 (incl. salmon)
+    fishDel: [0, 0, 0, 0, 0],  // !FISHDEL:<type>:<count>
     feed: 0,                   // !FEED:<count>
     // ── Career-mode game directives ──
     mode: null,                // !MODE:<0|1>  (0 creative, 1 career; latest wins)
     catch: [],                 // !CATCH:<id,id,…>  wanderer/loot item ids to grab
-    buyFish: [0, 0, 0, 0],     // !BUYFISH:<type>:<count>  shop purchase (device deducts)
+    buyFish: [0, 0, 0, 0, 0],  // !BUYFISH:<type>:<count>  shop purchase (device deducts)
     buyFood: 0,                // !BUYFOOD:<count>
     buySnail: 0,               // !BUYSNAIL:<count>  coin-collector snail
     sellFish: [],              // !SELLFISH:<id,id,…>  sell fish by slot id (device removes + credits coins)
+    switchAq: null,            // !SWITCHAQ:<id>  tell a physical device to load a different aquarium
   };
 }
 
@@ -76,13 +78,19 @@ function _extrapolateSnapshot(snapshot, elapsedMs) {
     }));
 
     for (let frame = 0; frame < n; frame++) {
-      const cent = [0, 1, 2, 3].map((t) => {
-        const g = st.filter((f) => f.type === t);
-        if (!g.length) return { x: 0, y: 0, z: 0 };
-        return { x: g.reduce((s, f) => s + f.x, 0) / g.length,
-                 y: g.reduce((s, f) => s + f.y, 0) / g.length,
-                 z: g.reduce((s, f) => s + f.z, 0) / g.length };
-      });
+      // Sub-school centroids: schooling types split into schools capped at FISH_SCHOOL_SIZE,
+      // each fish coheres to its own school's centroid (so beyond the cap a new school forms).
+      const cent = {};
+      const order = [0, 0, 0, 0, 0];
+      for (const f of st) {
+        const sz = FISH_SCHOOL_SIZE[f.type] || 0;
+        f._sub = sz >= 2 ? Math.floor(order[f.type] / sz) : 0;
+        order[f.type]++;
+        const k = f.type + ':' + f._sub;
+        const c = cent[k] || (cent[k] = { x: 0, y: 0, z: 0, n: 0 });
+        c.x += f.x; c.y += f.y; c.z += f.z; c.n++;
+      }
+      for (const k in cent) { const c = cent[k]; c.x /= c.n; c.y /= c.n; c.z /= c.n; }
       for (const f of st) {
         const t = f.type, chasing = f.chasing && t === 0;
         const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
@@ -92,15 +100,16 @@ function _extrapolateSnapshot(snapshot, elapsedMs) {
         let ax = (f.tx - f.x) * seekStr;
         let ay = (f.ty - f.y) * seekStr;
         let az = (f.tz - f.z) * 0.010;
+        const grp = cent[t + ':' + f._sub];
         if (t === 1 || t === 2) {
-          ax += (cent[t].x - f.x) * 0.010; ay += (cent[t].y - f.y) * 0.007; az += (cent[t].z - f.z) * 0.007;
+          ax += (grp.x - f.x) * 0.010; ay += (grp.y - f.y) * 0.007; az += (grp.z - f.z) * 0.007;
         } else if (t === 3) {
-          ax += (cent[3].x - f.x) * 0.012; ay += (cent[3].y - f.y) * 0.010; az += (cent[3].z - f.z) * 0.008;
+          ax += (grp.x - f.x) * 0.012; ay += (grp.y - f.y) * 0.010; az += (grp.z - f.z) * 0.008;
         }
         const sepR2 = t === 3 ? 60*60 : 80*80, sepK = t === 3 ? 7 : 8;
         if (t === 1 || t === 2 || t === 3) {
           for (const o of st) {
-            if (o === f || o.type !== t) continue;
+            if (o === f || o.type !== t || o._sub !== f._sub) continue;
             const dx = f.x - o.x, dy = f.y - o.y, d2 = dx*dx + dy*dy;
             if (d2 < sepR2 && d2 > 0.01) { const inv = sepK/d2; ax += dx*inv; ay += dy*inv; }
           }
@@ -174,22 +183,22 @@ const aquariums = new Map();
 (function _restore() {
   const rows = db.loadAll();
   for (const row of rows) {
-    if (!row.snapshot) continue;
     const entry = {
-      snapshot: row.snapshot,
-      saved: row.snapshot,                  // persisted snapshot is the baseline
-      savedSig: profileSig(row.snapshot),
+      snapshot: row.snapshot || null,
+      saved: row.snapshot || null,          // persisted snapshot is the baseline
+      savedSig: row.snapshot ? profileSig(row.snapshot) : null,
       conflict: null,
       awaitingRestore: false,
       adoptNext: false,
       pending: freshPending(),
       lastSeenMs: row.lastSeenMs,
       createdAt: row.createdAt,
+      name: row.name || null,     // friendly display name (dashboard-assigned)
       names: row.names,           // Map<fishId, name> from DB
       meta: new Map(),
     };
     // Re-seed fish meta from the persisted snapshot so ageMs is meaningful.
-    if (Array.isArray(row.snapshot.fish)) {
+    if (row.snapshot && Array.isArray(row.snapshot.fish)) {
       for (const f of row.snapshot.fish) {
         if (typeof f.id === 'number')
           entry.meta.set(f.id, { firstSeenMs: row.createdAt, lastSeenMs: row.lastSeenMs });
@@ -199,6 +208,113 @@ const aquariums = new Map();
   }
   if (rows.length) console.log(`Store: restored ${rows.length} aquarium(s) from DB`);
 })();
+
+// ── Devices ────────────────────────────────────────────────────────────────────
+// A device is a physical Pi/ESP that self-registers via telemetry. (There are no
+// "virtual" devices any more — any aquarium WITHOUT a live device is run by the
+// server's built-in web simulator; see deviceManager.js.) An aquarium is a standalone
+// saved tank; a device "plays" at most one aquarium at a time (`aquariumId`).
+/** @type {Map<string, {id,name,kind,aquariumId,createdAt,lastSeenMs}>} */
+const devices = new Map();
+let _devSeq = 1;
+(function _restoreDevices() {
+  for (const d of db.loadDevices()) { if (d && d.id) devices.set(d.id, d); _devSeq++; }
+  if (devices.size) console.log(`Store: restored ${devices.size} device(s) from DB`);
+})();
+function _persistDevices() { db.saveDevices([...devices.values()]); }
+function _newDeviceId() { return 'dev-' + now().toString(36) + '-' + (_devSeq++); }
+// An aquarium has at most one device: assigning it to one frees it from any other.
+function _unassignAquariumFromOthers(aquariumId, exceptId) {
+  if (!aquariumId) return;
+  for (const d of devices.values())
+    if (d.id !== exceptId && d.aquariumId === aquariumId) d.aquariumId = null;
+}
+
+function listDevices() {
+  return [...devices.values()].map((d) => ({ ...d, online: !isStale(d.lastSeenMs || 0) }));
+}
+// True when a (physical) device is currently live and bound to this aquarium. The
+// server simulator (deviceManager) defers to a real device whenever this is true.
+function hasLiveDevice(aquariumId) {
+  if (!aquariumId) return false;
+  for (const d of devices.values())
+    if (d.aquariumId === aquariumId && !isStale(d.lastSeenMs || 0)) return true;
+  return false;
+}
+// Device summary (if any) currently bound to an aquarium — live one preferred.
+function deviceForAquarium(aquariumId) {
+  let best = null;
+  for (const d of devices.values()) {
+    if (d.aquariumId !== aquariumId) continue;
+    const online = !isStale(d.lastSeenMs || 0);
+    if (!best || (online && !best.online)) best = { id: d.id, name: d.name, kind: d.kind, online };
+  }
+  return best;
+}
+function getDevice(id) {
+  const d = devices.get(id);
+  return d ? { ...d, online: !isStale(d.lastSeenMs || 0) } : null;
+}
+function createDevice(opts = {}) {
+  const id = opts.id || _newDeviceId();
+  const d = {
+    id,
+    name: sanitizeName(opts.name) || (opts.kind === 'virtual' ? 'Virtual device' : 'Device'),
+    kind: opts.kind || 'virtual',
+    aquariumId: opts.aquariumId || null,
+    createdAt: now(),
+    lastSeenMs: 0,
+  };
+  if (d.aquariumId) _unassignAquariumFromOthers(d.aquariumId, id);
+  devices.set(id, d);
+  _persistDevices();
+  return d;
+}
+// Rename / (re)assign which aquarium a device plays. assignAquarium(null) unassigns.
+function updateDevice(id, patch = {}) {
+  const d = devices.get(id);
+  if (!d) return null;
+  if (patch.name != null) { const n = sanitizeName(patch.name); if (n) d.name = n; }
+  if ('aquariumId' in patch) {
+    const oldAq = d.aquariumId;
+    d.aquariumId = patch.aquariumId || null;
+    if (d.aquariumId) _unassignAquariumFromOthers(d.aquariumId, d.id);
+    // A physical device is still polling its OLD aquarium's directive channel; queue a
+    // !SWITCHAQ there so it loads the new tank. (Virtual devices are rebound by the
+    // tick manager directly, so they need no directive.)
+    if (d.kind !== 'virtual' && oldAq && d.aquariumId && oldAq !== d.aquariumId) {
+      const e = aquariums.get(oldAq);
+      if (e) { (e.pending || (e.pending = freshPending())).switchAq = d.aquariumId; }
+    }
+  }
+  _persistDevices();
+  return { ...d, online: !isStale(d.lastSeenMs || 0) };
+}
+function removeDevice(id) {
+  const ok = devices.delete(id);
+  if (ok) _persistDevices();
+  return ok;
+}
+// Self-registration from a telemetry POST (physical hardware can create its device +
+// aquarium before the server knew about either). Only persists on structural changes;
+// the per-tick lastSeenMs bump stays in memory.
+function registerDeviceFromTelemetry(snapshot) {
+  const id = snapshot.device_id;
+  if (!id) return;
+  let d = devices.get(id);
+  let structural = false;
+  if (!d) {
+    d = { id, name: sanitizeName(snapshot.device_name) || id,
+          kind: snapshot.platform || 'device', aquariumId: snapshot.aquarium_id || null,
+          createdAt: now(), lastSeenMs: now() };
+    devices.set(id, d);
+    structural = true;
+  } else {
+    if (snapshot.aquarium_id && d.aquariumId !== snapshot.aquarium_id) { d.aquariumId = snapshot.aquarium_id; structural = true; }
+    d.lastSeenMs = now();
+  }
+  if (structural) _persistDevices();
+}
 
 /** @type {Set<(snapshot: object) => void>} */
 const subscribers = new Set();
@@ -223,6 +339,7 @@ function getOrCreate(id) {
   if (!entry) {
     entry = {
       snapshot: null, lastSeenMs: 0, createdAt: now(),
+      name: null,             // friendly display name (dashboard-assigned)
       names: new Map(), meta: new Map(),
       saved: null,            // source-of-truth snapshot (profile baseline)
       savedSig: null,         // profileSig(saved)
@@ -249,7 +366,7 @@ function getOrCreate(id) {
 function profileSig(s) {
   if (!s) return '';
   const c = s.counts || {};
-  return `P:${c.pair || 0},${c.school || 0},${c.school2 || 0},${c.angel || 0}`;
+  return `P:${c.pair || 0},${c.school || 0},${c.school2 || 0},${c.angel || 0},${c.salmon || 0}`;
 }
 
 // Update per-fish age metadata from a snapshot's fish list.
@@ -285,6 +402,7 @@ function enrich(entry) {
     : [];
   return {
     ...s, fish,
+    _name: entry.name || null,
     _lastSeenMs: entry.lastSeenMs,
     _stale: isStale(entry.lastSeenMs),
     _conflict: entry.conflict || null,
@@ -325,6 +443,7 @@ function upsert(snapshot) {
     return { ok: false, error: 'max_aquariums_reached' };
   }
   const entry = getOrCreate(id);
+  if (snapshot.device_id) registerDeviceFromTelemetry(snapshot); // physical/virtual self-register
   const t = now();
   const sig = profileSig(snapshot);
   // In Career mode the fish census changes constantly through legitimate play
@@ -391,19 +510,21 @@ function getNamesText(id) {
   // device scans for them explicitly). Drained here: one-shot per response.
   const p = entry.pending || (entry.pending = freshPending());
   let restoreEmitted = false;
+  if (p.switchAq) { lines.push(`!SWITCHAQ:${p.switchAq}`); p.switchAq = null; }
   if (p.restore) { lines.push('!RESTORE'); p.restore = false; restoreEmitted = true; }
   if (p.weather !== null) { lines.push(`!WEATHER:${p.weather}`); p.weather = null; }
   if (p.time !== null) { lines.push(`!TIME:${p.time}`); p.time = null; }
-  for (let t = 0; t < 4; t++) {
+  if (p.timescale !== null) { lines.push(`!TIMESCALE:${p.timescale}`); p.timescale = null; }
+  for (let t = 0; t < 5; t++) {
     if (p.fishAdd[t] > 0) { lines.push(`!FISHADD:${t}:${p.fishAdd[t]}`); p.fishAdd[t] = 0; }
   }
-  for (let t = 0; t < 4; t++) {
+  for (let t = 0; t < 5; t++) {
     if (p.fishDel[t] > 0) { lines.push(`!FISHDEL:${t}:${p.fishDel[t]}`); p.fishDel[t] = 0; }
   }
   if (p.feed > 0) { lines.push(`!FEED:${p.feed}`); p.feed = 0; }
   if (p.mode !== null) { lines.push(`!MODE:${p.mode}`); p.mode = null; }
   if (p.catch.length) { lines.push(`!CATCH:${p.catch.join(',')}`); p.catch = []; }
-  for (let t = 0; t < 4; t++) {
+  for (let t = 0; t < 5; t++) {
     if (p.buyFish[t] > 0) { lines.push(`!BUYFISH:${t}:${p.buyFish[t]}`); p.buyFish[t] = 0; }
   }
   if (p.buyFood > 0) { lines.push(`!BUYFOOD:${p.buyFood}`); p.buyFood = 0; }
@@ -418,7 +539,10 @@ function getNamesText(id) {
 
 // Fish-type caps mirror the firmware (main.cpp / aquarium.ino) so the dashboard
 // and server can validate without a round-trip.
-const FISH_MAX = [8, 16, 20, 12]; // pair, school, school2, angel
+const FISH_MAX = [8, 16, 20, 12, 16]; // pair(clownfish), guppy(school), piranha(school2), angel, salmon
+// Max school size per type before fish split into a new school (0 = solitary). Clownfish
+// realize size-2 via mate-pairing; Guppy/Piranha use centroid sub-schools; Angel/Salmon don't.
+const FISH_SCHOOL_SIZE = [2, 6, 4, 0, 0];
 
 // Buffer a downstream control directive for the device's next telemetry response.
 // Returns { ok } or { ok:false, error } on bad input.
@@ -439,10 +563,16 @@ function queueControl(id, cmd) {
       p.time = v === 'FAST' ? 1 : 0;
       break;
     }
+    case 'timescale': {
+      const v = Number(cmd.value);
+      if (!Number.isInteger(v) || v < 1 || v > 5) return { ok: false, error: 'bad_timescale' };
+      p.timescale = v;
+      break;
+    }
     case 'fish': {
       const ft = Number(cmd.fishType);
       const n = Math.max(1, Math.min(64, Number(cmd.count) || 1));
-      if (!Number.isInteger(ft) || ft < 0 || ft > 3) return { ok: false, error: 'bad_fish_type' };
+      if (!Number.isInteger(ft) || ft < 0 || ft > 4) return { ok: false, error: 'bad_fish_type' };
       if (cmd.action === 'add') p.fishAdd[ft] += n;
       else if (cmd.action === 'remove') p.fishDel[ft] += n;
       else return { ok: false, error: 'bad_fish_action' };
@@ -482,7 +612,7 @@ function queueControl(id, cmd) {
       const what = String(cmd.what);
       if (what === 'fish') {
         const ft = Number(cmd.fishType);
-        if (!Number.isInteger(ft) || ft < 0 || ft > 3) return { ok: false, error: 'bad_fish_type' };
+        if (!Number.isInteger(ft) || ft < 0 || ft > 4) return { ok: false, error: 'bad_fish_type' };
         p.buyFish[ft] += Math.max(1, Math.min(64, Number(cmd.count) || 1));
       } else if (what === 'food') {
         p.buyFood += Math.max(1, Math.min(99, Number(cmd.count) || 1));
@@ -517,9 +647,11 @@ function list() {
     const s = entry.snapshot || {};
     const counts = s.counts || {};
     const fishCount =
-      (counts.pair || 0) + (counts.school || 0) + (counts.school2 || 0) + (counts.angel || 0);
+      (counts.pair || 0) + (counts.school || 0) + (counts.school2 || 0) + (counts.angel || 0) + (counts.salmon || 0);
+    const device = deviceForAquarium(id);
     out.push({
       aquarium_id: id,
+      name: entry.name || null,
       platform: s.platform || 'unknown',
       fw_version: s.fw_version || null,
       lastSeenMs: entry.lastSeenMs,
@@ -528,6 +660,8 @@ function list() {
       counts,
       weather: s.weather || null,
       conflict: !!entry.conflict,
+      device,                          // { id, name, kind, online } | null
+      simulated: !(device && device.online), // server web-sim drives it when no live device
     });
   }
   out.sort((a, b) => a.aquarium_id.localeCompare(b.aquarium_id));
@@ -563,6 +697,7 @@ function bootstrap(id) {
     screen: base.screen || null,
     plants: base.plants || null,
     game: base.game || null,   // mode/coins/shells/food/luck — restore career state
+    snails: base.snails || null, // purchased coin-collector snails — durable, must survive reboot
     fish,                      // each fish already carries age/xp/fish_luck via {...f}
   };
 }
@@ -595,6 +730,37 @@ function resolveConflict(id, choice) {
   return { ok: false, error: 'bad_choice' };
 }
 
+// All known aquarium ids (snapshot-bearing or freshly-created). The device manager
+// iterates these to decide which tanks need server-side simulation.
+function aquariumIds() {
+  return [...aquariums.keys()];
+}
+
+// Create a brand-new aquarium from the dashboard. It has no physical device, so the
+// server's web simulator (deviceManager) starts running it immediately. The id is a
+// URL-safe slug of the name (deduped); the friendly name is kept for display.
+function createAquarium(rawName) {
+  if (aquariums.size >= MAX_AQUARIUMS) return { ok: false, error: 'max_aquariums_reached' };
+  const name = sanitizeName(rawName) || '';
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32);
+  let id = slug || ('tank-' + now().toString(36));
+  if (aquariums.has(id)) id = `${id}-${now().toString(36).slice(-4)}`;
+  const entry = getOrCreate(id);
+  entry.name = name || null;
+  db.saveAquariumMeta(id, { name: entry.name, createdAt: entry.createdAt });
+  return { ok: true, aquariumId: id, name: entry.name };
+}
+
+// Rename an existing aquarium (display name only; the id/slug is immutable).
+function renameAquarium(id, rawName) {
+  const entry = aquariums.get(id);
+  if (!entry) return { ok: false, error: 'not_found' };
+  entry.name = sanitizeName(rawName) || null;
+  db.saveAquariumMeta(id, { name: entry.name, createdAt: entry.createdAt });
+  broadcast(entry); // open dashboards update their title immediately
+  return { ok: true, name: entry.name };
+}
+
 // Forget an aquarium: drop it from memory and delete its persisted file. A device
 // that is still alive will simply re-create it on its next telemetry POST; for a
 // stale (gone) device this is a permanent removal. Returns whether it existed.
@@ -613,4 +779,8 @@ module.exports = {
   upsert, list, get, bootstrap, resolveConflict, subscribe, setName, getNamesText,
   queueControl, remove, FISH_MAX,
   STALE_MS, MAX_AQUARIUMS,
+  // Aquarium lifecycle (dashboard-created tanks, simulated server-side)
+  createAquarium, renameAquarium, aquariumIds, hasLiveDevice,
+  // Device registry (physical hardware that self-registers via telemetry)
+  listDevices, getDevice, createDevice, updateDevice, removeDevice,
 };
