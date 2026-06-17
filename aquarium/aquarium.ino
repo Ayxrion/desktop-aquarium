@@ -641,7 +641,7 @@ bool fishIsShiny(uint32_t id) { return hash32u(id ^ 0x5bd1e995u) % SHINY_ODDS ==
 
 // Canonical fish colour from type + luck + id (resident fish and wild wanderers).
 uint32_t syncedFishColor(int type, float luck, uint32_t id) {
-  if (type < 0 || type > 3) type = 1;
+  if (type < 0 || type > 4) type = 1;   // 0..4 (incl. salmon); clamp strays to guppy
   if (luck < 0) luck = 0; if (luck > 1) luck = 1;
   uint32_t c = lerpColor888(FISH_PRIMARY[type], LUCK_TINT_COLOR, luck * LUCK_TINT_STRENGTH);
   if (fishIsShiny(id)) c = (~c) & 0xFFFFFFUL;
