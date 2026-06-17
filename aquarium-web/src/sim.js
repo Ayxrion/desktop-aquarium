@@ -21,10 +21,14 @@ const FRAMES_PER_PUBLISH = 1000 / FRAME_MS; // 20 frames per 1Hz publish
 const DAMP = 0.85;
 
 const GROW_FRAMES = 3600;
-// One in-tank "day" in sim frames. At timescale 1 (20 fps) this is a 60-second day,
-// matching the previous real-time clock. The day clock is tick-based so a higher
-// timescale advances it (and every other property) proportionally faster.
-const DAY_FRAMES = 1200;
+// One in-tank "day" in sim frames. At timescale 1 (20 fps) this is a 20-minute day,
+// matching the firmware's FAST cycle (_FAST_CYCLE_MS = 20*60*1000 in aquarium-pi/
+// aquarium daynight.h). The day clock is tick-based so a higher timescale advances it
+// (and every other property) proportionally faster.
+const DAY_FRAMES = 24000;
+// One weather condition lasts this many sim frames before rotating. At 20 fps this is
+// 5 minutes, matching the firmware's _WEATHER_INTERVAL (5*60*1000 in weather.h).
+const WEATHER_FRAMES = 6000;
 const COIN_BASE_CD = 3000;
 const SHELL_BASE_CD = 2600;
 const WANDER_BASE_CD = 7000;
@@ -388,7 +392,7 @@ function createSim(opts) {
 
   function snapshot() {
     const dp = dayProgress();
-    const cond = weatherOverride >= 0 ? weatherOverride : Math.floor((tick / 100) % 7);
+    const cond = weatherOverride >= 0 ? weatherOverride : Math.floor((tick / WEATHER_FRAMES) % 7);
     return {
       aquarium_id: aquariumId,
       platform: 'web',
