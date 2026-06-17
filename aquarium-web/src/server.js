@@ -156,6 +156,9 @@ app.post('/api/aquariums/:id/resolve', (req, res) => {
 //   { type:'time', value:'REAL'|'FAST' }
 //   { type:'fish', action:'add'|'remove', fishType:0..3, count?:1 }
 //   { type:'feed', count?:1 }
+//   { type:'mode', value:'creative'|'career' }
+//   { type:'catch', itemId:<number> }                  (wanderer/loot id)
+//   { type:'buy', what:'fish', fishType:0..3, count?:1 } | { what:'food', count?:1 }
 app.post('/api/aquariums/:id/control', (req, res) => {
   const result = store.queueControl(req.params.id, req.body || {});
   if (!result.ok) return res.status(400).json(result);

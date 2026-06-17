@@ -106,6 +106,14 @@ static std::atomic<int> _ctrlTimeReq{-1};         // -1 none, 0 REAL, 1 FAST
 static std::atomic<int> _ctrlFeedReq{0};          // pending food drops
 static std::atomic<int> _ctrlFishAddReq[4];       // pending adds per fish type 0..3
 static std::atomic<int> _ctrlFishDelReq[4];       // pending removes per fish type 0..3
+// ── Career game directives ──
+static std::atomic<int> _ctrlModeReq{-1};          // -1 none, 0 creative, 1 career
+static std::atomic<int> _ctrlBuyFishReq[4];        // shop fish purchases per type
+static std::atomic<int> _ctrlBuyFoodReq{0};        // shop food purchases
+static std::atomic<int> _ctrlBuySnailReq{0};       // shop coin-collector snail purchases
+#define CTRL_CATCH_MAX 24
+static std::atomic<uint32_t> _ctrlCatchIds[CTRL_CATCH_MAX]; // wanderer/loot ids to grab
+static std::atomic<int> _ctrlCatchCount{0};
 
 // Parse the control directives out of a POST response body into the atomics above.
 // Each command type appears at most once per response (the server collapses them),
@@ -115,12 +123,31 @@ static void _telemetryParseControls(const char* body) {
     if ((d = strstr(body, "!WEATHER:")) != nullptr) _ctrlWeatherReq.store(atoi(d + 9));
     if ((d = strstr(body, "!TIME:"))    != nullptr) _ctrlTimeReq.store(atoi(d + 6));
     if ((d = strstr(body, "!FEED:"))    != nullptr) _ctrlFeedReq.fetch_add(atoi(d + 6));
+    if ((d = strstr(body, "!MODE:"))     != nullptr) _ctrlModeReq.store(atoi(d + 6));
+    if ((d = strstr(body, "!BUYFOOD:"))  != nullptr) _ctrlBuyFoodReq.fetch_add(atoi(d + 9));
+    if ((d = strstr(body, "!BUYSNAIL:")) != nullptr) _ctrlBuySnailReq.fetch_add(atoi(d + 10));
     for (int t = 0; t < 4; t++) {
         char tok[16];
         snprintf(tok, sizeof(tok), "!FISHADD:%d:", t);
         if ((d = strstr(body, tok)) != nullptr) _ctrlFishAddReq[t].fetch_add(atoi(d + strlen(tok)));
         snprintf(tok, sizeof(tok), "!FISHDEL:%d:", t);
         if ((d = strstr(body, tok)) != nullptr) _ctrlFishDelReq[t].fetch_add(atoi(d + strlen(tok)));
+        snprintf(tok, sizeof(tok), "!BUYFISH:%d:", t);
+        if ((d = strstr(body, tok)) != nullptr) _ctrlBuyFishReq[t].fetch_add(atoi(d + strlen(tok)));
+    }
+    // !CATCH:<id,id,…> — append ids to the catch queue (drained on the main thread).
+    if ((d = strstr(body, "!CATCH:")) != nullptr) {
+        const char* p = d + 7;
+        const char* nl = strchr(p, '\n');
+        while (*p && p != nl) {
+            int idx = _ctrlCatchCount.load();
+            if (idx >= CTRL_CATCH_MAX) break;
+            _ctrlCatchIds[idx].store((uint32_t)strtoul(p, nullptr, 10));
+            _ctrlCatchCount.store(idx + 1);
+            const char* c = strchr(p, ',');
+            if (!c || (nl && c > nl)) break;
+            p = c + 1;
+        }
     }
 }
 
@@ -186,7 +213,7 @@ static const char* _weatherName(int c) {
 static std::string _buildTelemetryJson() {
     std::string j;
     j.reserve(8192);
-    char tmp[320];
+    char tmp[384];
 
     int wc = (int)currentWeather;
     snprintf(tmp, sizeof(tmp),
@@ -211,20 +238,22 @@ static std::string _buildTelemetryJson() {
         if (!isFishActive(i)) continue;
         Fish& f = fish[i];
         snprintf(tmp, sizeof(tmp),
-            "%s{\"id\":%d,\"x\":%d,\"y\":%d,\"z\":%.3f,"
+            "%s{\"id\":%d,\"x\":%.1f,\"y\":%.1f,\"z\":%.3f,"
             "\"vx\":%.2f,\"vy\":%.2f,\"vz\":%.4f,"
-            "\"tx\":%d,\"ty\":%d,\"wander_cd\":%d,"
+            "\"tx\":%.1f,\"ty\":%.1f,\"tz\":%.3f,\"wander_cd\":%d,"
             "\"type\":%d,\"facing_right\":%s,"
-            "\"color\":%u,\"going_for_food\":%s,\"chasing\":%s}",
+            "\"color\":%u,\"going_for_food\":%s,\"chasing\":%s,"
+            "\"age\":%d,\"scale\":%.3f,\"xp\":%d,\"fish_luck\":%.3f}",
             first ? "" : ",", i,
-            (int)f.x, (int)f.y, f.z,
+            f.x, f.y, f.z,
             f.vx, f.vy, f.vz,
-            (int)f.tx, (int)f.ty, (int)f.wanderCD,
+            f.tx, f.ty, f.tz, (int)f.wanderCD,
             (int)f.type,
             f.facingRight ? "true" : "false",
             (unsigned)fishColor(i),
             f.goingForFood ? "true" : "false",
-            f.chasing ? "true" : "false");
+            f.chasing ? "true" : "false",
+            (int)f.age, fishScale(f), (int)f.xp, f.fishLuck);
         j += tmp;
         first = false;
     }
@@ -275,7 +304,51 @@ static std::string _buildTelemetryJson() {
         if (i) j += ",";
         j += tmp;
     }
-    j += "]}}";
+    j += "]},";
+
+    // Career game state
+    snprintf(tmp, sizeof(tmp),
+        "\"game\":{\"mode\":\"%s\",\"coins\":%d,\"shells\":%d,\"food\":%d,\"luck\":%.3f},",
+        (gameMode == MODE_CAREER) ? "career" : "creative",
+        gameCoins, gameShells, gameFood, tankLuck());
+    j += tmp;
+
+    // Wandering fish (catchable)
+    j += "\"wanderers\":[";
+    first = true;
+    for (int i = 0; i < MAX_WANDER; i++) {
+        if (!wanderers[i].active) continue;
+        snprintf(tmp, sizeof(tmp),
+            "%s{\"id\":%u,\"x\":%.1f,\"y\":%.1f,\"vx\":%.3f,\"bob\":%.3f,"
+            "\"type\":%d,\"color\":%u,\"facing_right\":%s}",
+            first ? "" : ",", wanderers[i].id, wanderers[i].x, wanderers[i].y,
+            wanderers[i].vx, wanderers[i].bob,
+            wanderers[i].type, (unsigned)wanderers[i].color,
+            wanderers[i].facingRight ? "true" : "false");
+        j += tmp; first = false;
+    }
+    j += "],\"loot\":[";
+    first = true;
+    for (int i = 0; i < MAX_LOOT; i++) {
+        if (!loot[i].active) continue;
+        snprintf(tmp, sizeof(tmp),
+            "%s{\"id\":%u,\"kind\":\"%s\",\"x\":%.1f,\"y\":%.1f,\"vy\":%.2f,"
+            "\"landed\":%s,\"ttl\":%d,\"tier\":%d}",
+            first ? "" : ",", loot[i].id, loot[i].kind == 0 ? "coin" : "shell",
+            loot[i].x, loot[i].y, loot[i].vy,
+            loot[i].landed ? "true" : "false", loot[i].ttl, loot[i].tier);
+        j += tmp; first = false;
+    }
+    j += "],\"snails\":[";
+    first = true;
+    for (int i = 0; i < numSnails; i++) {
+        if (!coinSnails[i].active) continue;
+        snprintf(tmp, sizeof(tmp), "%s{\"x\":%.1f,\"spd\":%.3f,\"facing_right\":%s}",
+            first ? "" : ",", coinSnails[i].x, coinSnails[i].spd,
+            coinSnails[i].facingRight ? "true" : "false");
+        j += tmp; first = false;
+    }
+    j += "]}";
 
     return j;
 }
@@ -510,6 +583,9 @@ static void _applyBootstrap(const char* json) {
         if (_jGetInt(obj, "ty",        &iv)) f.ty       = (float)iv;
         if (_jGetInt(obj, "wander_cd", &iv)) f.wanderCD = (float)iv;
         if (_jGetBool(obj, "chasing",  &bv)) f.chasing  = bv;
+        if (_jGetInt(obj, "age",       &iv)) f.age      = (float)iv;
+        if (_jGetInt(obj, "xp",        &iv)) f.xp       = iv;
+        if (_jGetFloat(obj, "fish_luck", &fv)) f.fishLuck = fv;
 
         const char* ns; size_t nl;
         if (_jGetStr(obj, "name", &ns, &nl) && nl > 0) {
@@ -523,11 +599,26 @@ static void _applyBootstrap(const char* json) {
     printf("Telemetry: aquarium state restored from server\n");
 }
 
+// Set true once a server profile has been adopted, so setup() can skip its
+// default tank seeding (which would otherwise reset restored fish ages to 0).
+bool telemetryProfileLoaded = false;
+
 // Rebuild the local tank to the server's saved profile (counts + plant layout),
 // then overlay the saved fish positions/names. Main-thread only (mutates fish[]
 // and the plant arrays that the render loop reads).
 static void _applyServerProfile(const char* json) {
     if (!strstr(json, "\"exists\":true")) return;
+
+    // 0) Career game state (mode + wallet) from the saved snapshot.
+    const char* gp = strstr(json, "\"game\":");
+    if (gp) {
+        int v; const char* ms; size_t ml;
+        if (_jGetStr(gp, "mode", &ms, &ml))
+            gameMode = (ml == 6 && strncmp(ms, "career", 6) == 0) ? MODE_CAREER : MODE_CREATIVE;
+        if (_jGetInt(gp, "coins",  &v)) gameCoins  = v;
+        if (_jGetInt(gp, "shells", &v)) gameShells = v;
+        if (_jGetInt(gp, "food",   &v)) gameFood   = v;
+    }
 
     // 1) Fish composition from saved counts — rebuild via addFish (handles slots
     //    + pair partners), then positions get overlaid by _applyBootstrap below.
@@ -589,6 +680,7 @@ static void _applyServerProfile(const char* json) {
 
     // 3) Overlay the saved fish positions + names.
     _applyBootstrap(json);
+    telemetryProfileLoaded = true;
     printf("Telemetry: rebuilt tank to server profile (pair %d school %d/%d angel %d)\n",
            numPair, numSchool, numSchool2, numAngel);
 }

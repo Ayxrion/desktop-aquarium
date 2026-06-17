@@ -48,11 +48,51 @@
             <button id="conflict-local" class="btn-local">Keep device's version</button>
           </div>
         </div>
+        <div id="mode-confirm" class="conflict-bar mode-confirm" hidden>
+          <div class="conflict-text">
+            <strong id="mode-confirm-title">Switch mode?</strong>
+            <span id="mode-confirm-detail"></span>
+          </div>
+          <div class="conflict-actions">
+            <button id="mode-confirm-ok" class="btn-server">Confirm</button>
+            <button id="mode-confirm-cancel" class="btn-local">Cancel</button>
+          </div>
+        </div>
         <div class="tank-row">
           <div class="tank-wrap">
             <canvas id="tank" width="800" height="480"></canvas>
+            <div id="legend-overlay" class="legend-overlay">
+              <div class="legend-head">
+                <h3>Fish</h3>
+                <span class="hint">click a row to highlight · click a name to rename</span>
+              </div>
+              <div id="legend" class="legend"></div>
+            </div>
           </div>
           <aside class="tank-info">
+            <div id="game-panel" class="game-panel" hidden>
+              <div class="hud">
+                <span class="hud-mode" id="hud-mode">Career</span>
+                <span class="hud-item" id="hud-coins" title="Coins">🪙 0</span>
+                <span class="hud-item" id="hud-shells" title="Shells">🐚 0</span>
+                <span class="hud-item" id="hud-food" title="Fish food">🍤 0</span>
+                <span class="hud-item" id="hud-snails" title="Collector snails">🐌 0</span>
+                <span class="hud-item" id="hud-luck" title="Tank luck">🍀 0%</span>
+              </div>
+              <div class="mode-row">
+                <span class="ctrl-label">Mode</span>
+                <div class="seg" id="mode-seg">
+                  <button type="button" data-mode="creative">Creative</button>
+                  <button type="button" data-mode="career">Career</button>
+                </div>
+              </div>
+              <div id="shop" class="shop" hidden>
+                <div class="shop-head">🛒 Shop <span class="hint">spend coins to grow your tank</span></div>
+                <div id="shop-fish" class="shop-fish"></div>
+                <button type="button" id="shop-food" class="shop-buy">🍤 Buy fish food — 5 🪙</button>
+                <button type="button" id="shop-snail" class="shop-buy">🐌 Buy collector snail — 50 🪙</button>
+              </div>
+            </div>
             <div id="stats" class="stats"></div>
             <div id="controls" class="controls" hidden>
               <h3>Controls</h3>
@@ -76,7 +116,7 @@
                   <button type="button" data-mode="FAST">Fast</button>
                 </div>
               </div>
-              <div class="ctrl-group">
+              <div class="ctrl-group" id="ctrl-fish-group">
                 <span class="ctrl-label">Fish</span>
                 <div id="ctrl-fish" class="ctrl-fish"></div>
               </div>
@@ -86,14 +126,20 @@
             </div>
           </aside>
         </div>
-        <div class="legend-head">
-          <h3>Fish</h3>
-          <span class="hint">click a row to highlight · click a name to rename</span>
-        </div>
-        <div id="legend" class="legend"></div>
       </div>
     </section>
   </main>
+
+  <!-- Floating hover card for canvas entities (fish / snails / loot / wild fish) -->
+  <div id="entity-tooltip" class="entity-tooltip" hidden></div>
+
+  <!-- Click-to-expand detailed profile (fish + snails) -->
+  <div id="entity-profile" class="entity-profile" hidden>
+    <div class="profile-card">
+      <button id="profile-close" class="profile-close" aria-label="Close profile">×</button>
+      <div id="profile-body" class="profile-body"></div>
+    </div>
+  </div>
 
   <!-- Relative src so it works under the prefix -->
   <script src="app.js"></script>

@@ -16,11 +16,14 @@
    leaving "hidden" elements (e.g. the profile-mismatch bar) permanently visible. */
 [hidden] { display: none !important; }
 
+html, body { height: 100%; }
 body {
   margin: 0;
   font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
   background: var(--bg);
   color: var(--text);
+  /* The dashboard is sized to fit the viewport; the page itself never scrolls. */
+  overflow: hidden;
 }
 
 header {
@@ -98,10 +101,19 @@ main {
 .dot.live { background: var(--live); box-shadow: 0 0 6px var(--live); }
 .dot.stale { background: var(--stale); }
 
-#view { flex: 1; padding: 18px; overflow-y: auto; }
+#view { flex: 1; padding: 18px; min-width: 0; overflow: hidden; display: flex; }
 .hint { color: var(--muted); font-size: 14px; }
 
-#view-content { max-width: 1280px; margin: 0 auto; }
+#view-content {
+  max-width: 1280px;
+  width: 100%;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;        /* let the tank row shrink to fit the viewport */
+}
+/* The empty-state hint isn't a flex column; keep it simple. */
+#view-empty { margin: auto; }
 
 /* Profile-mismatch banner (server vs device composition conflict). */
 .conflict-bar {
@@ -145,13 +157,19 @@ main {
 .tank-row {
   display: flex;
   gap: 18px;
-  align-items: flex-start;
+  align-items: stretch;     /* info column matches the canvas height, scrolls within */
+  flex: 1 1 auto;
+  min-height: 0;
 }
 .tank-info {
   width: 312px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  overflow-y: auto;         /* fold everything in here; scroll internally, not the page */
+  padding-right: 2px;
 }
 .tank-info .stats {
   grid-template-columns: 1fr 1fr;
@@ -159,8 +177,12 @@ main {
 }
 
 @media (max-width: 980px) {
-  .tank-row { flex-direction: column; }
-  .tank-info { width: 100%; }
+  body { overflow: auto; }
+  #view { overflow: visible; display: block; }
+  #view-content { min-height: 0; display: block; }
+  .tank-row { flex-direction: column; min-height: 0; }
+  .tank-wrap { align-self: stretch; max-width: none; }
+  .tank-info { width: 100%; min-height: 0; overflow: visible; }
   .tank-info .stats { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
 }
 
@@ -176,43 +198,69 @@ main {
 
 .tank-wrap {
   flex: 1 1 auto;
+  align-self: flex-start;   /* keep the canvas aspect ratio; only the info column stretches */
   width: auto;
   min-width: 0;
+  /* Lock the wrapper to the canvas aspect ratio so the canvas fills it
+     completely — no letterbox bars, no border around the visual. */
   aspect-ratio: 800 / 480;
-  background: #000;
-  border: 1px solid #ffffff14;
+  /* Cap the width so the derived height can't exceed the viewport → no page
+     scroll, while keeping the canvas full-size and undistorted. */
+  max-width: calc((100vh - 178px) * 800 / 480);
+  position: relative;       /* anchor for the floating legend overlay */
   border-radius: 12px;
   overflow: hidden;
   box-shadow: 0 8px 30px #0009;
 }
 #tank { width: 100%; height: 100%; display: block; image-rendering: auto; }
 
+/* Fish legend floats over the bottom of the tank instead of taking page space. */
+.legend-overlay {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 44%;
+  padding: 6px 10px 10px;
+  background: linear-gradient(to top,
+              rgba(5, 11, 19, 0.93),
+              rgba(5, 11, 19, 0.78) 65%,
+              rgba(5, 11, 19, 0));
+  backdrop-filter: blur(2px);
+}
+
 .legend-head {
   display: flex;
   align-items: baseline;
   gap: 10px;
-  margin: 18px 0 8px;
+  margin: 0;
 }
-.legend-head h3 { margin: 0; font-size: 15px; }
+.legend-head h3 { margin: 0; font-size: 15px; color: #eaf4ff; }
 .legend-head .hint { font-size: 12px; }
 
 .legend {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: 8px;
+  overflow-y: auto;
+  min-height: 0;
+  padding-right: 2px;
 }
 .legend-row {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 7px 10px;
-  background: var(--panel);
+  padding: 5px 9px;
+  background: rgba(22, 34, 50, 0.82);
   border-radius: 8px;
   border-left: 4px solid transparent;
   cursor: pointer;
   user-select: none;
 }
-.legend-row:hover { background: var(--panel-2); }
+.legend-row:hover { background: rgba(36, 54, 78, 0.9); }
 .legend-row.active {
   background: #24486a;
   box-shadow: 0 0 0 1px var(--accent) inset;
@@ -462,8 +510,249 @@ main {
   transition: width 0.6s ease, background 0.6s ease;
 }
 
-/* Responsive: stack the sidebar above the view on narrow screens. */
+/* ─── Career game panel: HUD + mode toggle + shop ─────────────────────────── */
+.game-panel {
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.hud { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.hud-mode {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-weight: 700;
+  color: #00131f;
+  background: var(--accent);
+  border-radius: 999px;
+  padding: 3px 10px;
+}
+.hud-mode.creative { background: #b07cff; }
+.hud-item {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  background: var(--panel-2);
+  border-radius: 6px;
+  padding: 3px 8px;
+}
+.mode-row { display: flex; align-items: center; gap: 10px; }
+.mode-row .ctrl-label {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted);
+}
+.shop { border-top: 1px solid #ffffff10; padding-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.shop-head { font-size: 12px; font-weight: 600; }
+.shop-head .hint { font-weight: 400; margin-left: 6px; }
+.shop-fish { display: flex; flex-direction: column; gap: 5px; }
+.shop-buy {
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--panel-2);
+  border: 1px solid #ffffff18;
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 10px;
+  cursor: pointer;
+  text-align: left;
+}
+.shop-buy:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.shop-buy:disabled { opacity: 0.4; cursor: not-allowed; }
+.shop-buy .price { color: var(--muted); flex-shrink: 0; margin-left: 8px; }
+
+.mode-confirm strong { color: var(--accent); }
+
+/* Default cursor; JS swaps to a pointer when hovering an interactive entity. */
+#tank { cursor: default; }
+
+/* ─── Canvas hover tooltip — dungeon-crawler item card ──────────────────────── */
+.entity-tooltip {
+  position: fixed;
+  z-index: 50;
+  pointer-events: none;
+  min-width: 150px;
+  max-width: 230px;
+  padding: 9px 11px;
+  background: rgba(10, 18, 28, 0.96);
+  border: 1px solid #ffffff22;
+  border-radius: 9px;
+  box-shadow: 0 10px 30px #000a, 0 0 0 1px #0006;
+  backdrop-filter: blur(2px);
+  font-size: 13px;
+  line-height: 1.35;
+}
+.entity-tooltip .tt-name {
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.2px;
+  text-shadow: 0 1px 2px #000a;
+}
+.entity-tooltip .tt-shiny {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  color: #5ffbf1;
+  text-shadow: 0 0 6px #5ffbf1aa;
+}
+.entity-tooltip .tt-sub {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  margin-top: 1px;
+  opacity: 0.9;
+}
+.entity-tooltip .tt-bar {
+  height: 5px;
+  margin: 7px 0 6px;
+  background: #ffffff14;
+  border-radius: 999px;
+  overflow: hidden;
+}
+.entity-tooltip .tt-bar-fill { height: 100%; border-radius: 999px; }
+.entity-tooltip .tt-stats { display: flex; flex-direction: column; gap: 2px; }
+.entity-tooltip .tt-stat { display: flex; justify-content: space-between; gap: 10px; }
+.entity-tooltip .tt-stat-l { color: var(--muted); }
+.entity-tooltip .tt-stat-v { font-variant-numeric: tabular-nums; font-weight: 600; }
+.entity-tooltip .tt-action {
+  margin-top: 7px;
+  padding-top: 6px;
+  border-top: 1px solid #ffffff14;
+  font-size: 11px;
+  color: var(--accent);
+  font-weight: 600;
+}
+.entity-tooltip .tt-action.grab { color: #ffd23f; }
+
+/* ─── Detailed entity profile (modal card) ─────────────────────────────────── */
+.entity-profile {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #04080cad;
+  backdrop-filter: blur(3px);
+}
+.profile-card {
+  position: relative;
+  width: min(380px, calc(100vw - 32px));
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
+  border: 1px solid #ffffff1f;
+  border-radius: 14px;
+  box-shadow: 0 24px 70px #000c;
+  padding: 20px;
+}
+.profile-close {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 7px;
+  background: #ffffff10;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+.profile-close:hover { background: #ffffff1f; color: var(--text); }
+.pf-head { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }
+.pf-chip {
+  width: 52px;
+  height: 52px;
+  flex-shrink: 0;
+  border-radius: 12px;
+  background: var(--chip, #33d17a);
+  box-shadow: 0 0 0 1px #0006, 0 4px 14px #0007, 0 0 18px -2px var(--chip, #33d17a);
+}
+.pf-chip.shiny {
+  background:
+    linear-gradient(125deg, #fff6 0%, #fff0 40%) ,
+    var(--chip, #33d17a);
+  animation: shiny-sheen 2.4s linear infinite;
+}
+@keyframes shiny-sheen {
+  0%   { filter: hue-rotate(0deg) brightness(1.05); box-shadow: 0 0 0 1px #0006, 0 4px 14px #0007, 0 0 20px -2px #5ffbf1; }
+  50%  { filter: hue-rotate(160deg) brightness(1.25); box-shadow: 0 0 0 1px #0006, 0 4px 14px #0007, 0 0 26px 0 #5ffbf1; }
+  100% { filter: hue-rotate(360deg) brightness(1.05); box-shadow: 0 0 0 1px #0006, 0 4px 14px #0007, 0 0 20px -2px #5ffbf1; }
+}
+.pf-head-text { flex: 1; min-width: 0; }
+.pf-name {
+  width: 100%;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 19px;
+  font-weight: 700;
+  padding: 3px 6px;
+}
+.pf-name::placeholder { color: var(--muted); font-style: italic; font-weight: 600; }
+.pf-name:hover { border-color: #ffffff22; }
+.pf-name:focus { outline: none; border-color: var(--accent); background: #0b1622; }
+.pf-name-static { font-size: 19px; font-weight: 700; padding: 3px 6px; }
+.pf-rarity {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-weight: 700;
+  padding: 0 6px;
+  margin-top: 2px;
+}
+.pf-bar {
+  height: 8px;
+  margin-bottom: 14px;
+  background: #ffffff12;
+  border-radius: 999px;
+  overflow: hidden;
+}
+.pf-bar-fill { height: 100%; border-radius: 999px; transition: width 0.4s ease; }
+.pf-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.pf-stat {
+  background: #ffffff0a;
+  border: 1px solid #ffffff0f;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.pf-stat-l { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+.pf-stat-v { font-size: 16px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.pf-note {
+  margin-top: 14px;
+  padding: 9px 11px;
+  background: #5ffbf112;
+  border: 1px solid #5ffbf133;
+  border-radius: 8px;
+  font-size: 12px;
+  color: #b9f6f1;
+}
+.pf-desc {
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+  opacity: 0.92;
+}
+
+/* Legend swatch gets a shiny shimmer to match the canvas. */
+.legend-row.shiny .legend-swatch {
+  box-shadow: 0 0 6px 1px #5ffbf1aa;
+  animation: shiny-sheen 2.4s linear infinite;
+}
+
+/* Responsive: stack the sidebar above the view on narrow screens. Fitting
+   everything in a phone viewport isn't practical, so allow normal scrolling and
+   drop the legend back into normal flow below the tank. */
 @media (max-width: 720px) {
+  body { overflow: auto; }
   main { flex-direction: column; height: auto; }
   #sidebar {
     width: 100%;
@@ -471,5 +760,17 @@ main {
     border-right: none;
     border-bottom: 1px solid #0006;
   }
-  #view { padding: 14px; }
+  #view { padding: 14px; overflow: visible; display: block; }
+  #view-content { min-height: 0; display: block; }
+  .tank-row { flex-direction: column; min-height: 0; }
+  .tank-wrap { max-width: none; align-self: stretch; }
+  .legend-overlay {
+    position: static;
+    max-height: none;
+    background: var(--panel);
+    border-radius: 10px;
+    margin-top: 12px;
+    padding: 10px;
+    backdrop-filter: none;
+  }
 }

@@ -133,6 +133,9 @@ struct Fish {
     int8_t  targetFlake;
     bool    chasing;
     float   fullTimer;
+    float   age;        // career: frames alive → growth scale (no death)
+    int     xp;         // career: feeding XP
+    float   fishLuck;   // career: 0..1, raised by feeding/XP
 };
 
 #define MAX_PAIR    8
@@ -148,6 +151,49 @@ static int numAngel   = 3;
 
 Fish fish[MAX_FISH];
 
+// ─── Career game state ──────────────────────────────────────────────────────────
+// Server-mirrored (reported in telemetry, restored on bootstrap). The device owns
+// the simulation; Creative is the classic sandbox, Career is the earn-it economy.
+enum GameMode : uint8_t { MODE_CREATIVE, MODE_CAREER };
+GameMode gameMode = MODE_CAREER;        // a fresh tank starts in career
+int gameCoins = 0, gameShells = 0, gameFood = 0;
+
+// Economy tuning (sim-frame units; FAST timescale accelerates it).
+// Currency is valuable → coins/wanderers are rare (full-day idle pace). Cadences
+// are in 20fps sim-frames: 3000 ≈ 2.5 min, 7000 ≈ 6 min.
+#define GROW_FRAMES   3600              // juvenile→mature growth span (~3 min @20fps) — slow growth
+#define COIN_BASE_CD  3000              // frames between a fish's coin rolls
+#define SHELL_BASE_CD 2600
+#define WANDER_BASE_CD 7000             // wandering fish are very rare
+#define COIN_GRAV     0.1f              // coin sink acceleration (px/frame²) — very gentle, water-like
+#define COIN_MAX_VY   1.4f              // terminal sink speed so coins drift slowly down, not plummet
+#define COIN_REST     240               // frames a landed coin sits before vanishing (~12s)
+#define SHELL_TTL     220               // shells linger on the sand a bit longer
+#define SAND_Y        (SCREEN_H - 20)   // resting line on the sea floor
+static const int FISH_PRICE[4] = { 10, 30, 45, 60 };
+#define FOOD_PRICE    5
+#define SNAIL_PRICE   50                // coins per coin-collector snail
+#define MAX_SNAILS    6
+#define SNAIL_REACH   26                // px a snail can grab a coin from
+static const int SHELL_VALUE[3] = { 2, 5, 12 };
+
+#define MAX_WANDER 4
+struct Wanderer { float x, y, vx, bob; uint8_t type; uint32_t color; bool facingRight; bool active; uint32_t id; };
+Wanderer wanderers[MAX_WANDER] = {};
+
+#define MAX_LOOT 12
+struct Loot { float x, y, vy; uint8_t kind; uint8_t tier; bool active, landed; uint32_t id; int ttl; }; // kind 0 coin, 1 shell
+Loot loot[MAX_LOOT] = {};
+
+// Purchased coin-collector snails — patrol the floor and grab coins nearing it.
+struct CoinSnail { float x, spd; bool facingRight, active; };
+CoinSnail coinSnails[MAX_SNAILS] = {};
+int numSnails = 0;
+
+static uint32_t nextItemId = 1;
+static float coinCD[MAX_FISH] = {};     // per-fish coin-roll countdown
+static float shellCD = SHELL_BASE_CD, wanderCD = WANDER_BASE_CD;
+
 // ─── Menu ─────────────────────────────────────────────────────────────────────
 #define HBTN_X   748
 #define HBTN_Y     5
@@ -162,6 +208,11 @@ bool     lastBtnState  = HIGH;
 uint32_t lastBtnMs     = 0;
 bool     lastTouched   = false;
 bool     menuOpen      = false;
+
+// Switching to Career wipes the tank (careerStartReset), so the menu's CAREER
+// button arms first and only commits on a confirming second tap within the window.
+#define  CAREER_ARM_MS 3000
+uint32_t careerArmMs   = 0;
 
 int8_t   weatherOverrideIdx = -1;
 
@@ -192,6 +243,60 @@ static Star skyStars[NUM_STARS];
 static Display display;
 static Canvas  canvas(&display);
 
+// ── Tap / collect feedback pulses ──────────────────────────────────────────────
+// Transient expanding rings drawn over the tank: a "glass tap" ripple wherever
+// the screen is touched, plus a celebratory burst when a collectible is obtained.
+#define MAX_PULSES 6
+struct Pulse { float x, y; int age, life; uint32_t col; uint8_t kind; bool active; }; // kind 0 tap, 1 collect
+static Pulse pulses[MAX_PULSES] = {};
+
+void spawnPulse(float x, float y, uint8_t kind, uint32_t col) {
+    int slot = -1, oldest = 0, oldestAge = -1;
+    for (int i = 0; i < MAX_PULSES; i++) {
+        if (!pulses[i].active) { slot = i; break; }
+        if (pulses[i].age > oldestAge) { oldestAge = pulses[i].age; oldest = i; }
+    }
+    if (slot < 0) slot = oldest;
+    pulses[slot].x = x; pulses[slot].y = y; pulses[slot].age = 0;
+    pulses[slot].life = (kind == 0) ? 12 : 16;   // ~0.6s / ~0.8s at 20fps
+    pulses[slot].col = col; pulses[slot].kind = kind; pulses[slot].active = true;
+}
+
+void updatePulses() {
+    for (int i = 0; i < MAX_PULSES; i++)
+        if (pulses[i].active && ++pulses[i].age >= pulses[i].life) pulses[i].active = false;
+}
+
+// Fade a 24-bit colour toward black as t goes 0→1 (no alpha on the panel).
+static uint32_t pulseFade(uint32_t c, float t) {
+    float k = 1.0f - t;
+    uint32_t r = (uint32_t)(((c >> 16) & 0xFF) * k);
+    uint32_t g = (uint32_t)(((c >> 8) & 0xFF) * k);
+    uint32_t b = (uint32_t)(( c        & 0xFF) * k);
+    return (r << 16) | (g << 8) | b;
+}
+
+void drawPulses() {
+    for (int i = 0; i < MAX_PULSES; i++) {
+        if (!pulses[i].active) continue;
+        Pulse& p = pulses[i];
+        float t = (float)p.age / (float)p.life;       // 0..1 progress
+        int cx = (int)p.x, cy = (int)p.y;
+        if (p.kind == 0) {                            // glass tap: a single soft ring
+            int r = (int)(3 + t * 16);
+            canvas.drawCircle(cx, cy, r, pulseFade(0x6FAAD0UL, t));
+        } else {                                       // collect: ring + four sparks
+            int r = (int)(6 + t * 22), s = (int)(3 + t * 16);
+            uint32_t col = pulseFade(p.col, t);
+            canvas.drawCircle(cx, cy, r, col);
+            canvas.drawLine(cx, cy - s, cx, cy - s - 4, col);
+            canvas.drawLine(cx, cy + s, cx, cy + s + 4, col);
+            canvas.drawLine(cx - s, cy, cx - s - 4, cy, col);
+            canvas.drawLine(cx + s, cy, cx + s + 4, cy, col);
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Helpers
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -216,8 +321,10 @@ int projY(float y, float z) {
 }
 
 int fishTS(const Fish& f) {
-    if (f.type == FISH_PAIR) return (f.z < 0.5f) ? 3 : 2;
-    return (f.z < 0.6f) ? 2 : 1;
+    int base = (f.type == FISH_PAIR) ? ((f.z < 0.5f) ? 3 : 2) : ((f.z < 0.6f) ? 2 : 1);
+    // Career: juveniles render one size smaller until half-grown (no death).
+    if (gameMode == MODE_CAREER && f.age < GROW_FRAMES * 0.5f && base > 1) base--;
+    return base;
 }
 
 // Uses canvas.charW so fish text is correctly centred regardless of font metrics.
@@ -225,6 +332,17 @@ int fishHW(const Fish& f) {
     int ts    = fishTS(f);
     int chars = (f.type == FISH_PAIR) ? 5 : 3;
     return (chars * canvas.charW * ts) / 2;
+}
+
+// Career helpers (read by telemetry.h's JSON builder).
+float fishScale(const Fish& f) {
+    float g = f.age / (float)GROW_FRAMES; if (g > 1) g = 1; if (g < 0) g = 0;
+    return 0.22f + 0.78f * g;   // hatch tiny (0.22) and grow to full size
+}
+float tankLuck() {
+    int n = 0; float s = 0;
+    for (int i = 0; i < MAX_FISH; i++) if (isFishActive(i)) { s += fish[i].fishLuck; n++; }
+    return n ? s / n : 0.0f;
 }
 
 uint32_t fishColor(int idx) {
@@ -264,6 +382,9 @@ void initFishEntry(int idx, float x, float y, float z, float vx,
     f.targetFlake  = -1;
     f.chasing      = (random(0, 2) == 0);
     f.fullTimer    = 0;
+    f.age          = (gameMode == MODE_CAREER) ? 0.0f : (float)GROW_FRAMES; // creative = full size
+    f.xp           = 0;
+    f.fishLuck     = 0.0f;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -611,23 +732,28 @@ void setup() {
         fgHornworts[i].segs  = (uint8_t)(6 + random(0, 6));
     }
 
-    initFishEntry(0, 150, 210, 0.20f,  3.0f, FISH_PAIR, 1);
-    initFishEntry(1, 330, 240, 0.35f, -2.5f, FISH_PAIR, 0);
+    // Seed the default tank only when the server had no saved profile to restore.
+    // A restored profile already rebuilt the fish (with their persisted ages), so
+    // re-seeding here would reset every fish back to age 0.
+    if (!telemetryProfileLoaded) {
+        initFishEntry(0, 150, 210, 0.20f,  3.0f, FISH_PAIR, 1);
+        initFishEntry(1, 330, 240, 0.35f, -2.5f, FISH_PAIR, 0);
 
-    for (int i = 0; i < numSchool; i++)
-        initFishEntry(MAX_PAIR + i,
-            frandr(380, 620), frandr(130, 330), frandr(0.40f, 0.75f),
-            frandr(-2.0f, 2.0f), FISH_SCHOOL, -1);
+        for (int i = 0; i < numSchool; i++)
+            initFishEntry(MAX_PAIR + i,
+                frandr(380, 620), frandr(130, 330), frandr(0.40f, 0.75f),
+                frandr(-2.0f, 2.0f), FISH_SCHOOL, -1);
 
-    for (int i = 0; i < numSchool2; i++)
-        initFishEntry(MAX_PAIR + MAX_SCHOOL + i,
-            frandr(150, 400), frandr(150, 350), frandr(0.40f, 0.75f),
-            frandr(-2.0f, 2.0f), FISH_SCHOOL2, -1);
+        for (int i = 0; i < numSchool2; i++)
+            initFishEntry(MAX_PAIR + MAX_SCHOOL + i,
+                frandr(150, 400), frandr(150, 350), frandr(0.40f, 0.75f),
+                frandr(-2.0f, 2.0f), FISH_SCHOOL2, -1);
 
-    for (int i = 0; i < numAngel; i++)
-        initFishEntry(MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + i,
-            frandr(200, 600), frandr(90, 320), frandr(0.25f, 0.65f),
-            frandr(-3.0f, 3.0f), FISH_ANGEL, -1);
+        for (int i = 0; i < numAngel; i++)
+            initFishEntry(MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + i,
+                frandr(200, 600), frandr(90, 320), frandr(0.25f, 0.65f),
+                frandr(-3.0f, 3.0f), FISH_ANGEL, -1);
+    }
 
     for (int i = 0; i < MAX_FLAKES; i++) flakes[i].active = false;
 
@@ -680,6 +806,157 @@ void dropFood(int touchX = -1, int touchY = -1) {
 // Apply dashboard control directives queued by the telemetry POST worker. Runs on
 // the main/render thread so it can safely mutate fish[], weather, time, and flakes.
 // Defined here (not in telemetry.h) because dropFood() is declared further down.
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Career: items, catching, shop, mode switching
+// ═══════════════════════════════════════════════════════════════════════════════
+void spawnLoot(uint8_t kind, float x, float y, uint8_t tier) {
+    for (int i = 0; i < MAX_LOOT; i++) if (!loot[i].active) {
+        Loot& it = loot[i];
+        it.active = true; it.kind = kind; it.tier = tier; it.x = x; it.y = y;
+        it.vy = 0; it.id = nextItemId++;
+        if (kind == 0) { it.landed = false; it.ttl = COIN_REST; }  // coin: sinks, then rests ~1s
+        else           { it.landed = true;  it.ttl = SHELL_TTL; }  // shell: rests on the sand
+        return;
+    }
+}
+void addSnail() {
+    if (numSnails >= MAX_SNAILS) return;
+    CoinSnail& s = coinSnails[numSnails];
+    s.active = true; s.x = frandr(80, SCREEN_W - 80); s.spd = frandr(0.5f, 1.0f);
+    s.facingRight = (random(0, 2) == 0);
+    numSnails++;
+}
+void spawnWanderer(float luck) {
+    for (int i = 0; i < MAX_WANDER; i++) if (!wanderers[i].active) {
+        float r = frandr(0, 1);
+        uint8_t type = (r < 0.1f + 0.3f * luck) ? 3 : (r < 0.4f) ? 0 : (r < 0.7f) ? 1 : 2;
+        bool fromLeft = (random(0, 2) == 0);
+        Wanderer& w = wanderers[i];
+        w.active = true; w.type = type; w.id = nextItemId++;
+        w.x = fromLeft ? -20.0f : (float)(SCREEN_W + 20);
+        w.y = frandr(TANK_TOP + 40, SCREEN_H - 120);
+        w.vx = fromLeft ? frandr(1.2f, 2.2f) : -frandr(1.2f, 2.2f);
+        w.facingRight = fromLeft; w.bob = frandr(0, 6.28f);
+        w.color = (type == 0) ? PAIR_COLS[random(0, 8)]
+                : (type == 1) ? SCHOOL_COLS[random(0, 16)]
+                : (type == 2) ? SCHOOL2_COLS[random(0, 20)] : ANGEL_COLS[random(0, 12)];
+        return;
+    }
+}
+bool catchWandererById(uint32_t id) {
+    static const FishType T[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
+    for (int i = 0; i < MAX_WANDER; i++)
+        if (wanderers[i].active && wanderers[i].id == id) {
+            addFish(T[wanderers[i].type]);
+            spawnPulse(wanderers[i].x, wanderers[i].y, 1, 0x88E0FFUL);
+            wanderers[i].active = false; return true;
+        }
+    return false;
+}
+bool collectLootById(uint32_t id) {
+    for (int i = 0; i < MAX_LOOT; i++)
+        if (loot[i].active && loot[i].id == id) {
+            uint32_t pc = loot[i].kind == 0 ? 0xFFD23FUL
+                : (loot[i].tier == 2 ? 0xFFD23FUL : loot[i].tier == 1 ? 0xFF9EC4UL : 0xE7C9A0UL);
+            if (loot[i].kind == 0) gameCoins++; else gameShells += SHELL_VALUE[loot[i].tier];
+            spawnPulse(loot[i].x, loot[i].y, 1, pc);
+            loot[i].active = false; return true;
+        }
+    return false;
+}
+// Tap (device touch) catch: wanderers first (bigger), then loot. Instant.
+bool tapCatch(int tx, int ty) {
+    for (int i = 0; i < MAX_WANDER; i++) if (wanderers[i].active) {
+        int dx = tx - (int)wanderers[i].x, dy = ty - (int)wanderers[i].y;
+        if (dx * dx + dy * dy < 30 * 30) return catchWandererById(wanderers[i].id);
+    }
+    for (int i = 0; i < MAX_LOOT; i++) if (loot[i].active) {
+        int dx = tx - (int)loot[i].x, dy = ty - (int)loot[i].y;
+        if (dx * dx + dy * dy < 22 * 22) return collectLootById(loot[i].id);
+    }
+    return false;
+}
+void careerStartReset() {                 // fresh career: 2 fish, empty wallet
+    numPair = numSchool = numSchool2 = numAngel = 0;
+    addFish(FISH_PAIR); addFish(FISH_PAIR);
+    gameCoins = gameShells = gameFood = 0;
+    for (int i = 0; i < MAX_WANDER; i++) wanderers[i].active = false;
+    for (int i = 0; i < MAX_LOOT; i++)   loot[i].active = false;
+    for (int i = 0; i < MAX_FISH; i++)   coinCD[i] = 0;
+    numSnails = 0;
+    for (int i = 0; i < MAX_SNAILS; i++) coinSnails[i].active = false;
+}
+void setGameMode(GameMode m) {
+    if (m == MODE_CAREER) { gameMode = MODE_CAREER; careerStartReset(); } // entering career = reset
+    else                  { gameMode = MODE_CREATIVE; }                   // convert in place
+}
+// Per-publish career tick (called from loop on the render thread).
+void updateCareer() {
+    if (gameMode != MODE_CAREER) return;
+    float luck = tankLuck();
+    for (int i = 0; i < MAX_FISH; i++) {
+        if (!isFishActive(i)) continue;
+        fish[i].age += 1.0f;
+        if (coinCD[i] <= 0) coinCD[i] = COIN_BASE_CD * frandr(0.7f, 1.3f);
+        coinCD[i] -= 1.0f;
+        if (coinCD[i] <= 0) {
+            spawnLoot(0, fish[i].x, fish[i].y, 0);
+            coinCD[i] = COIN_BASE_CD * (1.0f - 0.5f * luck) * frandr(0.7f, 1.3f);
+        }
+    }
+    if ((shellCD -= 1.0f) <= 0) {
+        float r = frandr(0, 1);
+        uint8_t tier = (r < 0.05f + 0.25f * luck) ? 2 : (r < 0.15f + 0.45f * luck) ? 1 : 0;
+        spawnLoot(1, frandr(40, SCREEN_W - 40), (float)(SCREEN_H - 26), tier);
+        shellCD = SHELL_BASE_CD * frandr(0.7f, 1.3f);
+    }
+    int activeW = 0;
+    for (int i = 0; i < MAX_WANDER; i++) if (wanderers[i].active) activeW++;
+    if ((wanderCD -= 1.0f) <= 0 && activeW < MAX_WANDER) {
+        spawnWanderer(luck);
+        wanderCD = WANDER_BASE_CD * frandr(0.7f, 1.3f);
+    }
+    for (int i = 0; i < MAX_WANDER; i++) {
+        if (!wanderers[i].active) continue;
+        wanderers[i].x += wanderers[i].vx;
+        wanderers[i].y += sinf(tick * 0.05f + wanderers[i].bob) * 0.6f;
+        if (wanderers[i].x < -40 || wanderers[i].x > SCREEN_W + 40) wanderers[i].active = false;
+    }
+
+    // Coins sink to the sand, rest ~1s, then vanish; shells just rest.
+    for (int i = 0; i < MAX_LOOT; i++) {
+        if (!loot[i].active) continue;
+        Loot& it = loot[i];
+        if (it.kind == 0 && !it.landed) {
+            it.vy += COIN_GRAV;
+            if (it.vy > COIN_MAX_VY) it.vy = COIN_MAX_VY;
+            it.y += it.vy;
+            if (it.y >= SAND_Y) { it.y = SAND_Y; it.landed = true; it.ttl = COIN_REST; }
+        } else if (--it.ttl <= 0) { it.active = false; }
+    }
+
+    // Coin-collector snails: steer toward the nearest coin nearing the floor + grab it.
+    for (int s = 0; s < numSnails; s++) {
+        if (!coinSnails[s].active) continue;
+        CoinSnail& sn = coinSnails[s];
+        int tgt = -1; float td = 1e9f;
+        for (int i = 0; i < MAX_LOOT; i++) {
+            if (!loot[i].active || loot[i].kind != 0 || loot[i].y < SAND_Y - 90) continue;
+            float d = fabsf(loot[i].x - sn.x);
+            if (d < td) { td = d; tgt = i; }
+        }
+        if (tgt >= 0) { sn.facingRight = loot[tgt].x > sn.x; sn.x += (sn.facingRight ? 1 : -1) * sn.spd * 1.6f; }
+        else {
+            sn.x += (sn.facingRight ? 1 : -1) * sn.spd;
+            if (sn.x > SCREEN_W - 55) { sn.x = SCREEN_W - 55; sn.facingRight = false; }
+            if (sn.x < 55)            { sn.x = 55;            sn.facingRight = true; }
+        }
+        for (int i = 0; i < MAX_LOOT; i++)
+            if (loot[i].active && loot[i].kind == 0 && loot[i].y > SAND_Y - 40 &&
+                fabsf(loot[i].x - sn.x) < SNAIL_REACH) { gameCoins++; loot[i].active = false; }
+    }
+}
+
 void telemetryApplyControls() {
     int w = _ctrlWeatherReq.exchange(-2);
     if (w != -2) {
@@ -695,7 +972,35 @@ void telemetryApplyControls() {
         for (int n = _ctrlFishAddReq[t].exchange(0); n > 0; n--) addFish(T[t]);
         for (int n = _ctrlFishDelReq[t].exchange(0); n > 0; n--) removeFish(T[t]);
     }
-    for (int n = _ctrlFeedReq.exchange(0); n > 0; n--) dropFood();
+
+    // ── Career directives ──
+    int m = _ctrlModeReq.exchange(-1);
+    if      (m == 0) setGameMode(MODE_CREATIVE);
+    else if (m == 1) setGameMode(MODE_CAREER);
+
+    for (int t = 0; t < 4; t++)
+        for (int n = _ctrlBuyFishReq[t].exchange(0); n > 0; n--)
+            if (gameCoins >= FISH_PRICE[t]) { gameCoins -= FISH_PRICE[t]; addFish(T[t]); }
+    for (int n = _ctrlBuyFoodReq.exchange(0); n > 0; n--)
+        if (gameCoins >= FOOD_PRICE) { gameCoins -= FOOD_PRICE; gameFood++; }
+    for (int n = _ctrlBuySnailReq.exchange(0); n > 0; n--)
+        if (gameCoins >= SNAIL_PRICE && numSnails < MAX_SNAILS) { gameCoins -= SNAIL_PRICE; addSnail(); }
+
+    int cc = _ctrlCatchCount.exchange(0);
+    for (int i = 0; i < cc && i < CTRL_CATCH_MAX; i++) {
+        uint32_t id = _ctrlCatchIds[i].load();
+        if (!catchWandererById(id)) collectLootById(id);
+    }
+
+    // Feeding — career consumes food inventory and rewards the eaters' growth/luck.
+    for (int n = _ctrlFeedReq.exchange(0); n > 0; n--) {
+        if (gameMode == MODE_CAREER) { if (gameFood <= 0) break; gameFood--; }
+        dropFood();
+        for (int k = 0; k < MAX_FISH; k++) if (isFishActive(k) && random(0, 3) == 0) {
+            fish[k].xp += 10; fish[k].age += 40;
+            fish[k].fishLuck = fish[k].fishLuck + 0.05f > 1 ? 1.0f : fish[k].fishLuck + 0.05f;
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -891,10 +1196,9 @@ void updateFish() {
 //  Draw helpers  (identical to ESP32 version)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-void drawSnail() {
-    int bx = (int)snail.x;
+void drawSnailShape(int bx, bool facingRight) {
     int by = terrainY[constrain(bx, 0, SCREEN_W - 1)];
-    int d  = snail.facingRight ? 1 : -1;
+    int d  = facingRight ? 1 : -1;
     const uint32_t BODY = 0xDDB060UL, SHELL = 0x7A2E0AUL, SWIRL = 0xB05020UL;
     canvas.fillCircle(bx - d * 4, by - 8, 8, SHELL);
     canvas.drawCircle(bx - d * 3, by - 8, 5, SWIRL);
@@ -908,6 +1212,11 @@ void drawSnail() {
     canvas.fillCircle(bx + d * 14, by - 15, 2, BODY);
     canvas.fillCircle(bx + d * 6,  by - 15, 1, 0x111111UL);
     canvas.fillCircle(bx + d * 14, by - 15, 1, 0x111111UL);
+}
+void drawSnail() { drawSnailShape((int)snail.x, snail.facingRight); }
+void drawCoinSnails() {                         // purchased coin collectors
+    for (int i = 0; i < numSnails; i++)
+        if (coinSnails[i].active) drawSnailShape((int)coinSnails[i].x, coinSnails[i].facingRight);
 }
 
 void drawStarfish() {
@@ -1204,6 +1513,55 @@ void drawFish() {
     }
 }
 
+// Career collectibles: gold coins (mid-water) + sea shells (on sand), tap to grab.
+void drawLootItems() {
+    for (int i = 0; i < MAX_LOOT; i++) {
+        if (!loot[i].active) continue;
+        int x = (int)loot[i].x, y = (int)loot[i].y;
+        if (loot[i].kind == 0) {                       // coin
+            canvas.fillCircle(x, y, 6, 0xFFD23FUL);
+            canvas.drawCircle(x, y, 6, 0xB8860BUL);
+            canvas.fillRect(x - 1, y - 3, 2, 6, 0x8A6508UL);
+        } else {                                        // shell — tan / pink / gold by tier
+            uint32_t c = loot[i].tier == 2 ? 0xFFD23FUL : loot[i].tier == 1 ? 0xFF9EC4UL : 0xE7C9A0UL;
+            canvas.fillCircle(x, y, 8, c);
+            for (int k = -2; k <= 2; k++) canvas.drawLine(x, y + 2, x + k * 3, y - 7, 0x553311UL);
+        }
+    }
+}
+
+// Compact career HUD (mode + wallet) drawn at the tank's bottom-left.
+void drawGameHud() {
+    char buf[72];
+    canvas.setTextSize(1);
+    if (gameMode == MODE_CAREER) {
+        canvas.setTextColor(0xFFD23FUL);
+        snprintf(buf, sizeof(buf), "CAREER  coins %d  shells %d  food %d", gameCoins, gameShells, gameFood);
+    } else {
+        canvas.setTextColor(0xC8A8FFUL);
+        snprintf(buf, sizeof(buf), "CREATIVE");
+    }
+    canvas.setCursor(10, SCREEN_H - 14);
+    canvas.print(buf);
+}
+
+// Wandering fish (career): an ASCII glyph with a pulsing catch halo.
+void drawWanderers() {
+    for (int i = 0; i < MAX_WANDER; i++) {
+        if (!wanderers[i].active) continue;
+        Wanderer& w = wanderers[i];
+        int x = (int)w.x, y = (int)w.y;
+        canvas.drawCircle(x, y, 16, 0x66CCFFUL);
+        canvas.setTextSize(2);
+        canvas.setTextColor(w.color);
+        int chars = (w.type == 0) ? 5 : 3;
+        int hw = (chars * canvas.charW * 2) / 2;
+        canvas.setCursor(x - hw, y - 8);
+        if (w.type == 0) canvas.print(w.facingRight ? "><(o>" : "<o(><");
+        else             canvas.print(w.facingRight ? "><>" : "<><");
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Menu UI
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1223,10 +1581,31 @@ void drawMenu() {
     canvas.fillRect(MENU_X,   MENU_Y,   MENU_W,   MENU_H,   0x0A1E3CUL);
     canvas.drawRect(MENU_X,   MENU_Y,   MENU_W,   MENU_H,   0x4488CCUL);
     canvas.drawRect(MENU_X+1, MENU_Y+1, MENU_W-2, MENU_H-2, 0x1A3355UL);
-    canvas.setTextSize(2); canvas.setTextColor(0x88DDFFUL);
-    canvas.setCursor(MENU_X + 28, MENU_Y + 10);
-    canvas.print("AQUARIUM MENU");
-    canvas.drawFastHLine(MENU_X + 8, MENU_Y + 32, MENU_W - 16, 0x2244AAUL);
+    // ── Game-mode segmented control (CREATIVE | CAREER) + career wallet ─────────
+    bool career = (gameMode == MODE_CAREER);
+    bool armed  = (!career) && (millis() - careerArmMs < CAREER_ARM_MS);
+    {
+        canvas.fillRect(MENU_X + 8, MENU_Y + 6, 104, 24, !career ? 0x6A3AC0UL : 0x16203AUL);
+        canvas.drawRect(MENU_X + 8, MENU_Y + 6, 104, 24, !career ? 0xC8A8FFUL : 0x33508AUL);
+        canvas.setTextSize(1); canvas.setTextColor(!career ? 0xFFFFFFUL : 0x8899AAUL);
+        canvas.setCursor(MENU_X + 8 + (104 - 8 * 6) / 2, MENU_Y + 13); canvas.print("CREATIVE");
+
+        uint32_t kF = career ? 0xB8860BUL : (armed ? 0x6A1818UL : 0x16203AUL);
+        uint32_t kB = career ? 0xFFD23FUL : (armed ? 0xFF6655UL : 0x33508AUL);
+        canvas.fillRect(MENU_X + 114, MENU_Y + 6, 104, 24, kF);
+        canvas.drawRect(MENU_X + 114, MENU_Y + 6, 104, 24, kB);
+        const char* kLbl = armed ? "RESET?" : "CAREER";
+        canvas.setTextColor(career ? 0x111111UL : (armed ? 0xFFDDDDUL : 0x8899AAUL));
+        canvas.setCursor(MENU_X + 114 + (104 - (int)strlen(kLbl) * 6) / 2, MENU_Y + 13);
+        canvas.print(kLbl);
+
+        if (career) {
+            char wbuf[12]; snprintf(wbuf, sizeof(wbuf), "%dc", gameCoins);
+            canvas.setTextColor(0xFFD23FUL);
+            canvas.setCursor(MENU_X + 226, MENU_Y + 13); canvas.print(wbuf);
+        }
+    }
+    canvas.drawFastHLine(MENU_X + 8, MENU_Y + 34, MENU_W - 16, 0x2244AAUL);
 
     const char* labels[4] = { "LARGE FISH", "SCHOOL FISH", "DEEP FISH", "ANGELFISH" };
     int counts[4]         = { numPair, numSchool, numSchool2, numAngel };
@@ -1235,7 +1614,7 @@ void drawMenu() {
         int ry = MENU_Y + 45 + row * 58;
         canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
         canvas.setCursor(MENU_X + 10, ry + 11); canvas.print(labels[row]);
-        bool canRm = counts[row] > 0;
+        bool canRm = !career && counts[row] > 0;   // remove: creative only
         canvas.fillRect(MENU_X + 148, ry, 30, 30, canRm ? 0x1A3355UL : 0x0C1A2AUL);
         canvas.drawRect(MENU_X + 148, ry, 30, 30, canRm ? 0x4488CCUL : 0x223344UL);
         canvas.setTextSize(2); canvas.setTextColor(canRm ? 0xFFFFFFUL : 0x334455UL);
@@ -1243,11 +1622,17 @@ void drawMenu() {
         char buf[4]; snprintf(buf, sizeof(buf), "%d", counts[row]);
         canvas.setTextSize(2); canvas.setTextColor(0xFFEE88UL);
         canvas.setCursor(MENU_X + 184, ry + 7); canvas.print(buf);
-        bool canAdd = counts[row] < maxes[row];
-        canvas.fillRect(MENU_X + 210, ry, 30, 30, canAdd ? 0x1A3355UL : 0x0C1A2AUL);
-        canvas.drawRect(MENU_X + 210, ry, 30, 30, canAdd ? 0x4488CCUL : 0x223344UL);
+        bool atCap  = counts[row] >= maxes[row];
+        bool canAdd = career ? (!atCap && gameCoins >= FISH_PRICE[row]) : !atCap;
+        canvas.fillRect(MENU_X + 210, ry, 30, 30, canAdd ? (career ? 0x3A2E0AUL : 0x1A3355UL) : 0x0C1A2AUL);
+        canvas.drawRect(MENU_X + 210, ry, 30, 30, canAdd ? (career ? 0xFFD23FUL : 0x4488CCUL) : 0x223344UL);
         canvas.setTextSize(2); canvas.setTextColor(canAdd ? 0xFFFFFFUL : 0x334455UL);
         canvas.setCursor(MENU_X + 217, ry + 7); canvas.print("+");
+        if (career) {                               // price tag beside the buy button
+            char pbuf[6]; snprintf(pbuf, sizeof(pbuf), "%d", FISH_PRICE[row]);
+            canvas.setTextSize(1); canvas.setTextColor(canAdd ? 0xFFD23FUL : 0x556677UL);
+            canvas.setCursor(MENU_X + 244, ry + 11); canvas.print(pbuf);
+        }
     }
     {
         int ry5 = MENU_Y + 45 + 5 * 58;
@@ -1407,13 +1792,40 @@ void loop() {
             ty >= HBTN_Y && ty < (uint16_t)(HBTN_Y + HBTN_H)) {
             menuOpen = !menuOpen;
         } else if (menuOpen) {
+            // ── Game-mode segments (header) ─────────────────────────────────────
+            if (ty >= (uint16_t)(MENU_Y + 6) && ty < (uint16_t)(MENU_Y + 30)) {
+                if (tx >= (uint16_t)(MENU_X + 8) && tx < (uint16_t)(MENU_X + 112)) {
+                    if (gameMode != MODE_CREATIVE) setGameMode(MODE_CREATIVE);  // non-destructive
+                    careerArmMs = 0;
+                } else if (tx >= (uint16_t)(MENU_X + 114) && tx < (uint16_t)(MENU_X + 218)) {
+                    // Career entry wipes the tank → require a confirming second tap.
+                    if (gameMode != MODE_CAREER) {
+                        if (millis() - careerArmMs < CAREER_ARM_MS) { setGameMode(MODE_CAREER); careerArmMs = 0; }
+                        else careerArmMs = millis();
+                    }
+                }
+            }
             const FishType rowType[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
             for (int row = 0; row < 4; row++) {
                 int ry = MENU_Y + 45 + row * 58;
                 if (tx >= (uint16_t)(MENU_X + 148) && tx < (uint16_t)(MENU_X + 178) &&
-                    ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) { removeFish(rowType[row]); break; }
+                    ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
+                    if (gameMode != MODE_CAREER) removeFish(rowType[row]);  // creative only
+                    break;
+                }
                 if (tx >= (uint16_t)(MENU_X + 210) && tx < (uint16_t)(MENU_X + 240) &&
-                    ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) { addFish(rowType[row]); break; }
+                    ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
+                    if (gameMode == MODE_CAREER) {            // buy with coins (guard the cap)
+                        int cnt[4] = { numPair, numSchool, numSchool2, numAngel };
+                        int mx[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
+                        if (cnt[row] < mx[row] && gameCoins >= FISH_PRICE[row]) {
+                            gameCoins -= FISH_PRICE[row]; addFish(rowType[row]);
+                        }
+                    } else {
+                        addFish(rowType[row]);               // creative: free
+                    }
+                    break;
+                }
             }
             {
                 int ry5 = MENU_Y + 45 + 5 * 58;
@@ -1453,7 +1865,12 @@ void loop() {
                 }
             }
         } else if ((int)ty > TANK_TOP) {
-            dropFood((int)tx, (int)ty);
+            spawnPulse((float)tx, (float)ty, 0, 0);   // glass-tap ripple where you touched
+            // Career: tap a wanderer to keep it / loot to collect; else feed (uses food).
+            if (!tapCatch((int)tx, (int)ty)) {
+                if (gameMode == MODE_CAREER) { if (gameFood > 0) { gameFood--; dropFood((int)tx, (int)ty); } }
+                else dropFood((int)tx, (int)ty);
+            }
         }
     }
     lastTouched = touched;
@@ -1478,6 +1895,8 @@ void loop() {
     updateBubbles();
     updateFlakes();
     updateFish();
+    updateCareer();            // age fish + spawn coins/shells/wanderers (career only)
+    updatePulses();            // advance tap/collect feedback rings
 
     drawBackground();
     drawWeatherSky();
@@ -1491,7 +1910,12 @@ void loop() {
     drawBubbles();
     drawFlakes();
     drawFish();
+    drawCoinSnails();          // purchased coin-collector snails
+    drawLootItems();           // coins + shells (career collectibles)
+    drawWanderers();           // wandering fish with catch halo
+    drawPulses();              // tap ripples + collect bursts (over entities, under rim)
     drawTankRim();
+    drawGameHud();             // mode + wallet readout
     drawTelemetryStatus();
     drawMenuButton();
     drawMenu();
