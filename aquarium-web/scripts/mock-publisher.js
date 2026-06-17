@@ -13,7 +13,7 @@ const apiKey = process.env.API_KEY || 'change-me';
 
 const W = 800, H = 480, TOP = 72;
 const PALETTE = [0x00ee66, 0xffdd00, 0xff6600, 0xcc44ff, 0x44ddff, 0xff44aa, 0x00ffff, 0xeeeeee];
-const FISH_MAX = [8, 16, 20, 12];           // pair, school, school2, angel
+const FISH_MAX = [8, 4, 20, 12];            // pair, school, school2, angel
 
 const FRAME_MS = 50;
 const FRAMES_PER_PUBLISH = 1000 / FRAME_MS; // 20 frames per 1Hz publish
@@ -24,18 +24,27 @@ const GROW_FRAMES = 3600;                     // juvenile→mature growth span (
 const COIN_BASE_CD = 3000;                    // frames between a fish's coin rolls (~2.5 min)
 const SHELL_BASE_CD = 2600;                   // frames between shell spawns
 const WANDER_BASE_CD = 7000;                  // wandering fish are very rare (~6 min)
+const SCHOOL_GROW_CD = 7200;                  // frames between school auto-grows (6 min @20fps)
 const COIN_GRAV = 0.1;                         // coin sink acceleration (px/frame²) — very gentle, water-like
 const COIN_MAX_VY = 1.4;                        // terminal sink speed so coins drift slowly down, not plummet
 const COIN_REST = 480;                         // frames a landed coin sits before vanishing (~24s); timer starts on landing
 const SHELL_TTL = 220;                         // shells linger on the sand a bit longer
 const SAND_Y = H - 20;                         // resting line on the sea floor
 const FISH_PRICE    = [10, 30, 45, 60];         // shop fish price (coins) by type
-const FISH_BASE_SELL = [6, 16, 22, 30];         // base sell value by type (≈55% of buy)
+const FISH_BASE_SELL = [6, 3, 22, 30];          // base sell value by type; school cheap to prevent market farming
 const FOOD_PRICE = 5;                          // coins per food unit
 const SNAIL_PRICE = 50;                        // coins per coin-collector snail
 const MAX_SNAILS = 6;
 const SNAIL_REACH = 36;                        // px a snail can grab a coin from
 const SHELL_VALUE = [2, 5, 12];               // shells granted per shell tier
+
+// Feeding schedule: 3 meals/day; a clean day raises luck, neglect/overfeeding lowers it.
+const MEALS_PER_DAY = 3;
+const HUNGER_GRACE = 0.35;                    // fraction into an unfed slot before fish look hungry
+const FEED_PERFECT_BONUS = 0.08;
+const FEED_MISS_PENALTY = 0.05;
+const FEED_OVERFEED_PENALTY = 0.03;
+const FEED_DELTA_MIN = -0.20, FEED_DELTA_MAX = 0.08;
 
 function bound(v, lo, hi) {
   if (v < lo) return (lo - v) * 0.30;
@@ -76,6 +85,12 @@ let timeMode = 'FAST';
 let coinTimers = new Map();        // fishId → frames until next coin roll
 let shellCD = SHELL_BASE_CD;
 let wanderCD = WANDER_BASE_CD;
+let schoolGrowCD = 0;
+
+// Feeding-schedule state (career). mealFed[s] = slot s satisfied today.
+let mealFed = [false, false, false];
+let mealsToday = 0, overfeedToday = 0, lastMealSlot = 0;
+let feedSchedInit = false, tankHungry = false;
 
 function addSnail() {
   if (snails.length >= MAX_SNAILS) return false;
@@ -88,8 +103,41 @@ function resetCareer() {
   wanderers = []; loot = []; snails = [];
   coins = 0; shells = 0; food = 0;
   coinTimers.clear();
+  schoolGrowCD = 0;
+  mealFed = [false, false, false];
+  mealsToday = 0; overfeedToday = 0; feedSchedInit = false; tankHungry = false;
 }
 resetCareer();
+
+// ── Feeding schedule: 3 meals/day off the (1-minute) sim day ──
+function dayProgress() { return ((Date.now() - startMs) / 60000) % 1; }
+function currentMealSlot() {
+  return clamp(Math.floor(dayProgress() * MEALS_PER_DAY), 0, MEALS_PER_DAY - 1);
+}
+function evaluateFeedingDay() {
+  const missed = mealFed.filter((m) => !m).length;
+  let delta = (missed === 0 && overfeedToday === 0)
+    ? FEED_PERFECT_BONUS
+    : -(FEED_MISS_PENALTY * missed) - (FEED_OVERFEED_PENALTY * overfeedToday);
+  delta = clamp(delta, FEED_DELTA_MIN, FEED_DELTA_MAX);
+  for (const f of fish) f.fishLuck = clamp((f.fishLuck || 0) + delta, 0, 1);
+}
+function resetFeedingDay() { mealFed = [false, false, false]; mealsToday = 0; overfeedToday = 0; }
+function registerFeeding() {                 // one feeding event satisfies a slot, else overfeeds
+  const s = currentMealSlot();
+  if (!mealFed[s]) { mealFed[s] = true; mealsToday++; } else { overfeedToday++; }
+  tankHungry = false;
+}
+function updateFeedingSchedule() {
+  const s = currentMealSlot();
+  if (!feedSchedInit) { lastMealSlot = s; feedSchedInit = true; }
+  if (s !== lastMealSlot) {
+    if (s < lastMealSlot) { evaluateFeedingDay(); resetFeedingDay(); } // wrapped → new day
+    lastMealSlot = s;
+  }
+  const frac = dayProgress() * MEALS_PER_DAY - s;
+  tankHungry = !mealFed[s] && frac > HUNGER_GRACE;
+}
 
 const plants = {
   bg: [60, 150, 240, 620, 720].map((x) => ({ x, segs: 6 + (x % 4), type: x % 2 })),
@@ -195,6 +243,7 @@ function stepPhysics() {
 // ── Career item simulation (per publish, ~1s) ──
 function stepCareer() {
   if (mode !== 'career') { wanderers = []; loot = []; return; }
+  updateFeedingSchedule();             // meal clock + hunger + day-end luck eval
   const luck = tankLuck();
   const dt = FRAMES_PER_PUBLISH;
 
@@ -221,11 +270,24 @@ function stepCareer() {
     shellCD = SHELL_BASE_CD * rnd(0.7, 1.3);
   }
 
-  // Wandering fish are very rare; type biased toward rarer by luck.
+  // School auto-grow: once you own any school fish, one more joins every SCHOOL_GROW_CD
+  // frames until the school reaches FISH_MAX[1] (4). School is catch-only — never sold
+  // in the shop — so this mechanic is the main way to build up the school.
+  const numSchool = fish.filter((f) => f.type === 1).length;
+  if (numSchool > 0 && numSchool < FISH_MAX[1]) {
+    if (schoolGrowCD <= 0) schoolGrowCD = SCHOOL_GROW_CD;
+    schoolGrowCD -= dt;
+    if (schoolGrowCD <= 0) { addFish(1); schoolGrowCD = SCHOOL_GROW_CD; }
+  } else {
+    schoolGrowCD = 0;
+  }
+
+  // Wandering fish are very rare; school fish (~8%) are rare — you need to catch one
+  // to start a school, then it auto-grows. Type biased toward rarer fish by luck.
   wanderCD -= dt;
   if (wanderCD <= 0 && wanderers.length < 2) {
     const r = Math.random();
-    const type = r < 0.1 + 0.3 * luck ? 3 : r < 0.4 ? 0 : r < 0.7 ? 1 : 2;
+    const type = r < 0.1 + 0.3 * luck ? 3 : r < 0.55 ? 0 : r < 0.63 ? 1 : 2;
     const fromLeft = Math.random() > 0.5;
     wanderers.push({
       id: nextItemId++, type,
@@ -307,6 +369,7 @@ function applyDirectives(text) {
     } else if (line.startsWith('!BUYFISH:')) {
       const [, t, n] = line.split(':');
       const type = parseInt(t, 10), qty = parseInt(n, 10) || 1;
+      if (type === 1) continue; // school fish are catch-only, not purchasable
       for (let k = 0; k < qty; k++) {
         if (coins >= FISH_PRICE[type] && addFish(type)) coins -= FISH_PRICE[type];
       }
@@ -320,6 +383,7 @@ function applyDirectives(text) {
       let n = parseInt(line.slice(6), 10) || 1;
       while (n-- > 0) {
         if (mode === 'career') { if (food <= 0) break; food -= 1; }
+        if (mode === 'career') registerFeeding();   // count toward the 3-meals/day schedule
         const f = fish[Math.floor(Math.random() * fish.length)];
         if (f) { f.xp += 10; f.fishLuck = clamp(f.fishLuck + 0.06, 0, 1); f.age += 40; }
       }
@@ -364,7 +428,10 @@ async function step() {
     time: { day_progress: dayProgress, mode: timeMode },
     counts: counts(),
     frame_ms: FRAME_MS,
-    game: { mode, coins, shells, food, luck: parseFloat(tankLuck().toFixed(3)) },
+    game: {
+      mode, coins, shells, food, luck: parseFloat(tankLuck().toFixed(3)),
+      fed: mealsToday, meals: MEALS_PER_DAY, hungry: tankHungry ? 1 : 0, overfed: overfeedToday,
+    },
     fish: fish.map((f) => ({
       id: f.id,
       x: parseFloat(f.x.toFixed(1)), y: parseFloat(f.y.toFixed(1)), z: f.z,

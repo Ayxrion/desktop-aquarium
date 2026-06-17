@@ -323,11 +323,15 @@ static std::string _buildTelemetryJson() {
     }
     j += "]},";
 
-    // Career game state
+    // Career game state (+ feeding schedule: fed/meals today, hunger, overfeeding)
+    int mealbits = 0;
+    for (int i = 0; i < MEALS_PER_DAY; i++) if (mealFed[i]) mealbits |= (1 << i);
     snprintf(tmp, sizeof(tmp),
-        "\"game\":{\"mode\":\"%s\",\"coins\":%d,\"shells\":%d,\"food\":%d,\"luck\":%.3f},",
+        "\"game\":{\"mode\":\"%s\",\"coins\":%d,\"shells\":%d,\"food\":%d,\"luck\":%.3f,"
+        "\"fed\":%d,\"meals\":%d,\"hungry\":%d,\"overfed\":%d,\"mealbits\":%d},",
         (gameMode == MODE_CAREER) ? "career" : "creative",
-        gameCoins, gameShells, gameFood, tankLuck());
+        gameCoins, gameShells, gameFood, tankLuck(),
+        mealsToday, MEALS_PER_DAY, tankHungry ? 1 : 0, overfeedToday, mealbits);
     j += tmp;
 
     // Wandering fish (catchable)
@@ -635,6 +639,12 @@ static void _applyServerProfile(const char* json) {
         if (_jGetInt(gp, "coins",  &v)) gameCoins  = v;
         if (_jGetInt(gp, "shells", &v)) gameShells = v;
         if (_jGetInt(gp, "food",   &v)) gameFood   = v;
+        // Restore today's feeding progress so reboot mid-day doesn't reset the schedule.
+        if (_jGetInt(gp, "fed",     &v)) mealsToday    = v;
+        if (_jGetInt(gp, "overfed", &v)) overfeedToday = v;
+        if (_jGetInt(gp, "mealbits", &v))
+            for (int i = 0; i < MEALS_PER_DAY; i++) mealFed[i] = (v >> i) & 1;
+        feedSchedInit = false;   // re-sync the slot clock on the next tick (no spurious day-eval)
     }
 
     // 1) Fish composition from saved counts — rebuild via addFish (handles slots

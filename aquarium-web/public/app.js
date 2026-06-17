@@ -6,7 +6,7 @@
 const WEATHER_NAMES = ['Sunny', 'Partly Cloudy', 'Cloudy', 'Rainy', 'Stormy', 'Snowy', 'Foggy'];
 const FISH_TYPE_NAMES = ['Pair', 'School', 'School 2', 'Angel'];
 // Per-type caps + snapshot count keys, mirroring the firmware (main.cpp / aquarium.ino).
-const FISH_MAX = [8, 16, 20, 12];
+const FISH_MAX = [8, 4, 20, 12];
 const FISH_COUNT_KEYS = ['pair', 'school', 'school2', 'angel'];
 const TANK_TOP = 72;
 const SCREEN_W = 800;
@@ -1022,6 +1022,7 @@ const els = {
   hudFood: document.getElementById('hud-food'),
   hudSnails: document.getElementById('hud-snails'),
   hudLuck: document.getElementById('hud-luck'),
+  hudMeals: document.getElementById('hud-meals'),
   modeSeg: document.getElementById('mode-seg'),
   shop: document.getElementById('shop'),
   shopFish: document.getElementById('shop-fish'),
@@ -1041,7 +1042,7 @@ const ctx = els.canvas.getContext('2d');
 
 // Shop prices (coins), mirroring the firmware/mock economy.
 const FISH_PRICE     = [10, 30, 45, 60];
-const FISH_BASE_SELL = [6, 16, 22, 30];   // base sell value by type (≈55-60% of buy price)
+const FISH_BASE_SELL = [6, 3, 22, 30];    // base sell value; school cheap to prevent market farming
 const FOOD_PRICE = 5;
 const SNAIL_PRICE = 50;
 const MAX_SNAILS = 6;
@@ -1736,7 +1737,14 @@ function renderGame(snap) {
   els.hudFood.textContent = '🍤 ' + (g.food || 0);
   els.hudSnails.textContent = '🐌 ' + ((snap.snails && snap.snails.length) || 0);
   els.hudLuck.textContent = '🍀 ' + Math.round((g.luck || 0) * 100) + '%';
-  for (const el of [els.hudCoins, els.hudShells, els.hudFood, els.hudSnails, els.hudLuck])
+  // Meals fed today (target 3). Turns into a pulsing warning while the fish are hungry.
+  const meals = g.meals || 3, fed = g.fed || 0, hungry = g.hungry === 1 || g.hungry === true;
+  els.hudMeals.textContent = (hungry ? '🍴 ' : '🍽️ ') + fed + '/' + meals;
+  els.hudMeals.classList.toggle('hungry', hungry);
+  els.hudMeals.title = hungry
+    ? 'Fish are hungry — feed them! (3 meals/day keeps them healthy)'
+    : 'Meals fed today' + (g.overfed ? ` · overfed ${g.overfed}× (hurts quality)` : '');
+  for (const el of [els.hudCoins, els.hudShells, els.hudFood, els.hudSnails, els.hudLuck, els.hudMeals])
     el.style.display = career ? '' : 'none';
 
   for (const b of els.modeSeg.querySelectorAll('button'))
@@ -1752,6 +1760,7 @@ function renderGame(snap) {
 function buildShop() {
   els.shopFish.innerHTML = '';
   for (let t = 0; t < 4; t++) {
+    if (t === 1) continue; // school fish are catch-only (wanderers); not sold in shop
     const b = document.createElement('button');
     b.type = 'button'; b.className = 'shop-buy'; b.dataset.type = String(t);
     b.innerHTML = `<span>🐟 ${escapeHtml(FISH_TYPE_NAMES[t])}</span><span class="price">${FISH_PRICE[t]} <span class="ci"></span></span>`;
@@ -2176,6 +2185,7 @@ function drawTank(s) {
   // Career collectibles, drawn on top so they're clearly visible + tappable.
   if (Array.isArray(s.loot)) for (const it of s.loot) drawLoot(it);
   if (Array.isArray(s.wanderers)) for (const w of s.wanderers) drawWanderer(w);
+  drawFoodBubbles(s);              // "feed me" bubbles above hungry fish
 
   if (cond === 3 || cond === 4) drawRain(cond, bright);
   else if (cond === 5) drawSnow(bright);
@@ -2205,6 +2215,61 @@ function drawSelectionHighlights() {
   if (hoveredKey) {
     const t = hitTargets.find((h) => h.key === hoveredKey);
     if (t) ring(t, 0.5 + 0.5 * Math.sin(animTick * 0.18));
+  }
+}
+
+// "Feed me" thought bubbles: spawned over a random fish while the tank is hungry
+// (career), they drift up and fade. Advanced in device-frame units (animTick) so the
+// cadence matches the firmware regardless of browser frame rate.
+let foodBubbles = [];
+let _bubbleCd = 0;
+let _bubbleLastTick = 0;
+const BUBBLE_SPAWN_CD = 1500;          // ~75s @20fps base interval; ×0.7–1.3 jitter (subtle, matches firmware)
+function drawFoodBubbles(s) {
+  const df = _bubbleLastTick ? clamp(animTick - _bubbleLastTick, 0, 5) : 1;
+  _bubbleLastTick = animTick;
+  const g = s && s.game;
+  const hungry = !!g && g.mode === 'career' && (g.hungry === 1 || g.hungry === true);
+
+  // Bubbles are bound to a fish id and re-anchored to its live position each frame, so
+  // they ride along as the fish swims; `rise` only lifts the bubble a little above it.
+  const fishById = new Map();
+  if (Array.isArray(s.fish)) for (const f of s.fish) fishById.set(f.id, f);
+
+  for (const b of foodBubbles) { b.rise += 0.4 * df; b.life -= df; }
+  foodBubbles = foodBubbles.filter((b) => b.life > 0 && fishById.has(b.fishId));
+
+  if (hungry && Array.isArray(s.fish) && s.fish.length) {
+    _bubbleCd -= df;
+    if (_bubbleCd <= 0) {
+      const f = s.fish[Math.floor(Math.random() * s.fish.length)];
+      foodBubbles.push({ fishId: f.id, rise: 0, life: 95, max: 95 });
+      _bubbleCd = BUBBLE_SPAWN_CD * (0.7 + Math.random() * 0.6);   // subtle, jittered (matches firmware)
+    }
+  } else {
+    _bubbleCd = 0;
+  }
+
+  for (const b of foodBubbles) {
+    const f = fishById.get(b.fishId);
+    if (!f) continue;
+    const x = projX(f.x, f.z || 0);
+    const y = projY(f.y, f.z || 0) - 24 - b.rise;
+    const a = clamp(b.life / b.max, 0, 1);
+    ctx.save();
+    ctx.globalAlpha = 0.9 * a;
+    ctx.fillStyle = '#f4fbff';
+    ctx.strokeStyle = 'rgba(80,150,190,0.9)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.ellipse(x, y, 14, 11, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    // tail dots trail back down toward the fish so the bubble reads as attached
+    ctx.beginPath(); ctx.arc(x - 10, y + 12, 2.4, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.arc(x - 14, y + 16, 1.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.globalAlpha = a;
+    ctx.font = '15px system-ui, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('🍴', x, y);
+    ctx.restore();
   }
 }
 

@@ -303,11 +303,15 @@ static int _buildTelemetryJson() {
             i ? "," : "", (int)fgHornworts[i].baseX, fgHornworts[i].segs);
     o = _tAppend(o, "]},");
 
-    // Career game state
+    // Career game state (+ feeding schedule: fed/meals today, hunger, overfeeding)
+    int mealbits = 0;
+    for (int i = 0; i < MEALS_PER_DAY; i++) if (mealFed[i]) mealbits |= (1 << i);
     o = _tAppend(o,
-        "\"game\":{\"mode\":\"%s\",\"coins\":%d,\"shells\":%d,\"food\":%d,\"luck\":%.3f},",
+        "\"game\":{\"mode\":\"%s\",\"coins\":%d,\"shells\":%d,\"food\":%d,\"luck\":%.3f,"
+        "\"fed\":%d,\"meals\":%d,\"hungry\":%d,\"overfed\":%d,\"mealbits\":%d},",
         (gameMode == MODE_CAREER) ? "career" : "creative",
-        gameCoins, gameShells, gameFood, tankLuck());
+        gameCoins, gameShells, gameFood, tankLuck(),
+        mealsToday, MEALS_PER_DAY, tankHungry ? 1 : 0, overfeedToday, mealbits);
 
     // Wandering fish (catchable)
     o = _tAppend(o, "\"wanderers\":[");
@@ -457,6 +461,12 @@ static void _applyServerProfileDoc(DynamicJsonDocument& doc) {
         gameCoins  = game["coins"]  | 0;
         gameShells = game["shells"] | 0;
         gameFood   = game["food"]   | 0;
+        // Restore today's feeding progress so reboot mid-day doesn't reset the schedule.
+        mealsToday    = game["fed"]     | 0;
+        overfeedToday = game["overfed"] | 0;
+        int mealbits  = game["mealbits"] | 0;
+        for (int i = 0; i < MEALS_PER_DAY; i++) mealFed[i] = (mealbits >> i) & 1;
+        feedSchedInit = false;   // re-sync the slot clock on the next tick (no spurious day-eval)
     }
 
     JsonObject counts = doc["counts"];

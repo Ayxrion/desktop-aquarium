@@ -304,13 +304,13 @@ struct Fish {
 // Fixed-slot layout: [0..MAX_PAIR-1] pair, [MAX_PAIR..MAX_PAIR+MAX_SCHOOL-1] school1,
 // [MAX_PAIR+MAX_SCHOOL..MAX_FISH-1] school2.  Only the first num* slots are active.
 #define MAX_PAIR    8
-#define MAX_SCHOOL  16
+#define MAX_SCHOOL  4               // school caps at 4; grows automatically once you own any
 #define MAX_SCHOOL2 20
 #define MAX_ANGEL   12
 #define MAX_FISH    (MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + MAX_ANGEL)
 
 static int numPair    = 2;
-static int numSchool  = 5;
+static int numSchool  = 2;          // demo initial; career starts at 0 via careerStartReset
 static int numSchool2 = 7;
 static int numAngel   = 3;
 
@@ -329,18 +329,36 @@ int gameCoins = 0, gameShells = 0, gameFood = 0;
 #define COIN_BASE_CD  3000
 #define SHELL_BASE_CD 2600
 #define WANDER_BASE_CD 7000
+#define SCHOOL_GROW_CD 7200             // frames between auto-grow ticks for the school
 #define COIN_GRAV     0.1f              // coin sink acceleration (px/frame²) — very gentle, water-like
 #define COIN_MAX_VY   1.4f              // terminal sink speed so coins drift slowly down, not plummet
 #define COIN_REST     480               // frames a landed coin sits before vanishing (~24s); timer starts on landing
 #define SHELL_TTL     220
 #define SAND_Y        (SCREEN_H - 20)
 static const int FISH_PRICE[4]     = { 10, 30, 45, 60 };
-static const int FISH_BASE_SELL[4] = {  6, 16, 22, 30 };
+static const int FISH_BASE_SELL[4] = {  6,  3, 22, 30 };
 #define FOOD_PRICE    5
 #define SNAIL_PRICE   50
 #define MAX_SNAILS    6
 #define SNAIL_REACH   36
 static const int SHELL_VALUE[3] = { 2, 5, 12 };
+
+// Feeding schedule: fish expect one feeding per third-of-day → 3 meals/day. A clean
+// 3-meal day (no overfeeding) nudges every fish's luck up at day's end; missing meals
+// (going hungry) or overfeeding pushes it down. Drives the on-screen "feed me" bubbles.
+#define MEALS_PER_DAY          3
+#define HUNGER_GRACE           0.35f   // fraction into an unfed slot before fish look hungry
+#define FEED_PERFECT_BONUS     0.08f   // daily luck gain for a perfectly-fed day
+#define FEED_MISS_PENALTY      0.05f   // daily luck loss per missed meal
+#define FEED_OVERFEED_PENALTY  0.03f   // daily luck loss per overfeeding
+#define FEED_DELTA_MIN         (-0.20f)
+#define FEED_DELTA_MAX         0.08f
+
+// Feeding-schedule state (career). mealFed[s] = slot s satisfied today; tankHungry
+// drives the "feed me" thought bubbles; counters feed the day-end luck evaluation.
+bool  mealFed[MEALS_PER_DAY] = { false, false, false };
+int   mealsToday = 0, overfeedToday = 0, lastMealSlot = 0;
+bool  feedSchedInit = false, tankHungry = false;
 
 #define MAX_WANDER 4
 struct Wanderer { float x, y, vx, bob; uint8_t type; uint32_t color; bool facingRight; bool active; uint32_t id; };
@@ -353,6 +371,16 @@ Loot loot[MAX_LOOT] = {};
 // Purchased coin-collector snails — patrol the floor and grab coins nearing it.
 struct CoinSnail { float x, spd; bool facingRight, active; };
 CoinSnail coinSnails[MAX_SNAILS] = {};
+
+// "Feed me" thought bubbles — ride above a specific hungry fish (career) to prompt
+// feeding. Bound to a fish slot + a small rising offset so they follow the fish.
+// Deliberately infrequent (a few per ~5 min) + jittered so the prompt stays subtle —
+// the player is meant to keep a feeding routine, not be nagged constantly.
+#define MAX_FOODBUBBLES 6
+#define BUBBLE_SPAWN_CD 1500            // ~75s @20fps base interval; ×0.7–1.3 jitter applied
+struct FoodBubble { int fish; float rise; int ttl; bool active; };
+FoodBubble foodBubbles[MAX_FOODBUBBLES] = {};
+static float bubbleSpawnCd = 0;
 
 // ── Tap / collect feedback pulses ──────────────────────────────────────────────
 // Transient expanding rings drawn over the tank: a "glass tap" ripple wherever
@@ -411,7 +439,7 @@ int numSnails = 0;
 
 static uint32_t nextItemId = 1;
 static float coinCD[MAX_FISH] = {};
-static float shellCD = SHELL_BASE_CD, wanderCD = WANDER_BASE_CD;
+static float shellCD = SHELL_BASE_CD, wanderCD = WANDER_BASE_CD, schoolGrowCd = 0;
 
 // ─── Menu ─────────────────────────────────────────────────────────────────────
 #define HBTN_X   748
@@ -1130,8 +1158,52 @@ void setup() {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Food drop
 // ═══════════════════════════════════════════════════════════════════════════════
+// ── Feeding schedule: 3 meals/day, with hunger + daily luck consequences ────────
+static int currentMealSlot() {
+  float p = getDayProgress();                 // 0..1 across the (real or FAST) day
+  int s = (int)(p * MEALS_PER_DAY);
+  return s < 0 ? 0 : (s >= MEALS_PER_DAY ? MEALS_PER_DAY - 1 : s);
+}
+void resetFeedingDay() {
+  for (int i = 0; i < MEALS_PER_DAY; i++) mealFed[i] = false;
+  mealsToday = 0; overfeedToday = 0;
+}
+// At day's end, reward a disciplined schedule and penalise neglect/overfeeding.
+void evaluateFeedingDay() {
+  int missed = 0;
+  for (int i = 0; i < MEALS_PER_DAY; i++) if (!mealFed[i]) missed++;
+  float delta = (missed == 0 && overfeedToday == 0)
+      ? FEED_PERFECT_BONUS
+      : -(FEED_MISS_PENALTY * missed) - (FEED_OVERFEED_PENALTY * overfeedToday);
+  if (delta < FEED_DELTA_MIN) delta = FEED_DELTA_MIN;
+  if (delta > FEED_DELTA_MAX) delta = FEED_DELTA_MAX;
+  for (int i = 0; i < MAX_FISH; i++) if (isFishActive(i)) {
+    float l = fish[i].fishLuck + delta;
+    fish[i].fishLuck = l < 0 ? 0.0f : (l > 1 ? 1.0f : l);
+  }
+}
+// One feeding event (career): satisfies the current slot, or counts as overfeeding.
+void registerFeeding() {
+  int s = currentMealSlot();
+  if (!mealFed[s]) { mealFed[s] = true; mealsToday++; }
+  else             { overfeedToday++; }
+  tankHungry = false;                         // immediate visual relief
+}
+// Per-publish: advance the meal clock, roll the day over, derive hunger.
+void updateFeedingSchedule() {
+  int s = currentMealSlot();
+  if (!feedSchedInit) { lastMealSlot = s; feedSchedInit = true; }
+  if (s != lastMealSlot) {
+    if (s < lastMealSlot) { evaluateFeedingDay(); resetFeedingDay(); } // wrapped → new day
+    lastMealSlot = s;
+  }
+  float frac = getDayProgress() * MEALS_PER_DAY - s;
+  tankHungry = (!mealFed[s]) && (frac > HUNGER_GRACE);
+}
+
 void dropFood(int touchX = -1, int touchY = -1) {
-  int n = random(5, 11);
+  if (gameMode == MODE_CAREER) registerFeeding();   // count this feeding toward the schedule
+  int n = irandom(5, 11);
   int spawned = 0;
   bool hasTouch = (touchX >= 0);
   for (int i = 0; i < MAX_FLAKES && spawned < n; i++) {
@@ -1185,7 +1257,7 @@ void addSnail() {
 void spawnWanderer(float luck) {
   for (int i = 0; i < MAX_WANDER; i++) if (!wanderers[i].active) {
     float r = frandr(0, 1);
-    uint8_t type = (r < 0.1f + 0.3f * luck) ? 3 : (r < 0.4f) ? 0 : (r < 0.7f) ? 1 : 2;
+    uint8_t type = (r < 0.1f + 0.3f * luck) ? 3 : (r < 0.55f) ? 0 : (r < 0.63f) ? 1 : 2;
     bool fromLeft = (random(0, 2) == 0);
     Wanderer& w = wanderers[i];
     w.active = true; w.type = type; w.id = nextItemId++;
@@ -1241,6 +1313,8 @@ void careerStartReset() {
   for (int i = 0; i < MAX_FISH; i++)   coinCD[i] = 0;
   numSnails = 0;
   for (int i = 0; i < MAX_SNAILS; i++) coinSnails[i].active = false;
+  resetFeedingDay(); feedSchedInit = false; tankHungry = false; bubbleSpawnCd = 0;
+  for (int i = 0; i < MAX_FOODBUBBLES; i++) foodBubbles[i].active = false;
 }
 void setGameMode(GameMode m) {
   if (m == MODE_CAREER) { gameMode = MODE_CAREER; careerStartReset(); }
@@ -1248,6 +1322,7 @@ void setGameMode(GameMode m) {
 }
 void updateCareer() {
   if (gameMode != MODE_CAREER) return;
+  updateFeedingSchedule();            // meal clock + hunger + day-end luck eval
   float luck = tankLuck();
   for (int i = 0; i < MAX_FISH; i++) {
     if (!isFishActive(i)) continue;
@@ -1264,6 +1339,13 @@ void updateCareer() {
     uint8_t tier = (r < 0.05f + 0.25f * luck) ? 2 : (r < 0.15f + 0.45f * luck) ? 1 : 0;
     spawnLoot(1, frandr(40, SCREEN_W - 40), (float)(SCREEN_H - 26), tier);
     shellCD = SHELL_BASE_CD * frandr(0.7f, 1.3f);
+  }
+  // School auto-grow: if any school fish exist but haven't hit the cap, add one every SCHOOL_GROW_CD frames.
+  if (numSchool > 0 && numSchool < MAX_SCHOOL) {
+    if (schoolGrowCd <= 0.0f) schoolGrowCd = SCHOOL_GROW_CD;
+    if ((schoolGrowCd -= 1.0f) <= 0.0f) { addFish(FISH_SCHOOL); schoolGrowCd = SCHOOL_GROW_CD; }
+  } else {
+    schoolGrowCd = 0.0f;
   }
   int activeW = 0;
   for (int i = 0; i < MAX_WANDER; i++) if (wanderers[i].active) activeW++;
@@ -1290,23 +1372,32 @@ void updateCareer() {
     } else if (--it.ttl <= 0) { it.active = false; }
   }
 
-  // Coin-collector snails: intercept any coin (predict landing x = current x since coins
-  // fall straight down); sprint 4× for landed coins, fast-walk 2× for falling coins.
+  // Coin-collector snails: only react to a falling coin once it is halfway to the sand
+  // (y >= SAND_Y/2); sprint 4× for landed coins, fast-walk 2× for falling.
+  // Use moveToward so the snail stops exactly at the target x without direction jitter.
   for (int s = 0; s < numSnails; s++) {
     if (!coinSnails[s].active) continue;
     CoinSnail& sn = coinSnails[s];
     int tgt = -1; float td = 1e9f; bool tgtLanded = false;
     for (int i = 0; i < MAX_LOOT; i++) {
       if (!loot[i].active || loot[i].kind != 0) continue;
+      if (!loot[i].landed && loot[i].y < (float)SAND_Y * 0.5f) continue;
       float d = fabsf(loot[i].x - sn.x);
       if (loot[i].landed) {
         if (!tgtLanded || d < td) { td = d; tgt = i; tgtLanded = true; }
       } else if (!tgtLanded && d < td) { td = d; tgt = i; }
     }
     if (tgt >= 0) {
-      sn.facingRight = loot[tgt].x > sn.x;
-      float mult = tgtLanded ? 4.0f : 2.0f;
-      sn.x += (sn.facingRight ? 1 : -1) * sn.spd * mult;
+      float dx   = loot[tgt].x - sn.x;
+      float dist = fabsf(dx);
+      float step = sn.spd * (tgtLanded ? 4.0f : 2.0f);
+      if (dist <= step) {
+        sn.x = loot[tgt].x;              // arrived — stop exactly, no direction jitter
+        sn.facingRight = (dx >= 0);
+      } else {
+        sn.facingRight = (dx > 0);
+        sn.x += sn.facingRight ? step : -step;
+      }
     } else {
       sn.x += (sn.facingRight ? 1 : -1) * sn.spd;
       if (sn.x > SCREEN_W - 55) { sn.x = SCREEN_W - 55; sn.facingRight = false; }
@@ -1378,6 +1469,35 @@ void updateSnail() {
   snail.x += move;
   if (snail.x > SCREEN_W - 55) { snail.x = SCREEN_W - 55; snail.facingRight = false; }
   if (snail.x < 55)             { snail.x = 55;             snail.facingRight = true;  }
+}
+
+// Float existing "feed me" bubbles up + fade; spawn a new one over a random fish
+// every few seconds while the tank is hungry (career only).
+void updateFoodBubbles() {
+  for (int i = 0; i < MAX_FOODBUBBLES; i++) if (foodBubbles[i].active) {
+    if (!isFishActive(foodBubbles[i].fish)) { foodBubbles[i].active = false; continue; }
+    foodBubbles[i].rise += 0.4f;     // lift slightly above the fish it rides
+    if (--foodBubbles[i].ttl <= 0) foodBubbles[i].active = false;
+  }
+  if (gameMode == MODE_CAREER && tankHungry) {
+    if ((bubbleSpawnCd -= 1.0f) <= 0.0f) {
+      int picks[MAX_FISH], n = 0;
+      for (int i = 0; i < MAX_FISH; i++) if (isFishActive(i)) picks[n++] = i;
+      if (n > 0) {
+        int idx = picks[irandom(0, n)];
+        for (int b = 0; b < MAX_FOODBUBBLES; b++) if (!foodBubbles[b].active) {
+          foodBubbles[b].fish = idx;
+          foodBubbles[b].rise = 0.0f;
+          foodBubbles[b].ttl  = 95;
+          foodBubbles[b].active = true;
+          break;
+        }
+      }
+      bubbleSpawnCd = BUBBLE_SPAWN_CD * frandr(0.7f, 1.3f);   // subtle, jittered cadence
+    }
+  } else {
+    bubbleSpawnCd = 0.0f;
+  }
 }
 
 void updateStarfish() {
@@ -1698,6 +1818,28 @@ void drawSnail() { drawSnailShape((int)snail.x, snail.facingRight); }
 void drawCoinSnails() {                          // purchased coin collectors
   for (int i = 0; i < numSnails; i++)
     if (coinSnails[i].active) drawSnailShape((int)coinSnails[i].x, coinSnails[i].facingRight, true);
+}
+// "Feed me" thought bubble: a small white cloud with a fork + food pellets inside.
+void drawFoodBubbles() {
+  for (int i = 0; i < MAX_FOODBUBBLES; i++) {
+    if (!foodBubbles[i].active) continue;
+    int idx = foodBubbles[i].fish;
+    if (!isFishActive(idx)) continue;
+    // Re-anchor to the fish's live position each frame so the bubble follows it.
+    int x = projX(fish[idx].x, fish[idx].z);
+    int y = (int)(projY(fish[idx].y, fish[idx].z) - 22.0f - foodBubbles[i].rise);
+    const uint32_t FILL = 0xF4FBFFUL, EDGE = 0x88B8D8UL, FORK = 0xE0762AUL;
+    canvas.fillRect(x - 11, y - 9, 22, 18, FILL);     // bubble body
+    canvas.drawRect(x - 11, y - 9, 22, 18, EDGE);
+    canvas.fillCircle(x - 8,  y + 12, 2, FILL);       // trailing tail dots
+    canvas.fillCircle(x - 12, y + 15, 1, FILL);
+    canvas.drawFastVLine(x - 4, y - 5, 11, FORK);     // fork: stem + 2 tines
+    canvas.drawFastVLine(x - 6, y - 5, 4,  FORK);
+    canvas.drawFastVLine(x - 2, y - 5, 4,  FORK);
+    canvas.drawFastHLine(x - 6, y - 5, 5,  FORK);
+    canvas.fillCircle(x + 4, y - 1, 2, 0x49C24AUL);   // food pellets
+    canvas.fillCircle(x + 7, y + 4, 1, 0xFFD23FUL);
+  }
 }
 
 void drawStarfish() {
@@ -2260,22 +2402,37 @@ void drawShopPanel() {
     canvas.setTextColor(can ? 0xCCFFDDUL : 0x334455UL);
     canvas.setCursor(rx + 157, SP_Y + 70); canvas.print("BUY");
   }
-  // Fish types
+  // Fish types (school fish are catch-only — shown grayed with CATCH label, no BUY button)
   const char* fNames[4] = { "LARGE FISH","SCHOOL FISH","DEEP FISH","ANGELFISH" };
   int cnts[4] = { numPair, numSchool, numSchool2, numAngel };
   int mxs[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
-  for (int row = 0; row < 4; row++) {
-    int fy = SP_Y + 108 + row * 44;
-    bool can = cnts[row] < mxs[row] && gameCoins >= FISH_PRICE[row];
-    canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
-    canvas.setCursor(rx, fy + 8); canvas.print(fNames[row]);
-    char pbuf[8]; snprintf(pbuf, sizeof(pbuf), "%dc", FISH_PRICE[row]);
+  int shopRow = 0;
+  for (int t = 0; t < 4; t++) {
+    int fy = SP_Y + 108 + shopRow * 44;
+    canvas.setTextSize(1);
+    if (t == 1) {
+      // School fish: show count/max + CATCH label; no buy button
+      canvas.setTextColor(0x667788UL);
+      canvas.setCursor(rx, fy + 8); canvas.print(fNames[t]);
+      char cbuf[10]; snprintf(cbuf, sizeof(cbuf), "%d/%d", cnts[t], mxs[t]);
+      canvas.setCursor(rx + 100, fy + 8); canvas.print(cbuf);
+      canvas.fillRect(rx + 148, fy, 56, 28, 0x0C1A2AUL);
+      canvas.drawRect(rx + 148, fy, 56, 28, 0x223344UL);
+      canvas.setTextColor(0x334455UL);
+      canvas.setCursor(rx + 151, fy + 10); canvas.print("CATCH");
+      shopRow++; continue;
+    }
+    bool can = cnts[t] < mxs[t] && gameCoins >= FISH_PRICE[t];
+    canvas.setTextColor(0xAADDFFUL);
+    canvas.setCursor(rx, fy + 8); canvas.print(fNames[t]);
+    char pbuf[8]; snprintf(pbuf, sizeof(pbuf), "%dc", FISH_PRICE[t]);
     canvas.setTextColor(can ? 0xFFD23FUL : 0x556677UL);
     canvas.setCursor(rx + 100, fy + 8); canvas.print(pbuf);
     canvas.fillRect(rx + 148, fy, 56, 28, can ? 0x3A2E0AUL : 0x0C1A2AUL);
     canvas.drawRect(rx + 148, fy, 56, 28, can ? 0xFFD23FUL : 0x223344UL);
     canvas.setTextColor(can ? 0x111111UL : 0x334455UL);
     canvas.setCursor(rx + 157, fy + 10); canvas.print("BUY");
+    shopRow++;
   }
   // Close button
   canvas.fillRect(SP_X + SP_W - 36, SP_Y + 4, 28, 20, 0x1A0000UL);
@@ -2360,7 +2517,7 @@ void drawMenu() {
 
     // [+] add (creative free) / buy with coins (career)
     bool atCap  = counts[row] >= maxes[row];
-    bool canAdd = career ? (!atCap && gameCoins >= FISH_PRICE[row]) : !atCap;
+    bool canAdd = career ? (!atCap && row != 1 && gameCoins >= FISH_PRICE[row]) : !atCap;
     canvas.fillRect(MENU_X + 210, ry, 30, 30, canAdd ? (career ? 0x3A2E0AUL : 0x1A3355UL) : 0x0C1A2AUL);
     canvas.drawRect(MENU_X + 210, ry, 30, 30, canAdd ? (career ? 0xFFD23FUL : 0x4488CCUL) : 0x223344UL);
     canvas.setTextSize(2);
@@ -2620,12 +2777,15 @@ void loop() {
         const FishType T[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
         int cnts[4] = { numPair, numSchool, numSchool2, numAngel };
         int mxs[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
-        for (int row = 0; row < 4; row++) {
-          int fy = SP_Y + 108 + row * 44;
+        int shopRow2 = 0;
+        for (int t = 0; t < 4; t++) {
+          int fy = SP_Y + 108 + shopRow2 * 44;
+          shopRow2++;
+          if (t == 1) continue; // school fish are catch-only; no buy button
           if (tx >= (uint16_t)(rx + 148) && tx < (uint16_t)(rx + 204) &&
               ty >= (uint16_t)fy          && ty < (uint16_t)(fy + 28)) {
-            if (cnts[row] < mxs[row] && gameCoins >= FISH_PRICE[row]) {
-              gameCoins -= FISH_PRICE[row]; addFish(T[row]);
+            if (cnts[t] < mxs[t] && gameCoins >= FISH_PRICE[t]) {
+              gameCoins -= FISH_PRICE[t]; addFish(T[t]);
             }
             break;
           }
@@ -2660,10 +2820,10 @@ void loop() {
         }
         if (tx >= (uint16_t)(MENU_X + 210) && tx < (uint16_t)(MENU_X + 240) &&
             ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
-          if (gameMode == MODE_CAREER) {           // buy with coins (guard the cap)
+          if (gameMode == MODE_CAREER) {           // buy with coins (guard cap; school fish are catch-only)
             int cnt[4] = { numPair, numSchool, numSchool2, numAngel };
             int mx[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
-            if (cnt[row] < mx[row] && gameCoins >= FISH_PRICE[row]) {
+            if (row != 1 && cnt[row] < mx[row] && gameCoins >= FISH_PRICE[row]) {
               gameCoins -= FISH_PRICE[row]; addFish(rowType[row]);
             }
           } else {
@@ -2761,6 +2921,7 @@ void loop() {
   updateFlakes();
   updateFish();
   updateCareer();     // age fish + spawn coins/shells/wanderers (career only)
+  updateFoodBubbles(); // float/spawn "feed me" bubbles while hungry
   updatePulses();     // advance tap/collect feedback rings
 
   drawBackground();
@@ -2780,6 +2941,7 @@ void loop() {
   drawStarfish();
   drawLootItems();    // coins + shells (career collectibles)
   drawWanderers();    // wandering fish with catch halo
+  drawFoodBubbles();  // "feed me" thought bubbles above hungry fish
   drawPulses();       // tap ripples + collect bursts (over entities, under rim)
   drawTankRim();      // draws over the bottom of the sky, giving a clean rim
   drawGameHud();      // mode + wallet readout

@@ -199,14 +199,15 @@ main {
 .view-sub { color: var(--muted); font-size: 13px; }
 
 .tank-wrap {
-  flex: 1 1 auto;
+  flex: 0 0 auto;
   align-self: flex-start;
-  width: auto;
+  width: 100%;
   min-width: 0;
   aspect-ratio: 800 / 480;
   /* Cap width so canvas height fits within tank-col. Overhead: header+padding
-     (85px) + viewTitle (27px) + stats strip (~90px) + gaps (18px) = 220px. */
-  max-width: min(100%, calc((100vh - 220px) * 800 / 480));
+     (85px) + viewTitle (27px) + compact stats strip (~30px) + gaps (18px) =
+     ~160px. The slimmer info strip lets the tank reclaim its full size. */
+  max-width: min(100%, calc((100vh - 160px) * 800 / 480));
   position: relative;
   border-radius: 12px;
   overflow: hidden;
@@ -323,23 +324,32 @@ main {
   text-align: right;
 }
 
+/* Compact single-row info strip beneath the tank — chips on one line so the
+   canvas can claim back the vertical space (scrolls sideways if it overflows). */
 .stats {
-  flex: 1 1 0;
+  flex: 0 0 auto;
   min-width: 0;
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+  display: flex;
+  flex-wrap: nowrap;
   gap: 6px;
   margin-top: 0;
-  align-content: start;
+  overflow-x: auto;
+  scrollbar-width: thin;
 }
 .stat {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
   background: var(--panel);
-  border-radius: 7px;
-  padding: 6px 10px;
+  border-radius: 6px;
+  padding: 5px 10px;
+  white-space: nowrap;
 }
 .stat .label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); }
-.stat .value { font-size: 15px; font-weight: 600; margin-top: 2px; }
-.stat .sub { font-size: 11px; color: var(--muted); margin-top: 1px; }
+.stat .value { font-size: 13px; font-weight: 600; }
+.stat .sub { font-size: 11px; color: var(--muted); }
+.stat .sub:empty { display: none; }
 
 /* Device control panel (weather / timescale / fish / feed). */
 .controls {
@@ -569,6 +579,17 @@ main {
   background: var(--panel-2);
   border-radius: 6px;
   padding: 3px 8px;
+}
+/* Meals indicator turns into a pulsing amber warning while the fish are hungry. */
+.hud-item.hungry {
+  background: #5a2a12;
+  color: #ffd9a8;
+  box-shadow: 0 0 0 1px #c8651f inset;
+  animation: hungry-pulse 1.1s ease-in-out infinite;
+}
+@keyframes hungry-pulse {
+  0%, 100% { box-shadow: 0 0 0 1px #c8651f inset; }
+  50%      { box-shadow: 0 0 6px 1px rgba(255, 150, 60, 0.7), 0 0 0 1px #ff8a3c inset; }
 }
 .ci {
   display: inline-block;

@@ -418,7 +418,7 @@ function getNamesText(id) {
 
 // Fish-type caps mirror the firmware (main.cpp / aquarium.ino) so the dashboard
 // and server can validate without a round-trip.
-const FISH_MAX = [8, 16, 20, 12]; // pair, school, school2, angel
+const FISH_MAX = [8, 4, 20, 12]; // pair, school, school2, angel
 
 // Buffer a downstream control directive for the device's next telemetry response.
 // Returns { ok } or { ok:false, error } on bad input.
@@ -483,6 +483,7 @@ function queueControl(id, cmd) {
       if (what === 'fish') {
         const ft = Number(cmd.fishType);
         if (!Number.isInteger(ft) || ft < 0 || ft > 3) return { ok: false, error: 'bad_fish_type' };
+        if (ft === 1) return { ok: false, error: 'school_catch_only' }; // school fish are catch-only
         p.buyFish[ft] += Math.max(1, Math.min(64, Number(cmd.count) || 1));
       } else if (what === 'food') {
         p.buyFood += Math.max(1, Math.min(99, Number(cmd.count) || 1));
