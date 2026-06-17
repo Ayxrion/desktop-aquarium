@@ -29,7 +29,8 @@ const COIN_MAX_VY = 1.4;                        // terminal sink speed so coins 
 const COIN_REST = 480;                         // frames a landed coin sits before vanishing (~24s); timer starts on landing
 const SHELL_TTL = 220;                         // shells linger on the sand a bit longer
 const SAND_Y = H - 20;                         // resting line on the sea floor
-const FISH_PRICE = [10, 30, 45, 60];          // shop fish price (coins) by type
+const FISH_PRICE    = [10, 30, 45, 60];         // shop fish price (coins) by type
+const FISH_BASE_SELL = [6, 16, 22, 30];         // base sell value by type (≈55% of buy)
 const FOOD_PRICE = 5;                          // coins per food unit
 const SNAIL_PRICE = 50;                        // coins per coin-collector snail
 const MAX_SNAILS = 6;
@@ -124,6 +125,15 @@ function removeFish(type) {
     if (fish[i].type === type) { fish.splice(i, 1); return true; }
   }
   return false;
+}
+
+function fishSellValue(f) {
+  const base = FISH_BASE_SELL[f.type] || 6;
+  return base
+    + Math.round(base * scaleOf(f))
+    + Math.round((f.fishLuck || 0) * 15)
+    + Math.min(Math.floor((f.xp || 0) / 100), 8)
+    + (f.shiny ? 12 : 0);
 }
 
 // ── Resident fish physics (mirrors device updateFish) ──
@@ -312,6 +322,12 @@ function applyDirectives(text) {
         if (mode === 'career') { if (food <= 0) break; food -= 1; }
         const f = fish[Math.floor(Math.random() * fish.length)];
         if (f) { f.xp += 10; f.fishLuck = clamp(f.fishLuck + 0.06, 0, 1); f.age += 40; }
+      }
+    } else if (line.startsWith('!SELLFISH:')) {
+      for (const idStr of line.slice(10).split(',')) {
+        const id = parseInt(idStr, 10);
+        const fi = fish.findIndex((f) => f.id === id);
+        if (fi >= 0) { coins += fishSellValue(fish[fi]); fish.splice(fi, 1); }
       }
     } else if (line.startsWith('!FISHADD:')) {
       const [, t, n] = line.split(':');

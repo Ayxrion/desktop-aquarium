@@ -340,6 +340,16 @@ function projY(y, z) { const cy = SCREEN_H * 0.45; return cy + (y - cy) * (1 - z
 // 0.22..1.0 (matches device fishScale); absent (creative / pre-game) → full size.
 function growth(f) { return typeof f.scale === 'number' ? clamp(f.scale, 0.2, 1) : 1; }
 
+function fishSellValue(f) {
+  const base = FISH_BASE_SELL[f.type] || 6;
+  const g = growth(f);
+  return base
+    + Math.round(base * g)
+    + Math.round(fishLuck(f) * 15)
+    + Math.min(Math.floor((f.xp || 0) / 100), 8)
+    + (isShiny(f) ? 12 : 0);
+}
+
 // Fish text size / half-width (device units) — drives shadow + glyph scale.
 function fishTS(f)    { return (f.type || 0) === 0 ? (f.z < 0.5 ? 3 : 2) : (f.z < 0.6 ? 2 : 1); }
 function fishChars(f) { return (f.type || 0) === 0 ? 5 : 3; }
@@ -1026,7 +1036,8 @@ const els = {
 const ctx = els.canvas.getContext('2d');
 
 // Shop prices (coins), mirroring the firmware/mock economy.
-const FISH_PRICE = [10, 30, 45, 60];
+const FISH_PRICE     = [10, 30, 45, 60];
+const FISH_BASE_SELL = [6, 16, 22, 30];   // base sell value by type (≈55-60% of buy price)
 const FOOD_PRICE = 5;
 const SNAIL_PRICE = 50;
 const MAX_SNAILS = 6;
@@ -1998,6 +2009,15 @@ function closeProfile() {
   profileKey = null;
   els.profile.hidden = true;
 }
+async function sellFish(fishId) {
+  const snap = latestSnapshot;
+  const f = snap && snap.fish && snap.fish.find((x) => x.id === fishId);
+  if (!f) return;
+  const val = fishSellValue(f);
+  if (!confirm(`Sell ${fishName(f)} for ${val} coins?`)) return;
+  closeProfile();
+  await sendControl({ type: 'sell', fishId }, `Sold ${fishName(f)} for ${val} coins`, { label: 'Sell fish' });
+}
 function pfStat(label, val) {
   return `<div class="pf-stat"><div class="pf-stat-l">${label}</div>` +
          `<div class="pf-stat-v">${escapeHtml(String(val))}</div></div>`;
@@ -2006,6 +2026,8 @@ function fishProfileHTML(f) {
   const r = rarityOf(f), shiny = isShiny(f);
   const q = Math.round(fishLuck(f) * 100), size = Math.round(growth(f) * 100);
   const col = fishColorHex(f);
+  const inCareer = latestSnapshot && latestSnapshot.game && latestSnapshot.game.mode === 'career';
+  const sellVal = inCareer ? fishSellValue(f) : 0;
   return `
     <div class="pf-head">
       <div class="pf-chip${shiny ? ' shiny' : ''}" style="--chip:${col}"></div>
@@ -2029,7 +2051,12 @@ function fishProfileHTML(f) {
       ${pfStat('Type', FISH_TYPE_NAMES[f.type] || 'Fish')}
       ${pfStat('Colour', col.toUpperCase())}
     </div>
-    ${shiny ? `<div class="pf-note">✦ A 1-in-${SHINY_ODDS} shiny — inverted colours and a glistening shimmer as it swims.</div>` : ''}`;
+    ${shiny ? `<div class="pf-note">✦ A 1-in-${SHINY_ODDS} shiny — inverted colours and a glistening shimmer as it swims.</div>` : ''}
+    ${inCareer ? `<div class="pf-sell-row">
+      <button type="button" class="pf-sell-btn" data-fish-id="${f.id}">
+        Sell for ${sellVal} <span class="ci"></span>
+      </button>
+    </div>` : ''}`;
 }
 // Wire the profile dialog's rename field: blur, Enter/Escape, and the Save button
 // all persist via saveName(); the Save button briefly confirms.
@@ -2074,6 +2101,8 @@ function renderProfile() {
   if (ent.kind === 'fish') {
     const input = els.profileBody.querySelector('.pf-name');
     if (input) _wireProfileRename(input, ent.ref.id);
+    const sellBtn = els.profileBody.querySelector('.pf-sell-btn');
+    if (sellBtn) sellBtn.addEventListener('click', () => sellFish(ent.ref.id));
   }
 }
 els.profileClose.addEventListener('click', closeProfile);

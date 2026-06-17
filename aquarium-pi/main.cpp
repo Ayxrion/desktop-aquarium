@@ -172,7 +172,8 @@ int gameCoins = 0, gameShells = 0, gameFood = 0;
 #define COIN_REST     480               // frames a landed coin sits before vanishing (~24s); timer starts on landing
 #define SHELL_TTL     220               // shells linger on the sand a bit longer
 #define SAND_Y        (SCREEN_H - 20)   // resting line on the sea floor
-static const int FISH_PRICE[4] = { 10, 30, 45, 60 };
+static const int FISH_PRICE[4]     = { 10, 30, 45, 60 };
+static const int FISH_BASE_SELL[4] = {  6, 16, 22, 30 }; // base sell value (≈55% of buy)
 #define FOOD_PRICE    5
 #define SNAIL_PRICE   50                // coins per coin-collector snail
 #define MAX_SNAILS    6
@@ -210,6 +211,14 @@ bool     lastBtnState  = HIGH;
 uint32_t lastBtnMs     = 0;
 bool     lastTouched   = false;
 bool     menuOpen      = false;
+
+// ─── Shop panel ───────────────────────────────────────────────────────────────
+#define SBTN_X   694
+#define SBTN_Y     5
+#define SBTN_W    43
+#define SBTN_H    38
+bool shopOpen      = false;
+int  shopSellPage  = 0;   // page index for sell-fish list (8 fish per page)
 
 // Switching to Career wipes the tank (careerStartReset), so the menu's CAREER
 // button arms first and only commits on a confirming second tap within the window.
@@ -1017,6 +1026,51 @@ void updateCareer() {
     }
 }
 
+// ── Sell fish helpers ─────────────────────────────────────────────────────────
+// Remove fish by slot index (fills gap by swapping with last of same type).
+void removeFishSlot(int idx) {
+    if (!isFishActive(idx)) return;
+    if (idx < MAX_PAIR) {
+        if (fish[idx].partner >= 0 && fish[idx].partner < numPair)
+            fish[fish[idx].partner].partner = -1;
+        int last = numPair - 1;
+        if (idx != last) {
+            fish[idx] = fish[last];
+            if (fish[idx].partner >= 0 && fish[idx].partner < numPair)
+                fish[fish[idx].partner].partner = idx;
+        }
+        numPair--;
+    } else if (idx < MAX_PAIR + MAX_SCHOOL) {
+        int last = MAX_PAIR + numSchool - 1;
+        if (idx != last) fish[idx] = fish[last];
+        numSchool--;
+    } else if (idx < MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2) {
+        int last = MAX_PAIR + MAX_SCHOOL + numSchool2 - 1;
+        if (idx != last) fish[idx] = fish[last];
+        numSchool2--;
+    } else {
+        int last = MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + numAngel - 1;
+        if (idx != last) fish[idx] = fish[last];
+        numAngel--;
+    }
+}
+int fishSellValue(int idx) {
+    if (!isFishActive(idx)) return 0;
+    const Fish& f = fish[idx];
+    int base = FISH_BASE_SELL[(int)f.type < 4 ? (int)f.type : 0];
+    float sc = fishScale(f);
+    int val = base
+            + (int)(base * sc + 0.5f)
+            + (int)(f.fishLuck * 15.0f + 0.5f)
+            + (f.xp / 100 < 8 ? f.xp / 100 : 8);
+    return val;
+}
+void sellFishSlot(int idx) {
+    if (!isFishActive(idx)) return;
+    gameCoins += fishSellValue(idx);
+    removeFishSlot(idx);
+}
+
 void telemetryApplyControls() {
     int w = _ctrlWeatherReq.exchange(-2);
     if (w != -2) {
@@ -1060,6 +1114,13 @@ void telemetryApplyControls() {
             fish[k].xp += 10; fish[k].age += 40;
             fish[k].fishLuck = fish[k].fishLuck + 0.05f > 1 ? 1.0f : fish[k].fishLuck + 0.05f;
         }
+    }
+
+    // Sell fish (from web dashboard fish-profile sell button or local shop panel).
+    {
+        int sc = _ctrlSellFishCount.exchange(0);
+        for (int i = 0; i < sc && i < CTRL_SELL_MAX; i++)
+            sellFishSlot(_ctrlSellFishIds[i].load());
     }
 }
 
@@ -1639,6 +1700,146 @@ void drawMenuButton() {
     canvas.fillRect(bx, HBTN_Y + 26, bw, 3, 0xCCEEFFUL);
 }
 
+// ─── Shop (cart) button — only visible in career mode ────────────────────────
+void drawCartButton() {
+    if (gameMode != MODE_CAREER) return;
+    uint32_t bg = shopOpen ? 0x5A3A00UL : 0x2A1800UL;
+    canvas.fillRect(SBTN_X, SBTN_Y, SBTN_W, SBTN_H, bg);
+    canvas.drawRect(SBTN_X, SBTN_Y, SBTN_W, SBTN_H, 0xD9A441UL);
+    // Cart glyph: basket body + two wheels
+    int cx = SBTN_X + SBTN_W / 2, cy = SBTN_Y + SBTN_H / 2 - 2;
+    canvas.fillRect(cx - 9, cy - 4, 18, 10, 0xFFD23FUL);
+    canvas.drawRect(cx - 9, cy - 4, 18, 10, 0xB8860BUL);
+    canvas.fillCircle(cx - 5, cy + 9, 3, 0xFFD23FUL);
+    canvas.fillCircle(cx + 5, cy + 9, 3, 0xFFD23FUL);
+    // Handle arrow pointing up-left
+    canvas.drawLine(cx - 9, cy - 4, cx - 14, cy - 8, 0xFFD23FUL);
+    canvas.drawLine(cx - 14, cy - 8, cx - 17, cy - 8, 0xFFD23FUL);
+}
+
+// ─── Shop panel — split: left=sell fish, right=buy items ─────────────────────
+#define SP_X     10
+#define SP_Y     TANK_TOP
+#define SP_W     780
+#define SP_H     (SCREEN_H - TANK_TOP - 4)
+#define SP_MID   (SP_X + SP_W / 2)
+#define SP_ROW_H 40
+#define SP_ROWS  9   // visible fish rows per page
+
+void drawShopPanel() {
+    if (!shopOpen) return;
+    // Background
+    canvas.fillRect(SP_X, SP_Y, SP_W, SP_H, 0x080E1CUL);
+    canvas.drawRect(SP_X, SP_Y, SP_W, SP_H, 0xD9A441UL);
+    canvas.drawRect(SP_X+1, SP_Y+1, SP_W-2, SP_H-2, 0x1A1000UL);
+    // Divider
+    canvas.drawFastVLine(SP_MID, SP_Y + 4, SP_H - 8, 0x2244AAUL);
+    // Headers
+    canvas.setTextSize(1); canvas.setTextColor(0xFFD23FUL);
+    canvas.setCursor(SP_X + 10, SP_Y + 8);  canvas.print("SELL FISH");
+    canvas.setCursor(SP_MID + 10, SP_Y + 8); canvas.print("SHOP");
+    canvas.drawFastHLine(SP_X + 4,       SP_Y + 22, SP_W/2 - 8, 0x2244AAUL);
+    canvas.drawFastHLine(SP_MID + 4,     SP_Y + 22, SP_W/2 - 8, 0x2244AAUL);
+
+    // ── Left panel: active fish list with sell button ─────────────────────────
+    // Collect active fish indices
+    int activeFish[MAX_FISH]; int nActive = 0;
+    for (int i = 0; i < MAX_FISH; i++) if (isFishActive(i)) activeFish[nActive++] = i;
+    int pages = (nActive + SP_ROWS - 1) / SP_ROWS;
+    if (shopSellPage >= pages) shopSellPage = pages > 0 ? pages - 1 : 0;
+    int start = shopSellPage * SP_ROWS;
+    static const char* tNames[4] = { "LARGE","SCHOOL","DEEP","ANGEL" };
+    for (int r = 0; r < SP_ROWS && (start + r) < nActive; r++) {
+        int idx = activeFish[start + r];
+        const Fish& f = fish[idx];
+        int ry = SP_Y + 28 + r * SP_ROW_H;
+        int sv = fishSellValue(idx);
+        char line[40];
+        snprintf(line, sizeof(line), "#%-2d %s  %dc", idx, tNames[(int)f.type < 4 ? (int)f.type : 0], sv);
+        canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
+        canvas.setCursor(SP_X + 8, ry + 4); canvas.print(line);
+        // SELL button
+        canvas.fillRect(SP_X + 270, ry, 52, 28, 0x3A1800UL);
+        canvas.drawRect(SP_X + 270, ry, 52, 28, 0xD9A441UL);
+        canvas.setTextColor(0xFFD23FUL);
+        canvas.setCursor(SP_X + 279, ry + 10); canvas.print("SELL");
+    }
+    // Page navigation (prev/next) if needed
+    if (pages > 1) {
+        int nav_y = SP_Y + SP_H - 30;
+        if (shopSellPage > 0) {
+            canvas.fillRect(SP_X + 8, nav_y, 40, 22, 0x1A3355UL);
+            canvas.drawRect(SP_X + 8, nav_y, 40, 22, 0x4488CCUL);
+            canvas.setTextSize(2); canvas.setTextColor(0xFFFFFFUL);
+            canvas.setCursor(SP_X + 16, nav_y + 4); canvas.print("<");
+        }
+        char pg[8]; snprintf(pg, sizeof(pg), "%d/%d", shopSellPage + 1, pages);
+        canvas.setTextSize(1); canvas.setTextColor(0x778899UL);
+        canvas.setCursor(SP_X + 58, nav_y + 7); canvas.print(pg);
+        if (shopSellPage < pages - 1) {
+            canvas.fillRect(SP_X + 102, nav_y, 40, 22, 0x1A3355UL);
+            canvas.drawRect(SP_X + 102, nav_y, 40, 22, 0x4488CCUL);
+            canvas.setTextSize(2); canvas.setTextColor(0xFFFFFFUL);
+            canvas.setCursor(SP_X + 110, nav_y + 4); canvas.print(">");
+        }
+    }
+
+    // ── Right panel: buy items ────────────────────────────────────────────────
+    int rx = SP_MID + 8;
+    // Food
+    {
+        bool can = gameCoins >= FOOD_PRICE;
+        canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
+        canvas.setCursor(rx, SP_Y + 34); canvas.print("FISH FOOD");
+        canvas.setTextColor(can ? 0xFFD23FUL : 0x556677UL);
+        char pbuf[8]; snprintf(pbuf, sizeof(pbuf), "%dc", FOOD_PRICE);
+        canvas.setCursor(rx + 100, SP_Y + 34); canvas.print(pbuf);
+        canvas.fillRect(rx + 148, SP_Y + 27, 56, 26, can ? 0x115522UL : 0x0C1A2AUL);
+        canvas.drawRect(rx + 148, SP_Y + 27, 56, 26, can ? 0x33CC66UL : 0x223344UL);
+        canvas.setTextColor(can ? 0xCCFFDDUL : 0x334455UL);
+        canvas.setCursor(rx + 157, SP_Y + 34); canvas.print("BUY");
+    }
+    // Snail
+    {
+        bool can = gameCoins >= SNAIL_PRICE && numSnails < MAX_SNAILS;
+        canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
+        canvas.setCursor(rx, SP_Y + 70); canvas.print("SNAIL");
+        canvas.setTextColor(can ? 0xFFD23FUL : 0x556677UL);
+        char pbuf[8]; snprintf(pbuf, sizeof(pbuf), "%dc", SNAIL_PRICE);
+        canvas.setCursor(rx + 100, SP_Y + 70); canvas.print(pbuf);
+        canvas.fillRect(rx + 148, SP_Y + 63, 56, 26, can ? 0x115522UL : 0x0C1A2AUL);
+        canvas.drawRect(rx + 148, SP_Y + 63, 56, 26, can ? 0x33CC66UL : 0x223344UL);
+        canvas.setTextColor(can ? 0xCCFFDDUL : 0x334455UL);
+        canvas.setCursor(rx + 157, SP_Y + 70); canvas.print("BUY");
+    }
+    // Fish types
+    const char* fNames[4] = { "LARGE FISH","SCHOOL FISH","DEEP FISH","ANGELFISH" };
+    int cnts[4] = { numPair, numSchool, numSchool2, numAngel };
+    int mxs[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
+    for (int row = 0; row < 4; row++) {
+        int fy = SP_Y + 108 + row * 44;
+        bool can = cnts[row] < mxs[row] && gameCoins >= FISH_PRICE[row];
+        canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
+        canvas.setCursor(rx, fy + 8); canvas.print(fNames[row]);
+        canvas.setTextColor(can ? 0xFFD23FUL : 0x556677UL);
+        char pbuf[8]; snprintf(pbuf, sizeof(pbuf), "%dc", FISH_PRICE[row]);
+        canvas.setCursor(rx + 100, fy + 8); canvas.print(pbuf);
+        canvas.fillRect(rx + 148, fy, 56, 28, can ? 0x3A2E0AUL : 0x0C1A2AUL);
+        canvas.drawRect(rx + 148, fy, 56, 28, can ? 0xFFD23FUL : 0x223344UL);
+        canvas.setTextColor(can ? 0x111111UL : 0x334455UL);
+        canvas.setCursor(rx + 157, fy + 10); canvas.print("BUY");
+    }
+    // Close button
+    canvas.fillRect(SP_X + SP_W - 36, SP_Y + 4, 28, 20, 0x1A0000UL);
+    canvas.drawRect(SP_X + SP_W - 36, SP_Y + 4, 28, 20, 0xCC4444UL);
+    canvas.setTextSize(1); canvas.setTextColor(0xFF8888UL);
+    canvas.setCursor(SP_X + SP_W - 27, SP_Y + 10); canvas.print("X");
+    // Wallet reminder
+    char wallet[20]; snprintf(wallet, sizeof(wallet), "Coins: %d", gameCoins);
+    canvas.setTextSize(1); canvas.setTextColor(0xFFD23FUL);
+    canvas.setCursor(SP_X + 10, SP_Y + SP_H - 18); canvas.print(wallet);
+}
+
 void drawMenu() {
     if (!menuOpen) return;
     canvas.fillRect(MENU_X,   MENU_Y,   MENU_W,   MENU_H,   0x0A1E3CUL);
@@ -1851,6 +2052,66 @@ void loop() {
             else if (tx >= PM_BTN2_X && tx < (uint16_t)(PM_BTN2_X + PM_BTN_W) &&
                      ty >= PM_BTN_Y  && ty < (uint16_t)(PM_BTN_Y + PM_BTN_H))
                 telemetryResolveKeepLocal();
+        } else if (gameMode == MODE_CAREER &&
+                   tx >= SBTN_X && tx < (uint16_t)(SBTN_X + SBTN_W) &&
+                   ty >= SBTN_Y && ty < (uint16_t)(SBTN_Y + SBTN_H)) {
+            shopOpen = !shopOpen; menuOpen = false;
+        } else if (shopOpen) {
+            // Close button (top-right corner of panel)
+            if (tx >= (uint16_t)(SP_X + SP_W - 36) && tx < (uint16_t)(SP_X + SP_W - 8) &&
+                ty >= (uint16_t)(SP_Y + 4)          && ty < (uint16_t)(SP_Y + 24)) {
+                shopOpen = false;
+            } else {
+                // ── Left panel: sell buttons ──────────────────────────────────────
+                int activeFish[MAX_FISH]; int nActive = 0;
+                for (int i = 0; i < MAX_FISH; i++) if (isFishActive(i)) activeFish[nActive++] = i;
+                int start = shopSellPage * SP_ROWS;
+                for (int r = 0; r < SP_ROWS && (start + r) < nActive; r++) {
+                    int ry = SP_Y + 28 + r * SP_ROW_H;
+                    if (tx >= (uint16_t)(SP_X + 270) && tx < (uint16_t)(SP_X + 322) &&
+                        ty >= (uint16_t)ry            && ty < (uint16_t)(ry + 28)) {
+                        sellFishSlot(activeFish[start + r]);
+                        break;
+                    }
+                }
+                // Page prev/next
+                {
+                    int pages = (nActive + SP_ROWS - 1) / SP_ROWS;
+                    int nav_y = SP_Y + SP_H - 30;
+                    if (shopSellPage > 0 &&
+                        tx >= (uint16_t)(SP_X + 8) && tx < (uint16_t)(SP_X + 48) &&
+                        ty >= (uint16_t)nav_y       && ty < (uint16_t)(nav_y + 22))
+                        shopSellPage--;
+                    if (shopSellPage < pages - 1 &&
+                        tx >= (uint16_t)(SP_X + 102) && tx < (uint16_t)(SP_X + 142) &&
+                        ty >= (uint16_t)nav_y         && ty < (uint16_t)(nav_y + 22))
+                        shopSellPage++;
+                }
+                // ── Right panel: buy buttons ──────────────────────────────────────
+                int rx = SP_MID + 8;
+                // Food buy
+                if (tx >= (uint16_t)(rx + 148) && tx < (uint16_t)(rx + 204) &&
+                    ty >= (uint16_t)(SP_Y + 27) && ty < (uint16_t)(SP_Y + 53))
+                    if (gameCoins >= FOOD_PRICE) { gameCoins -= FOOD_PRICE; gameFood++; }
+                // Snail buy
+                if (tx >= (uint16_t)(rx + 148) && tx < (uint16_t)(rx + 204) &&
+                    ty >= (uint16_t)(SP_Y + 63) && ty < (uint16_t)(SP_Y + 89))
+                    if (gameCoins >= SNAIL_PRICE && numSnails < MAX_SNAILS) { gameCoins -= SNAIL_PRICE; addSnail(); }
+                // Fish buy
+                const FishType T[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
+                int cnts[4] = { numPair, numSchool, numSchool2, numAngel };
+                int mxs[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
+                for (int row = 0; row < 4; row++) {
+                    int fy = SP_Y + 108 + row * 44;
+                    if (tx >= (uint16_t)(rx + 148) && tx < (uint16_t)(rx + 204) &&
+                        ty >= (uint16_t)fy          && ty < (uint16_t)(fy + 28)) {
+                        if (cnts[row] < mxs[row] && gameCoins >= FISH_PRICE[row]) {
+                            gameCoins -= FISH_PRICE[row]; addFish(T[row]);
+                        }
+                        break;
+                    }
+                }
+            }
         } else if (tx >= HBTN_X && tx < (uint16_t)(HBTN_X + HBTN_W) &&
             ty >= HBTN_Y && ty < (uint16_t)(HBTN_Y + HBTN_H)) {
             menuOpen = !menuOpen;
@@ -1981,8 +2242,10 @@ void loop() {
     drawTankRim();
     drawGameHud();             // mode + wallet readout
     drawTelemetryStatus();
+    drawCartButton();
     drawMenuButton();
     drawMenu();
+    drawShopPanel();
     drawProfileModal();
     canvas.pushSprite(0, 0);
 }

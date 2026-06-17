@@ -31,6 +31,7 @@ function freshPending() {
     buyFish: [0, 0, 0, 0],     // !BUYFISH:<type>:<count>  shop purchase (device deducts)
     buyFood: 0,                // !BUYFOOD:<count>
     buySnail: 0,               // !BUYSNAIL:<count>  coin-collector snail
+    sellFish: [],              // !SELLFISH:<id,id,…>  sell fish by slot id (device removes + credits coins)
   };
 }
 
@@ -407,6 +408,7 @@ function getNamesText(id) {
   }
   if (p.buyFood > 0) { lines.push(`!BUYFOOD:${p.buyFood}`); p.buyFood = 0; }
   if (p.buySnail > 0) { lines.push(`!BUYSNAIL:${p.buySnail}`); p.buySnail = 0; }
+  if (p.sellFish && p.sellFish.length > 0) { lines.push(`!SELLFISH:${p.sellFish.join(',')}`); p.sellFish = []; }
   // Only nudge the device's on-screen conflict prompt when we're not already
   // telling it to restore (restore resolves the conflict on its own).
   if (!restoreEmitted && entry.conflict) lines.push('!CONFLICT');
@@ -466,6 +468,14 @@ function queueControl(id, cmd) {
       const itemId = Number(cmd.itemId);
       if (!Number.isInteger(itemId) || itemId < 0) return { ok: false, error: 'bad_item_id' };
       if (!p.catch.includes(itemId)) p.catch.push(itemId);
+      break;
+    }
+    case 'sell': {
+      const fishId = Number(cmd.fishId);
+      if (!Number.isInteger(fishId) || fishId < 0 || fishId > 200)
+        return { ok: false, error: 'bad_fish_id' };
+      if (!(p.sellFish || (p.sellFish = [])).includes(fishId)) p.sellFish.push(fishId);
+      entry.adoptNext = true;  // census changes after sale
       break;
     }
     case 'buy': {

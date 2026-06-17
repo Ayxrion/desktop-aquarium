@@ -791,6 +791,23 @@ main {
   font-size: 12px;
   color: #b9f6f1;
 }
+.pf-sell-row {
+  margin-top: 14px;
+  display: flex;
+  justify-content: flex-end;
+}
+.pf-sell-btn {
+  background: linear-gradient(135deg, #7a3400, #c05000);
+  color: #ffe9b0;
+  border: 1px solid #c06000;
+  border-radius: 8px;
+  padding: 7px 18px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter 0.15s;
+}
+.pf-sell-btn:hover { filter: brightness(1.15); }
 .pf-desc {
   font-size: 14px;
   line-height: 1.5;
