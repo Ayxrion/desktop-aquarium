@@ -20,13 +20,13 @@ const FRAMES_PER_PUBLISH = 1000 / FRAME_MS; // 20 frames per 1Hz publish
 const DAMP = 0.85;
 
 // ── Career economy tuning (sim-frame units; currency is rare → full-day idle) ──
-const GROW_FRAMES = 800;                      // juvenile→mature growth span
+const GROW_FRAMES = 3600;                     // juvenile→mature growth span (~3 min @20fps) — slow growth
 const COIN_BASE_CD = 3000;                    // frames between a fish's coin rolls (~2.5 min)
 const SHELL_BASE_CD = 2600;                   // frames between shell spawns
 const WANDER_BASE_CD = 7000;                  // wandering fish are very rare (~6 min)
-const COIN_GRAV = 0.2;                         // coin sink acceleration (px/frame²) — gentle, water-like
-const COIN_MAX_VY = 2.8;                        // terminal sink speed so coins drift down, not plummet
-const COIN_REST = 80;                          // frames a landed coin sits before vanishing (~4s)
+const COIN_GRAV = 0.1;                         // coin sink acceleration (px/frame²) — very gentle, water-like
+const COIN_MAX_VY = 1.4;                        // terminal sink speed so coins drift slowly down, not plummet
+const COIN_REST = 240;                         // frames a landed coin sits before vanishing (~12s)
 const SHELL_TTL = 220;                         // shells linger on the sand a bit longer
 const SAND_Y = H - 20;                         // resting line on the sea floor
 const FISH_PRICE = [10, 30, 45, 60];          // shop fish price (coins) by type
@@ -226,15 +226,14 @@ function stepCareer() {
     });
     wanderCD = WANDER_BASE_CD * rnd(0.7, 1.3);
   }
-  for (const w of wanderers) {
-    w.x += w.vx * dt * 0.5;
-    w.y += Math.sin(tick * 0.05 + w.bob) * 0.6;
-  }
-  wanderers = wanderers.filter((w) => w.x > -40 && w.x < W + 40);
-
-  // Advance coin sink + snail collection across the publish's frames so coins
-  // visibly fall, rest ~1s on the sand, then vanish — grab them fast (or let a snail).
+  // Advance coin sink + wanderer drift + snail collection per frame (matching the
+  // device's updateCareer) so the web can dead-reckon them between publishes.
   for (let s = 0; s < dt; s++) {
+    const frameTick = tick - dt + s + 1;   // device tick at this sub-frame
+    for (const w of wanderers) {
+      w.x += w.vx;
+      w.y += Math.sin(frameTick * 0.05 + w.bob) * 0.6;
+    }
     for (const it of loot) {
       if (it.kind === 'coin' && !it.landed) {
         it.vy += COIN_GRAV;
@@ -264,6 +263,7 @@ function stepCareer() {
     }
     loot = loot.filter((it) => it.ttl > 0);
   }
+  wanderers = wanderers.filter((w) => w.x > -40 && w.x < W + 40);
 }
 
 // ── Apply control directives returned in the POST response ──
@@ -322,7 +322,7 @@ function applyDirectives(text) {
 }
 
 function scaleOf(f) {
-  return clamp(0.45 + 0.55 * Math.min(1, f.age / GROW_FRAMES), 0.45, 1.0);
+  return clamp(0.22 + 0.78 * Math.min(1, f.age / GROW_FRAMES), 0.22, 1.0);
 }
 
 async function step() {
@@ -345,20 +345,27 @@ async function step() {
     game: { mode, coins, shells, food, luck: parseFloat(tankLuck().toFixed(3)) },
     fish: fish.map((f) => ({
       id: f.id,
-      x: Math.round(f.x), y: Math.round(f.y), z: f.z,
+      x: parseFloat(f.x.toFixed(1)), y: parseFloat(f.y.toFixed(1)), z: f.z,
       vx: parseFloat(f.vx.toFixed(2)), vy: parseFloat(f.vy.toFixed(2)), vz: 0,
-      tx: Math.round(f.tx), ty: Math.round(f.ty), wander_cd: f.wanderCD,
+      tx: parseFloat(f.tx.toFixed(1)), ty: parseFloat(f.ty.toFixed(1)), tz: f.z,
+      wander_cd: f.wanderCD,
       type: f.type, facing_right: f.facing_right, color: f.color,
       going_for_food: f.going_for_food, chasing: f.chasing,
       age: Math.round(f.age), scale: parseFloat(scaleOf(f).toFixed(3)),
       xp: f.xp, fish_luck: parseFloat(f.fishLuck.toFixed(3)),
     })),
     wanderers: wanderers.map((w) => ({
-      id: w.id, x: Math.round(w.x), y: Math.round(w.y),
+      id: w.id, x: parseFloat(w.x.toFixed(1)), y: parseFloat(w.y.toFixed(1)),
+      vx: parseFloat(w.vx.toFixed(3)), bob: parseFloat(w.bob.toFixed(3)),
       type: w.type, color: w.color, facing_right: w.facing_right,
     })),
-    loot: loot.map((it) => ({ id: it.id, kind: it.kind, x: Math.round(it.x), y: Math.round(it.y), tier: it.tier })),
-    snails: snails.map((s) => ({ x: Math.round(s.x), facing_right: s.facing_right })),
+    loot: loot.map((it) => ({
+      id: it.id, kind: it.kind, x: parseFloat(it.x.toFixed(1)), y: parseFloat(it.y.toFixed(1)),
+      vy: parseFloat((it.vy || 0).toFixed(2)), landed: !!it.landed, ttl: it.ttl, tier: it.tier,
+    })),
+    snails: snails.map((s) => ({
+      x: parseFloat(s.x.toFixed(1)), spd: parseFloat(s.spd.toFixed(3)), facing_right: s.facing_right,
+    })),
     flakes: [],
     snail: { x: Math.round((tick * 0.5) % W), facing_right: true },
     starfish: { x: 80, facing_right: false },

@@ -321,13 +321,13 @@ int gameCoins = 0, gameShells = 0, gameFood = 0;
 
 // Currency is valuable → coins/wanderers are rare (full-day idle pace). Cadences
 // are in 20fps sim-frames: 3000 ≈ 2.5 min, 7000 ≈ 6 min.
-#define GROW_FRAMES   800
+#define GROW_FRAMES   3600              // juvenile→mature growth span (~3 min @20fps) — slow growth
 #define COIN_BASE_CD  3000
 #define SHELL_BASE_CD 2600
 #define WANDER_BASE_CD 7000
-#define COIN_GRAV     0.2f              // coin sink acceleration (px/frame²) — gentle, water-like
-#define COIN_MAX_VY   2.8f              // terminal sink speed so coins drift down, not plummet
-#define COIN_REST     80                // frames a landed coin sits before vanishing (~4s)
+#define COIN_GRAV     0.1f              // coin sink acceleration (px/frame²) — very gentle, water-like
+#define COIN_MAX_VY   1.4f              // terminal sink speed so coins drift slowly down, not plummet
+#define COIN_REST     240               // frames a landed coin sits before vanishing (~12s)
 #define SHELL_TTL     220
 #define SAND_Y        (SCREEN_H - 20)
 static const int FISH_PRICE[4] = { 10, 30, 45, 60 };
@@ -502,7 +502,7 @@ int fishHW(const Fish& f) {
 // Career helpers (read by telemetry.h's JSON builder).
 float fishScale(const Fish& f) {
   float g = f.age / (float)GROW_FRAMES; if (g > 1) g = 1; if (g < 0) g = 0;
-  return 0.45f + 0.55f * g;
+  return 0.22f + 0.78f * g;   // hatch tiny (0.22) and grow to full size
 }
 float tankLuck() {
   int n = 0; float s = 0;
@@ -956,29 +956,34 @@ void setup() {
     fgHornworts[i].segs  = (uint8_t)(6 + random(0, 6));
   }
 
-  // Pair fish — indices 0 and 1
-  initFishEntry(0,  150, 210, 0.20f,  3.0f, FISH_PAIR, 1);
-  initFishEntry(1,  330, 240, 0.35f, -2.5f, FISH_PAIR, 0);
+  // Seed the default tank only when the server had no saved profile to restore.
+  // A restored profile already rebuilt the fish (with their persisted ages), so
+  // re-seeding here would reset every fish back to age 0.
+  if (!telemetryProfileLoaded) {
+    // Pair fish — indices 0 and 1
+    initFishEntry(0,  150, 210, 0.20f,  3.0f, FISH_PAIR, 1);
+    initFishEntry(1,  330, 240, 0.35f, -2.5f, FISH_PAIR, 0);
 
-  // School 1 — starts at index MAX_PAIR
-  for (int i = 0; i < numSchool; i++) {
-    initFishEntry(MAX_PAIR + i,
-                  frandr(380, 620), frandr(130, 330), frandr(0.40f, 0.75f),
-                  frandr(-2.0f, 2.0f), FISH_SCHOOL, -1);
-  }
+    // School 1 — starts at index MAX_PAIR
+    for (int i = 0; i < numSchool; i++) {
+      initFishEntry(MAX_PAIR + i,
+                    frandr(380, 620), frandr(130, 330), frandr(0.40f, 0.75f),
+                    frandr(-2.0f, 2.0f), FISH_SCHOOL, -1);
+    }
 
-  // School 2 — starts at index MAX_PAIR + MAX_SCHOOL
-  for (int i = 0; i < numSchool2; i++) {
-    initFishEntry(MAX_PAIR + MAX_SCHOOL + i,
-                  frandr(150, 400), frandr(150, 350), frandr(0.40f, 0.75f),
-                  frandr(-2.0f, 2.0f), FISH_SCHOOL2, -1);
-  }
+    // School 2 — starts at index MAX_PAIR + MAX_SCHOOL
+    for (int i = 0; i < numSchool2; i++) {
+      initFishEntry(MAX_PAIR + MAX_SCHOOL + i,
+                    frandr(150, 400), frandr(150, 350), frandr(0.40f, 0.75f),
+                    frandr(-2.0f, 2.0f), FISH_SCHOOL2, -1);
+    }
 
-  // Angelfish — starts at index MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2
-  for (int i = 0; i < numAngel; i++) {
-    initFishEntry(MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + i,
-                  frandr(200, 600), frandr(90, 320), frandr(0.25f, 0.65f),
-                  frandr(-3.0f, 3.0f), FISH_ANGEL, -1);
+    // Angelfish — starts at index MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2
+    for (int i = 0; i < numAngel; i++) {
+      initFishEntry(MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + i,
+                    frandr(200, 600), frandr(90, 320), frandr(0.25f, 0.65f),
+                    frandr(-3.0f, 3.0f), FISH_ANGEL, -1);
+    }
   }
 
   for (int i = 0; i < MAX_FLAKES; i++) flakes[i].active = false;

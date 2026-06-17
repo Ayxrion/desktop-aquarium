@@ -22,6 +22,8 @@ body {
   font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
   background: var(--bg);
   color: var(--text);
+  /* The dashboard is sized to fit the viewport; the page itself never scrolls. */
+  overflow: hidden;
 }
 
 header {
@@ -99,10 +101,17 @@ main {
 .dot.live { background: var(--live); box-shadow: 0 0 6px var(--live); }
 .dot.stale { background: var(--stale); }
 
-#view { flex: 1; padding: 18px; overflow-y: auto; }
+#view { flex: 1; padding: 18px; min-width: 0; overflow: hidden; display: flex; }
 .hint { color: var(--muted); font-size: 14px; }
 
-#view-content { max-width: 1280px; margin: 0 auto; }
+#view-content {
+  max-width: 1280px;
+  width: 100%;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;        /* let the tank row shrink to fit the viewport */
+}
 /* The empty-state hint isn't a flex column; keep it simple. */
 #view-empty { margin: auto; }
 
@@ -148,13 +157,19 @@ main {
 .tank-row {
   display: flex;
   gap: 18px;
-  align-items: flex-start;
+  align-items: stretch;     /* info column matches the canvas height, scrolls within */
+  flex: 1 1 auto;
+  min-height: 0;
 }
 .tank-info {
   width: 312px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  overflow-y: auto;         /* fold everything in here; scroll internally, not the page */
+  padding-right: 2px;
 }
 .tank-info .stats {
   grid-template-columns: 1fr 1fr;
@@ -162,8 +177,12 @@ main {
 }
 
 @media (max-width: 980px) {
-  .tank-row { flex-direction: column; }
-  .tank-info { width: 100%; }
+  body { overflow: auto; }
+  #view { overflow: visible; display: block; }
+  #view-content { min-height: 0; display: block; }
+  .tank-row { flex-direction: column; min-height: 0; }
+  .tank-wrap { align-self: stretch; max-width: none; }
+  .tank-info { width: 100%; min-height: 0; overflow: visible; }
   .tank-info .stats { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
 }
 
@@ -179,43 +198,69 @@ main {
 
 .tank-wrap {
   flex: 1 1 auto;
+  align-self: flex-start;   /* keep the canvas aspect ratio; only the info column stretches */
   width: auto;
   min-width: 0;
   /* Lock the wrapper to the canvas aspect ratio so the canvas fills it
      completely — no letterbox bars, no border around the visual. */
   aspect-ratio: 800 / 480;
+  /* Cap the width so the derived height can't exceed the viewport → no page
+     scroll, while keeping the canvas full-size and undistorted. */
+  max-width: calc((100vh - 178px) * 800 / 480);
+  position: relative;       /* anchor for the floating legend overlay */
   border-radius: 12px;
   overflow: hidden;
   box-shadow: 0 8px 30px #0009;
 }
 #tank { width: 100%; height: 100%; display: block; image-rendering: auto; }
 
+/* Fish legend floats over the bottom of the tank instead of taking page space. */
+.legend-overlay {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 44%;
+  padding: 6px 10px 10px;
+  background: linear-gradient(to top,
+              rgba(5, 11, 19, 0.93),
+              rgba(5, 11, 19, 0.78) 65%,
+              rgba(5, 11, 19, 0));
+  backdrop-filter: blur(2px);
+}
+
 .legend-head {
   display: flex;
   align-items: baseline;
   gap: 10px;
-  margin: 18px 0 8px;
+  margin: 0;
 }
-.legend-head h3 { margin: 0; font-size: 15px; }
+.legend-head h3 { margin: 0; font-size: 15px; color: #eaf4ff; }
 .legend-head .hint { font-size: 12px; }
 
 .legend {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: 8px;
+  overflow-y: auto;
+  min-height: 0;
+  padding-right: 2px;
 }
 .legend-row {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 7px 10px;
-  background: var(--panel);
+  padding: 5px 9px;
+  background: rgba(22, 34, 50, 0.82);
   border-radius: 8px;
   border-left: 4px solid transparent;
   cursor: pointer;
   user-select: none;
 }
-.legend-row:hover { background: var(--panel-2); }
+.legend-row:hover { background: rgba(36, 54, 78, 0.9); }
 .legend-row.active {
   background: #24486a;
   box-shadow: 0 0 0 1px var(--accent) inset;
@@ -704,8 +749,10 @@ main {
 }
 
 /* Responsive: stack the sidebar above the view on narrow screens. Fitting
-   everything in a phone viewport isn't practical, so allow normal scrolling. */
+   everything in a phone viewport isn't practical, so allow normal scrolling and
+   drop the legend back into normal flow below the tank. */
 @media (max-width: 720px) {
+  body { overflow: auto; }
   main { flex-direction: column; height: auto; }
   #sidebar {
     width: 100%;
@@ -713,5 +760,17 @@ main {
     border-right: none;
     border-bottom: 1px solid #0006;
   }
-  #view { padding: 14px; }
+  #view { padding: 14px; overflow: visible; display: block; }
+  #view-content { min-height: 0; display: block; }
+  .tank-row { flex-direction: column; min-height: 0; }
+  .tank-wrap { max-width: none; align-self: stretch; }
+  .legend-overlay {
+    position: static;
+    max-height: none;
+    background: var(--panel);
+    border-radius: 10px;
+    margin-top: 12px;
+    padding: 10px;
+    backdrop-filter: none;
+  }
 }

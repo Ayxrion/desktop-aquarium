@@ -238,16 +238,16 @@ static std::string _buildTelemetryJson() {
         if (!isFishActive(i)) continue;
         Fish& f = fish[i];
         snprintf(tmp, sizeof(tmp),
-            "%s{\"id\":%d,\"x\":%d,\"y\":%d,\"z\":%.3f,"
+            "%s{\"id\":%d,\"x\":%.1f,\"y\":%.1f,\"z\":%.3f,"
             "\"vx\":%.2f,\"vy\":%.2f,\"vz\":%.4f,"
-            "\"tx\":%d,\"ty\":%d,\"wander_cd\":%d,"
+            "\"tx\":%.1f,\"ty\":%.1f,\"tz\":%.3f,\"wander_cd\":%d,"
             "\"type\":%d,\"facing_right\":%s,"
             "\"color\":%u,\"going_for_food\":%s,\"chasing\":%s,"
             "\"age\":%d,\"scale\":%.3f,\"xp\":%d,\"fish_luck\":%.3f}",
             first ? "" : ",", i,
-            (int)f.x, (int)f.y, f.z,
+            f.x, f.y, f.z,
             f.vx, f.vy, f.vz,
-            (int)f.tx, (int)f.ty, (int)f.wanderCD,
+            f.tx, f.ty, f.tz, (int)f.wanderCD,
             (int)f.type,
             f.facingRight ? "true" : "false",
             (unsigned)fishColor(i),
@@ -319,8 +319,10 @@ static std::string _buildTelemetryJson() {
     for (int i = 0; i < MAX_WANDER; i++) {
         if (!wanderers[i].active) continue;
         snprintf(tmp, sizeof(tmp),
-            "%s{\"id\":%u,\"x\":%d,\"y\":%d,\"type\":%d,\"color\":%u,\"facing_right\":%s}",
-            first ? "" : ",", wanderers[i].id, (int)wanderers[i].x, (int)wanderers[i].y,
+            "%s{\"id\":%u,\"x\":%.1f,\"y\":%.1f,\"vx\":%.3f,\"bob\":%.3f,"
+            "\"type\":%d,\"color\":%u,\"facing_right\":%s}",
+            first ? "" : ",", wanderers[i].id, wanderers[i].x, wanderers[i].y,
+            wanderers[i].vx, wanderers[i].bob,
             wanderers[i].type, (unsigned)wanderers[i].color,
             wanderers[i].facingRight ? "true" : "false");
         j += tmp; first = false;
@@ -330,17 +332,20 @@ static std::string _buildTelemetryJson() {
     for (int i = 0; i < MAX_LOOT; i++) {
         if (!loot[i].active) continue;
         snprintf(tmp, sizeof(tmp),
-            "%s{\"id\":%u,\"kind\":\"%s\",\"x\":%d,\"y\":%d,\"tier\":%d}",
+            "%s{\"id\":%u,\"kind\":\"%s\",\"x\":%.1f,\"y\":%.1f,\"vy\":%.2f,"
+            "\"landed\":%s,\"ttl\":%d,\"tier\":%d}",
             first ? "" : ",", loot[i].id, loot[i].kind == 0 ? "coin" : "shell",
-            (int)loot[i].x, (int)loot[i].y, loot[i].tier);
+            loot[i].x, loot[i].y, loot[i].vy,
+            loot[i].landed ? "true" : "false", loot[i].ttl, loot[i].tier);
         j += tmp; first = false;
     }
     j += "],\"snails\":[";
     first = true;
     for (int i = 0; i < numSnails; i++) {
         if (!coinSnails[i].active) continue;
-        snprintf(tmp, sizeof(tmp), "%s{\"x\":%d,\"facing_right\":%s}",
-            first ? "" : ",", (int)coinSnails[i].x, coinSnails[i].facingRight ? "true" : "false");
+        snprintf(tmp, sizeof(tmp), "%s{\"x\":%.1f,\"spd\":%.3f,\"facing_right\":%s}",
+            first ? "" : ",", coinSnails[i].x, coinSnails[i].spd,
+            coinSnails[i].facingRight ? "true" : "false");
         j += tmp; first = false;
     }
     j += "]}";
@@ -594,6 +599,10 @@ static void _applyBootstrap(const char* json) {
     printf("Telemetry: aquarium state restored from server\n");
 }
 
+// Set true once a server profile has been adopted, so setup() can skip its
+// default tank seeding (which would otherwise reset restored fish ages to 0).
+bool telemetryProfileLoaded = false;
+
 // Rebuild the local tank to the server's saved profile (counts + plant layout),
 // then overlay the saved fish positions/names. Main-thread only (mutates fish[]
 // and the plant arrays that the render loop reads).
@@ -671,6 +680,7 @@ static void _applyServerProfile(const char* json) {
 
     // 3) Overlay the saved fish positions + names.
     _applyBootstrap(json);
+    telemetryProfileLoaded = true;
     printf("Telemetry: rebuilt tank to server profile (pair %d school %d/%d angel %d)\n",
            numPair, numSchool, numSchool2, numAngel);
 }

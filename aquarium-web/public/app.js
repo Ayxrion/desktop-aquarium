@@ -92,6 +92,10 @@ function fishName(f) { return f.name || `${FISH_TYPE_NAMES[f.type] || 'Fish'} #$
 // ─── Physics simulation (mirrors device updateFish, aquarium.ino / main.cpp) ──
 const _DAMP  = 0.85;
 const _DAMPZ = 0.88;
+const SAND_Y = SCREEN_H - 20;   // floor coins rest on (matches device SAND_Y)
+const COIN_GRAV = 0.1;          // coin sink acceleration (px/frame²) — matches device
+const COIN_MAX_VY = 1.4;        // terminal sink speed (px/frame) — matches device
+const COIN_REST_FRAMES = 240;   // frames a landed coin sits before vanishing (~12s)
 
 // Smooth motion for the non-fish movers (boat, snail, starfish, flakes). Their
 // telemetry carries no velocity, so we dead-reckon: derive each one's velocity
@@ -170,32 +174,38 @@ function _extrapolateSnapshot(snap, elapsedMs) {
   }));
 
   for (let frame = 0; frame < n; frame++) {
-    // Recompute centroids from current positions each frame (matches device)
+    // Recompute centroids (x, y AND z) from current positions each frame.
     const cent = [0, 1, 2, 3].map((t) => {
       const g = st.filter((f) => f.type === t);
-      if (!g.length) return { x: 0, y: 0 };
+      if (!g.length) return { x: 0, y: 0, z: 0 };
       return { x: g.reduce((s, f) => s + f.x, 0) / g.length,
-               y: g.reduce((s, f) => s + f.y, 0) / g.length };
+               y: g.reduce((s, f) => s + f.y, 0) / g.length,
+               z: g.reduce((s, f) => s + f.z, 0) / g.length };
     });
 
     for (const f of st) {
-      f.wcd--;
       const t = f.type;
-      const seeking = f.going_for_food || f.wcd >= 0;
       const chasing = f.chasing && t === 0;
       const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
       const maxV    = f.going_for_food ? 8.0 : (chasing || t === 3) ? 7.0 : 5.5;
 
-      let ax = (seeking ? (f.tx - f.x) * seekStr : 0);
-      let ay = (seeking ? (f.ty - f.y) * seekStr : 0);
+      // Always seek the last-known target. The device keeps seeking (tx,ty,tz)
+      // every frame in its wander branch; it only swaps to a fresh *random*
+      // target when wander_cd expires — which we can't predict — so holding the
+      // last target is far closer than the old "stop seeking" behaviour.
+      let ax = (f.tx - f.x) * seekStr;
+      let ay = (f.ty - f.y) * seekStr;
+      let az = (f.tz - f.z) * 0.010;
 
-      // Cohesion toward group centroid (school / angel)
+      // Cohesion toward group centroid (school / angel), x, y and z.
       if (t === 1 || t === 2) {
         ax += (cent[t].x - f.x) * 0.010;
         ay += (cent[t].y - f.y) * 0.007;
+        az += (cent[t].z - f.z) * 0.007;
       } else if (t === 3) {
         ax += (cent[3].x - f.x) * 0.012;
         ay += (cent[3].y - f.y) * 0.010;
+        az += (cent[3].z - f.z) * 0.008;
       }
 
       // Pairwise separation within school / angel groups
@@ -210,28 +220,33 @@ function _extrapolateSnapshot(snap, elapsedMs) {
         }
       }
 
-      // Boundary springs
+      // Boundary springs (x, y, z)
       ax += _bound(f.x, 30, SCREEN_W - 30, 0.30);
       ay += _bound(f.y, TANK_TOP + 20, SCREEN_H - 80, 0.30);
+      az += _bound(f.z, 0.0, 0.75, 0.08);
 
       f.vx = Math.max(-maxV,     Math.min(maxV,     f.vx + ax)) * _DAMP;
       f.vy = Math.max(-maxV*0.5, Math.min(maxV*0.5, f.vy + ay)) * _DAMP;
+      f.vz = Math.max(-0.015,    Math.min(0.015,    f.vz + az)) * _DAMPZ;
       f.x  = Math.max(5,         Math.min(SCREEN_W - 5,  f.x + f.vx));
       f.y  = Math.max(TANK_TOP+5,Math.min(SCREEN_H - 60, f.y + f.vy));
+      f.z  = Math.max(0,         Math.min(0.78,          f.z + f.vz));
       if (Math.abs(f.vx) > 0.4) f.facing_right = f.vx > 0;
     }
   }
 
   fishOut = snap.fish.map((orig, i) => ({
     ...orig,
-    x: Math.round(st[i].x), y: Math.round(st[i].y), z: st[i].z,
-    vx: st[i].vx, vy: st[i].vy,
+    x: st[i].x, y: st[i].y, z: st[i].z,
+    vx: st[i].vx, vy: st[i].vy, vz: st[i].vz,
     facing_right: st[i].facing_right,
   }));
   }
 
-  // Dead-reckon the non-fish movers from their observed velocity.
   const out = { ...snap, fish: fishOut };
+  _predictCareerMovers(out, snap, n);
+
+  // Dead-reckon the non-fish decorative movers from their observed velocity.
   if (snap.snail && typeof snap.snail.x === 'number')
     out.snail = { ...snap.snail, x: snap.snail.x + _sceneVel.snail * e };
   if (snap.starfish && typeof snap.starfish.x === 'number')
@@ -247,6 +262,61 @@ function _extrapolateSnapshot(snap, elapsedMs) {
     }));
   }
   return out;
+}
+
+// Career loot/wanderers/collector-snails move deterministically on the device,
+// so we can step them forward exactly (no blend needed). Mirrors updateCareer():
+//   coins:     vy += 0.2 (cap 2.8), sink to SAND_Y, then ttl counts down
+//   wanderers: x += vx,  y += sin((tick+f)*0.05 + bob) * 0.6
+//   snails:    patrol at spd, bouncing between x=55 and x=SCREEN_W-55
+function _predictCareerMovers(out, snap, n) {
+  if (n <= 0) return;
+  const baseTick = typeof snap.tick === 'number' ? snap.tick : 0;
+
+  if (Array.isArray(snap.loot)) {
+    out.loot = snap.loot.map((it) => {
+      let y = it.y, vy = it.vy || 0;
+      let landed = !!it.landed;
+      let ttl = typeof it.ttl === 'number' ? it.ttl : 9999;
+      const isCoin = it.kind === 'coin';
+      for (let f = 0; f < n; f++) {
+        if (isCoin && !landed) {
+          vy = Math.min(vy + COIN_GRAV, COIN_MAX_VY);
+          y += vy;
+          if (y >= SAND_Y) { y = SAND_Y; landed = true; ttl = COIN_REST_FRAMES; }
+        } else {
+          ttl -= 1;
+        }
+      }
+      return { ...it, y, vy, landed, ttl };
+    }).filter((it) => it.ttl > 0);
+  }
+
+  if (Array.isArray(snap.wanderers)) {
+    out.wanderers = snap.wanderers.map((w) => {
+      let x = w.x, y = w.y;
+      const vx = w.vx || 0, bob = w.bob || 0;
+      for (let f = 0; f < n; f++) {
+        x += vx;
+        y += Math.sin((baseTick + f) * 0.05 + bob) * 0.6;
+      }
+      return { ...w, x, y };
+    }).filter((w) => w.x > -40 && w.x < SCREEN_W + 40);
+  }
+
+  if (Array.isArray(snap.snails)) {
+    out.snails = snap.snails.map((s) => {
+      let x = s.x;
+      let dir = s.facing_right ? 1 : -1;
+      const spd = s.spd || 0;
+      for (let f = 0; f < n; f++) {
+        x += dir * spd;
+        if (x > SCREEN_W - 55) { x = SCREEN_W - 55; dir = -1; }
+        if (x < 55)            { x = 55;            dir = 1; }
+      }
+      return { ...s, x, facing_right: dir > 0 };
+    });
+  }
 }
 
 // ─── Faithful scene renderer (mirrors device aquarium.ino / main.cpp) ─────────
@@ -267,8 +337,8 @@ function projX(x, z) { const cx = SCREEN_W * 0.5;  return cx + (x - cx) * (1 - z
 function projY(y, z) { const cy = SCREEN_H * 0.45; return cy + (y - cy) * (1 - z * 0.38); }
 
 // Career growth: fish hatch small and grow to full size (no death). `scale` is
-// 0.45..1.0; absent (creative / pre-game telemetry) → full size.
-function growth(f) { return typeof f.scale === 'number' ? clamp(f.scale, 0.3, 1) : 1; }
+// 0.22..1.0 (matches device fishScale); absent (creative / pre-game) → full size.
+function growth(f) { return typeof f.scale === 'number' ? clamp(f.scale, 0.2, 1) : 1; }
 
 // Fish text size / half-width (device units) — drives shadow + glyph scale.
 function fishTS(f)    { return (f.type || 0) === 0 ? (f.z < 0.5 ? 3 : 2) : (f.z < 0.6 ? 2 : 1); }

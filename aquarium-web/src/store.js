@@ -41,7 +41,12 @@ const MAX_NAME_LEN = 24;
 
 // Physics simulation matching the device (aquarium.ino / main.cpp).
 const _DAMP  = 0.85;
+const _DAMPZ = 0.88;
 const TANK_TOP = 72, SCREEN_W = 800, SCREEN_H = 480;
+const SAND_Y = SCREEN_H - 20;     // floor coins rest on (matches device SAND_Y)
+const COIN_GRAV = 0.1;            // coin sink acceleration (px/frame²) — matches device
+const COIN_MAX_VY = 1.4;          // terminal sink speed (px/frame) — matches device
+const COIN_REST_FRAMES = 240;     // frames a landed coin sits before vanishing (~12s)
 
 function _bound(v, lo, hi, k) {
   if (v < lo) return (lo - v) * k;
@@ -50,64 +55,109 @@ function _bound(v, lo, hi, k) {
 }
 
 // Joint simulation: all fish stepped together each frame so school centroids
-// and pairwise separation forces match the device's updateFish() exactly.
+// and pairwise separation forces match the device's updateFish() exactly. Loot,
+// wanderers and collector snails are stepped deterministically too (updateCareer).
 function _extrapolateSnapshot(snapshot, elapsedMs) {
-  const fish = snapshot && Array.isArray(snapshot.fish) ? snapshot.fish : [];
-  if (!fish.length) return snapshot;
+  if (!snapshot) return snapshot;
   const fm = snapshot.frame_ms || 50;
-  const n  = Math.round(Math.min(elapsedMs, 3000) / fm);
+  const n  = Math.round(Math.min(Math.max(elapsedMs, 0), 3000) / fm);
   if (n === 0) return snapshot;
 
-  const st = fish.map((f) => ({
-    id: f.id, type: f.type || 0,
-    x: f.x, y: f.y, z: f.z || 0,
-    vx: f.vx || 0, vy: f.vy || 0, vz: f.vz || 0,
-    tx: f.tx ?? f.x, ty: f.ty ?? f.y,
-    wcd: typeof f.wander_cd === 'number' ? f.wander_cd : n,
-    chasing: !!f.chasing, going_for_food: !!f.going_for_food,
-  }));
+  const fish = Array.isArray(snapshot.fish) ? snapshot.fish : [];
+  let fishOut = fish;
+  if (fish.length) {
+    const st = fish.map((f) => ({
+      id: f.id, type: f.type || 0,
+      x: f.x, y: f.y, z: f.z || 0,
+      vx: f.vx || 0, vy: f.vy || 0, vz: f.vz || 0,
+      tx: f.tx ?? f.x, ty: f.ty ?? f.y, tz: typeof f.tz === 'number' ? f.tz : (f.z || 0),
+      chasing: !!f.chasing, going_for_food: !!f.going_for_food,
+    }));
 
-  for (let frame = 0; frame < n; frame++) {
-    const cent = [0, 1, 2, 3].map((t) => {
-      const g = st.filter((f) => f.type === t);
-      if (!g.length) return { x: 0, y: 0 };
-      return { x: g.reduce((s, f) => s + f.x, 0) / g.length,
-               y: g.reduce((s, f) => s + f.y, 0) / g.length };
-    });
-    for (const f of st) {
-      f.wcd--;
-      const t = f.type, chasing = f.chasing && t === 0;
-      const seeking = f.going_for_food || f.wcd >= 0;
-      const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
-      const maxV    = f.going_for_food ? 8.0 : (chasing || t === 3) ? 7.0 : 5.5;
-      let ax = seeking ? (f.tx - f.x) * seekStr : 0;
-      let ay = seeking ? (f.ty - f.y) * seekStr : 0;
-      if (t === 1 || t === 2) {
-        ax += (cent[t].x - f.x) * 0.010; ay += (cent[t].y - f.y) * 0.007;
-      } else if (t === 3) {
-        ax += (cent[3].x - f.x) * 0.012; ay += (cent[3].y - f.y) * 0.010;
-      }
-      const sepR2 = t === 3 ? 60*60 : 80*80, sepK = t === 3 ? 7 : 8;
-      if (t === 1 || t === 2 || t === 3) {
-        for (const o of st) {
-          if (o === f || o.type !== t) continue;
-          const dx = f.x - o.x, dy = f.y - o.y, d2 = dx*dx + dy*dy;
-          if (d2 < sepR2 && d2 > 0.01) { const inv = sepK/d2; ax += dx*inv; ay += dy*inv; }
+    for (let frame = 0; frame < n; frame++) {
+      const cent = [0, 1, 2, 3].map((t) => {
+        const g = st.filter((f) => f.type === t);
+        if (!g.length) return { x: 0, y: 0, z: 0 };
+        return { x: g.reduce((s, f) => s + f.x, 0) / g.length,
+                 y: g.reduce((s, f) => s + f.y, 0) / g.length,
+                 z: g.reduce((s, f) => s + f.z, 0) / g.length };
+      });
+      for (const f of st) {
+        const t = f.type, chasing = f.chasing && t === 0;
+        const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
+        const maxV    = f.going_for_food ? 8.0 : (chasing || t === 3) ? 7.0 : 5.5;
+        // Always seek the last-known target (device keeps seeking; only the
+        // unpredictable random retarget on wander_cd expiry is skipped).
+        let ax = (f.tx - f.x) * seekStr;
+        let ay = (f.ty - f.y) * seekStr;
+        let az = (f.tz - f.z) * 0.010;
+        if (t === 1 || t === 2) {
+          ax += (cent[t].x - f.x) * 0.010; ay += (cent[t].y - f.y) * 0.007; az += (cent[t].z - f.z) * 0.007;
+        } else if (t === 3) {
+          ax += (cent[3].x - f.x) * 0.012; ay += (cent[3].y - f.y) * 0.010; az += (cent[3].z - f.z) * 0.008;
         }
+        const sepR2 = t === 3 ? 60*60 : 80*80, sepK = t === 3 ? 7 : 8;
+        if (t === 1 || t === 2 || t === 3) {
+          for (const o of st) {
+            if (o === f || o.type !== t) continue;
+            const dx = f.x - o.x, dy = f.y - o.y, d2 = dx*dx + dy*dy;
+            if (d2 < sepR2 && d2 > 0.01) { const inv = sepK/d2; ax += dx*inv; ay += dy*inv; }
+          }
+        }
+        ax += _bound(f.x, 30, SCREEN_W - 30, 0.30);
+        ay += _bound(f.y, TANK_TOP + 20, SCREEN_H - 80, 0.30);
+        az += _bound(f.z, 0.0, 0.75, 0.08);
+        f.vx = Math.max(-maxV,     Math.min(maxV,     f.vx + ax)) * _DAMP;
+        f.vy = Math.max(-maxV*0.5, Math.min(maxV*0.5, f.vy + ay)) * _DAMP;
+        f.vz = Math.max(-0.015,    Math.min(0.015,    f.vz + az)) * _DAMPZ;
+        f.x  = Math.max(5,          Math.min(SCREEN_W - 5,  f.x + f.vx));
+        f.y  = Math.max(TANK_TOP+5, Math.min(SCREEN_H - 60, f.y + f.vy));
+        f.z  = Math.max(0,          Math.min(0.78,          f.z + f.vz));
       }
-      ax += _bound(f.x, 30, SCREEN_W - 30, 0.30);
-      ay += _bound(f.y, TANK_TOP + 20, SCREEN_H - 80, 0.30);
-      f.vx = Math.max(-maxV,     Math.min(maxV,     f.vx + ax)) * _DAMP;
-      f.vy = Math.max(-maxV*0.5, Math.min(maxV*0.5, f.vy + ay)) * _DAMP;
-      f.x  = Math.max(5,          Math.min(SCREEN_W - 5,  f.x + f.vx));
-      f.y  = Math.max(TANK_TOP+5, Math.min(SCREEN_H - 60, f.y + f.vy));
     }
+
+    fishOut = fish.map((orig, i) => ({
+      ...orig, x: st[i].x, y: st[i].y, z: st[i].z,
+      vx: st[i].vx, vy: st[i].vy, vz: st[i].vz,
+    }));
   }
 
-  const fishOut = fish.map((orig, i) => ({
-    ...orig, x: Math.round(st[i].x), y: Math.round(st[i].y), z: st[i].z,
-  }));
-  return { ...snapshot, fish: fishOut };
+  const out = { ...snapshot, fish: fishOut };
+  const baseTick = typeof snapshot.tick === 'number' ? snapshot.tick : 0;
+
+  if (Array.isArray(snapshot.loot)) {
+    out.loot = snapshot.loot.map((it) => {
+      let y = it.y, vy = it.vy || 0, landed = !!it.landed;
+      let ttl = typeof it.ttl === 'number' ? it.ttl : 9999;
+      const isCoin = it.kind === 'coin';
+      for (let f = 0; f < n; f++) {
+        if (isCoin && !landed) {
+          vy = Math.min(vy + COIN_GRAV, COIN_MAX_VY); y += vy;
+          if (y >= SAND_Y) { y = SAND_Y; landed = true; ttl = COIN_REST_FRAMES; }
+        } else { ttl -= 1; }
+      }
+      return { ...it, y, vy, landed, ttl };
+    }).filter((it) => it.ttl > 0);
+  }
+  if (Array.isArray(snapshot.wanderers)) {
+    out.wanderers = snapshot.wanderers.map((w) => {
+      let x = w.x, y = w.y; const vx = w.vx || 0, bob = w.bob || 0;
+      for (let f = 0; f < n; f++) { x += vx; y += Math.sin((baseTick + f) * 0.05 + bob) * 0.6; }
+      return { ...w, x, y };
+    }).filter((w) => w.x > -40 && w.x < SCREEN_W + 40);
+  }
+  if (Array.isArray(snapshot.snails)) {
+    out.snails = snapshot.snails.map((s) => {
+      let x = s.x, dir = s.facing_right ? 1 : -1; const spd = s.spd || 0;
+      for (let f = 0; f < n; f++) {
+        x += dir * spd;
+        if (x > SCREEN_W - 55) { x = SCREEN_W - 55; dir = -1; }
+        if (x < 55)            { x = 55;            dir = 1; }
+      }
+      return { ...s, x, facing_right: dir > 0 };
+    });
+  }
+  return out;
 }
 
 /**

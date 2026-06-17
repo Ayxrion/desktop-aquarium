@@ -231,16 +231,16 @@ static int _buildTelemetryJson() {
         if (!isFishActive(i)) continue;
         Fish& f = fish[i];
         o = _tAppend(o,
-            "%s{\"id\":%d,\"x\":%d,\"y\":%d,\"z\":%.3f,"
+            "%s{\"id\":%d,\"x\":%.1f,\"y\":%.1f,\"z\":%.3f,"
             "\"vx\":%.2f,\"vy\":%.2f,\"vz\":%.4f,"
-            "\"tx\":%d,\"ty\":%d,\"wander_cd\":%d,"
+            "\"tx\":%.1f,\"ty\":%.1f,\"tz\":%.3f,\"wander_cd\":%d,"
             "\"type\":%d,\"facing_right\":%s,"
             "\"color\":%u,\"going_for_food\":%s,\"chasing\":%s,"
             "\"age\":%d,\"scale\":%.3f,\"xp\":%d,\"fish_luck\":%.3f}",
             first ? "" : ",", i,
-            (int)f.x, (int)f.y, f.z,
+            f.x, f.y, f.z,
             f.vx, f.vy, f.vz,
-            (int)f.tx, (int)f.ty, (int)f.wanderCD,
+            f.tx, f.ty, f.tz, (int)f.wanderCD,
             (int)f.type,
             f.facingRight ? "true" : "false",
             (unsigned)fishColor(i),
@@ -299,8 +299,10 @@ static int _buildTelemetryJson() {
     for (int i = 0; i < MAX_WANDER; i++) {
         if (!wanderers[i].active) continue;
         o = _tAppend(o,
-            "%s{\"id\":%u,\"x\":%d,\"y\":%d,\"type\":%d,\"color\":%u,\"facing_right\":%s}",
-            firstW ? "" : ",", wanderers[i].id, (int)wanderers[i].x, (int)wanderers[i].y,
+            "%s{\"id\":%u,\"x\":%.1f,\"y\":%.1f,\"vx\":%.3f,\"bob\":%.3f,"
+            "\"type\":%d,\"color\":%u,\"facing_right\":%s}",
+            firstW ? "" : ",", wanderers[i].id, wanderers[i].x, wanderers[i].y,
+            wanderers[i].vx, wanderers[i].bob,
             wanderers[i].type, (unsigned)wanderers[i].color,
             wanderers[i].facingRight ? "true" : "false");
         firstW = false;
@@ -309,17 +311,21 @@ static int _buildTelemetryJson() {
     bool firstL = true;
     for (int i = 0; i < MAX_LOOT; i++) {
         if (!loot[i].active) continue;
-        o = _tAppend(o, "%s{\"id\":%u,\"kind\":\"%s\",\"x\":%d,\"y\":%d,\"tier\":%d}",
+        o = _tAppend(o,
+            "%s{\"id\":%u,\"kind\":\"%s\",\"x\":%.1f,\"y\":%.1f,\"vy\":%.2f,"
+            "\"landed\":%s,\"ttl\":%d,\"tier\":%d}",
             firstL ? "" : ",", loot[i].id, loot[i].kind == 0 ? "coin" : "shell",
-            (int)loot[i].x, (int)loot[i].y, loot[i].tier);
+            loot[i].x, loot[i].y, loot[i].vy,
+            loot[i].landed ? "true" : "false", loot[i].ttl, loot[i].tier);
         firstL = false;
     }
     o = _tAppend(o, "],\"snails\":[");
     bool firstS = true;
     for (int i = 0; i < numSnails; i++) {
         if (!coinSnails[i].active) continue;
-        o = _tAppend(o, "%s{\"x\":%d,\"facing_right\":%s}",
-            firstS ? "" : ",", (int)coinSnails[i].x, coinSnails[i].facingRight ? "true" : "false");
+        o = _tAppend(o, "%s{\"x\":%.1f,\"spd\":%.3f,\"facing_right\":%s}",
+            firstS ? "" : ",", coinSnails[i].x, coinSnails[i].spd,
+            coinSnails[i].facingRight ? "true" : "false");
         firstS = false;
     }
     o = _tAppend(o, "]}");
@@ -504,10 +510,15 @@ static void _applyServerProfileDoc(DynamicJsonDocument& doc) {
                   numPair, numSchool, numSchool2, numAngel);
 }
 
+// Set true once a server profile has been adopted, so setup() can skip its
+// default tank seeding (which would otherwise reset restored fish ages to 0).
+bool telemetryProfileLoaded = false;
+
 static bool telemetryFetchAndApplyProfile() {
     DynamicJsonDocument doc(12288);
     if (!_fetchBootstrapDoc(doc) || !doc["exists"].as<bool>()) return false;
     _applyServerProfileDoc(doc);
+    telemetryProfileLoaded = true;
     return true;
 }
 
