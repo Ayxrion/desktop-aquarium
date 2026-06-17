@@ -1,54 +1,58 @@
 'use strict';
 
-// Always-on runner for VIRTUAL devices. Each virtual device (store.kind === 'virtual')
-// that has an assigned aquarium gets an in-process simulator (src/sim.js) ticked ~1Hz:
-// step() → telemetry snapshot → store.upsert() (exactly as a physical device would POST),
-// then the device's queued control directives are drained + applied. Physical Pi/ESP
-// devices run their own firmware and are NOT ticked here (they self-register via telemetry).
+// Always-on web simulator for aquariums that have NO live physical device.
 //
-// State reconciles against the store every tick, so create/assign/reassign/delete done
-// through the store are picked up automatically (no tight coupling):
-//   - new virtual device with an aquarium  → spawn a sim (seeded from that aquarium's
-//     saved snapshot, so it RESUMES rather than resets — also covers server restart)
-//   - device's aquariumId changed          → rebind the sim to the new aquarium
-//   - device unassigned / removed          → drop its sim
+// Every aquarium the store knows about (dashboard-created or persisted) is run by an
+// in-process simulator (src/sim.js) ticked ~1Hz: step() → telemetry snapshot →
+// store.upsert() (exactly as a physical device would POST), then the aquarium's queued
+// control directives are drained + applied. The simulated snapshot carries NO device_id,
+// so it never registers as a device — it's purely the server's "visual web simulation".
+//
+// Whenever a real Pi/ESP is live on an aquarium (it self-registers via telemetry and
+// store.hasLiveDevice() is true), the simulator steps aside and lets the hardware drive.
+//
+// State reconciles against the store every tick, so create/rename/delete and a device
+// coming online/offline are all picked up automatically (no tight coupling):
+//   - new aquarium with no live device  → spawn a sim (seeded from its saved snapshot,
+//     so it RESUMES rather than resets — also covers server restart)
+//   - a device comes online for a tank   → drop that tank's sim (hardware takes over)
+//   - aquarium removed                    → drop its sim
 
 const store = require('./store');
 const { createSim } = require('./sim');
 
 const TICK_MS = 1000;
-const sims = new Map(); // deviceId -> { sim, aquariumId }
+const sims = new Map(); // aquariumId -> { sim }
 let timer = null;
 
 function tickOnce() {
-  let virtual;
-  try { virtual = store.listDevices().filter((d) => d.kind === 'virtual'); }
+  let ids;
+  try { ids = store.aquariumIds(); }
   catch { return; }
 
   const seen = new Set();
-  for (const d of virtual) {
-    seen.add(d.id);
-    if (!d.aquariumId) { sims.delete(d.id); continue; } // idle until assigned an aquarium
+  for (const id of ids) {
+    // A live physical device owns this tank → let the hardware drive it.
+    if (store.hasLiveDevice(id)) { sims.delete(id); continue; }
+    seen.add(id);
 
-    let inst = sims.get(d.id);
-    if (!inst || inst.aquariumId !== d.aquariumId) {
-      // (Re)bind to this aquarium, resuming from its persisted state if it exists.
-      const saved = store.get(d.aquariumId);
-      inst = { sim: createSim({ aquariumId: d.aquariumId, restoreSnapshot: saved }), aquariumId: d.aquariumId };
-      sims.set(d.id, inst);
+    let inst = sims.get(id);
+    if (!inst) {
+      // Resume from the aquarium's persisted/last state if it has one.
+      const saved = store.get(id);
+      inst = { sim: createSim({ aquariumId: id, restoreSnapshot: saved }) };
+      sims.set(id, inst);
     }
 
     try {
-      const snap = inst.sim.step();
-      snap.device_id = d.id;
-      snap.device_name = d.name;
+      const snap = inst.sim.step();   // no device_id — this is a server-side web simulation
       store.upsert(snap);
-      inst.sim.applyDirectives(store.getNamesText(d.aquariumId));
+      inst.sim.applyDirectives(store.getNamesText(id));
     } catch (err) {
-      console.warn(`deviceManager: tick failed for ${d.id}: ${err.message}`);
+      console.warn(`deviceManager: sim tick failed for ${id}: ${err.message}`);
     }
   }
-  // Drop sims for devices that were removed or became non-virtual.
+  // Drop sims for aquariums that were removed or taken over by hardware.
   for (const id of [...sims.keys()]) if (!seen.has(id)) sims.delete(id);
 }
 
@@ -56,7 +60,7 @@ function start() {
   if (timer) return;
   timer = setInterval(tickOnce, TICK_MS);
   if (timer.unref) timer.unref();
-  console.log('deviceManager: virtual-device tick loop started');
+  console.log('deviceManager: web-simulation tick loop started');
 }
 function stop() { if (timer) { clearInterval(timer); timer = null; } }
 

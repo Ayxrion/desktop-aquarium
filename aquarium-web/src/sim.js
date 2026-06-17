@@ -21,6 +21,10 @@ const FRAMES_PER_PUBLISH = 1000 / FRAME_MS; // 20 frames per 1Hz publish
 const DAMP = 0.85;
 
 const GROW_FRAMES = 3600;
+// One in-tank "day" in sim frames. At timescale 1 (20 fps) this is a 60-second day,
+// matching the previous real-time clock. The day clock is tick-based so a higher
+// timescale advances it (and every other property) proportionally faster.
+const DAY_FRAMES = 1200;
 const COIN_BASE_CD = 3000;
 const SHELL_BASE_CD = 2600;
 const WANDER_BASE_CD = 7000;
@@ -68,6 +72,7 @@ function createSim(opts) {
   let fish = [], wanderers = [], loot = [], snails = [];
   let weatherOverride = -1;
   let timeMode = 'FAST';
+  let timescale = 1;             // 1..5 — how many sim-seconds advance per ~1s tick (all properties)
   const coinTimers = new Map();
   let shellCD = SHELL_BASE_CD, wanderCD = WANDER_BASE_CD;
   let mealFed = [false, false, false];
@@ -109,7 +114,8 @@ function createSim(opts) {
     mealsToday = 0; overfeedToday = 0; feedSchedInit = false; tankHungry = false;
   }
 
-  function dayProgress() { return ((Date.now() - startMs) / 60000) % 1; }
+  // Tick-based so the day cycle scales with the timescale (not wall-clock).
+  function dayProgress() { return (tick / DAY_FRAMES) % 1; }
   function currentMealSlot() { return clamp(Math.floor(dayProgress() * MEALS_PER_DAY), 0, MEALS_PER_DAY - 1); }
   function evaluateFeedingDay() {
     const missed = mealFed.filter((m) => !m).length;
@@ -189,11 +195,15 @@ function createSim(opts) {
             f.wanderCD = f.chasing ? 30 + Math.random() * 40 : 40 + Math.random() * 50;
           } else if (t === 3) { f.wanderCD = 8 + Math.random() * 20; }
           else { f.wanderCD = 15 + Math.random() * 35; }
-          const cg = cent[t + ':' + f._sub];
-          const cx = cg.x, cy = cg.y;
-          const spread = t === 3 ? 120 : t === 0 ? 0 : 160;
-          f.tx = clamp(cx + (Math.random() * 2 - 1) * spread, 30, W - 30);
-          f.ty = clamp(cy + (Math.random() * 2 - 1) * (t === 3 ? 110 : 90), TOP + 20, H - 80);
+          if (t === 4) {                       // salmon: solitary — roam the tank independently
+            f.tx = rnd(30, W - 30);
+            f.ty = rnd(TOP + 20, H - 80);
+          } else {
+            const cg = cent[t + ':' + f._sub];
+            const spread = t === 3 ? 120 : t === 0 ? 0 : 160;
+            f.tx = clamp(cg.x + (Math.random() * 2 - 1) * spread, 30, W - 30);
+            f.ty = clamp(cg.y + (Math.random() * 2 - 1) * (t === 3 ? 110 : 90), TOP + 20, H - 80);
+          }
         }
         const chasing = t === 0 && f.chasing;
         const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
@@ -366,6 +376,9 @@ function createSim(opts) {
         for (let k = 0; k < (parseInt(n, 10) || 1); k++) removeFish(parseInt(t, 10));
       } else if (line.startsWith('!WEATHER:')) {
         weatherOverride = parseInt(line.slice(9), 10);
+      } else if (line.startsWith('!TIMESCALE:')) {
+        const v = parseInt(line.slice(11), 10);
+        timescale = Number.isFinite(v) ? Math.max(1, Math.min(5, v)) : 1;
       } else if (line.startsWith('!TIME:')) {
         timeMode = line.slice(6) === '1' ? 'FAST' : 'REAL';
       }
@@ -374,7 +387,7 @@ function createSim(opts) {
   }
 
   function snapshot() {
-    const dp = ((Date.now() - startMs) / 60000) % 1;
+    const dp = dayProgress();
     const cond = weatherOverride >= 0 ? weatherOverride : Math.floor((tick / 100) % 7);
     return {
       aquarium_id: aquariumId,
@@ -384,7 +397,7 @@ function createSim(opts) {
       tick,
       screen: { w: W, h: H, tank_top: TOP },
       weather: { condition: cond, name: '', override: weatherOverride >= 0 },
-      time: { day_progress: dp, mode: timeMode },
+      time: { day_progress: dp, mode: timeMode, scale: timescale },
       counts: counts(),
       frame_ms: FRAME_MS,
       game: {
@@ -429,6 +442,8 @@ function createSim(opts) {
     if (!snap) { resetCareer(); return; }
     const g = snap.game || {};
     mode = g.mode === 'creative' ? 'creative' : 'career';
+    const ts = snap.time && Number(snap.time.scale);
+    timescale = ts >= 1 && ts <= 5 ? (ts | 0) : 1;
     coins = g.coins | 0; shells = g.shells | 0; food = g.food | 0;
     mealsToday = g.fed | 0; overfeedToday = g.overfed | 0;
     feedSchedInit = false;
@@ -454,10 +469,13 @@ function createSim(opts) {
   if (opts.restoreSnapshot) restoreFrom(opts.restoreSnapshot);
   else resetCareer();
 
-  // One ~1s tick: advance sim and return the telemetry snapshot.
+  // One ~1s tick: advance the sim and return the telemetry snapshot. The timescale
+  // multiplies how many sim-seconds elapse per tick, so it uniformly speeds up every
+  // property (fish movement + aging, day/weather cycle, coin/shell/wanderer spawning,
+  // snail collection, feeding schedule). timescale 1 = real-time (unchanged).
   function step() {
-    stepPhysics();
-    stepCareer();
+    const n = timescale < 1 ? 1 : timescale > 5 ? 5 : timescale;
+    for (let i = 0; i < n; i++) { stepPhysics(); stepCareer(); }
     return snapshot();
   }
 

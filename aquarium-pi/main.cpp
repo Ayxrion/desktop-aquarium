@@ -345,6 +345,47 @@ void drawPulses() {
     }
 }
 
+// ── Floating action text ────────────────────────────────────────────────────
+// A short label ("Caught Salmon!", "+1 coin", "+5 shells") that rises + fades where a
+// tap (or a dashboard !CATCH) caught a wanderer or collected loot — tells the user what
+// the cursor action actually did.
+#define MAX_FLOATTEXT 5
+struct FloatText { float x, y; int age, life; uint32_t col; char msg[20]; bool active; };
+static FloatText floatTexts[MAX_FLOATTEXT] = {};
+void spawnFloatText(float x, float y, uint32_t col, const char* msg) {
+    int slot = -1, oldest = 0, oldestAge = -1;
+    for (int i = 0; i < MAX_FLOATTEXT; i++) {
+        if (!floatTexts[i].active) { slot = i; break; }
+        if (floatTexts[i].age > oldestAge) { oldestAge = floatTexts[i].age; oldest = i; }
+    }
+    if (slot < 0) slot = oldest;
+    FloatText& f = floatTexts[slot];
+    f.x = x; f.y = y; f.age = 0; f.life = 44;   // ~2.2s @20fps
+    f.col = col; f.active = true;
+    strncpy(f.msg, msg, sizeof(f.msg) - 1); f.msg[sizeof(f.msg) - 1] = '\0';
+}
+void updateFloatTexts() {
+    for (int i = 0; i < MAX_FLOATTEXT; i++)
+        if (floatTexts[i].active && ++floatTexts[i].age >= floatTexts[i].life) floatTexts[i].active = false;
+}
+void drawFloatTexts() {
+    for (int i = 0; i < MAX_FLOATTEXT; i++) {
+        if (!floatTexts[i].active) continue;
+        FloatText& f = floatTexts[i];
+        float t = (float)f.age / (float)f.life;          // 0..1
+        int w = (int)strlen(f.msg) * 6;                  // size-1 glyphs are ~6px wide
+        int x = (int)f.x - w / 2;
+        if (x < 4) x = 4; if (x > SCREEN_W - w - 4) x = SCREEN_W - w - 4;
+        int y = (int)(f.y - 16.0f - t * 22.0f);          // start above the point, drift up
+        if (y < TANK_TOP + 2) y = TANK_TOP + 2;
+        canvas.setTextSize(1);
+        canvas.setTextColor(pulseFade(0x04070AUL, t));   // dark shadow for legibility
+        canvas.setCursor(x + 1, y + 1); canvas.print(f.msg);
+        canvas.setTextColor(pulseFade(f.col, t));        // colored text, fading out
+        canvas.setCursor(x, y); canvas.print(f.msg);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Helpers
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -996,12 +1037,21 @@ void spawnWanderer(float luck) {
         return;
     }
 }
+static const char* FISH_DISPLAY[5] = { "Clownfish", "Guppy", "Piranha", "Angelfish", "Salmon" };
 bool catchWandererById(uint32_t id) {
     static const FishType T[5] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
     for (int i = 0; i < MAX_WANDER; i++)
         if (wanderers[i].active && wanderers[i].id == id) {
-            addFish(T[wanderers[i].type]);
+            int ty = wanderers[i].type < 5 ? wanderers[i].type : 0;
+            int cnts[5] = { numPair, numSchool, numSchool2, numAngel, numSalmon };
+            int mxs[5]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL, MAX_SALMON };
+            bool added = cnts[ty] < mxs[ty];            // false if that species is at capacity
+            addFish(T[ty]);
             spawnPulse(wanderers[i].x, wanderers[i].y, 1, 0x88E0FFUL);
+            char msg[20];
+            if (added) snprintf(msg, sizeof(msg), "Caught %s!", FISH_DISPLAY[ty]);
+            else       snprintf(msg, sizeof(msg), "%s full", FISH_DISPLAY[ty]);
+            spawnFloatText(wanderers[i].x, wanderers[i].y, added ? 0x88E0FFUL : 0xFF8866UL, msg);
             wanderers[i].active = false; return true;
         }
     return false;
@@ -1011,8 +1061,11 @@ bool collectLootById(uint32_t id) {
         if (loot[i].active && loot[i].id == id) {
             uint32_t pc = loot[i].kind == 0 ? 0xFFD23FUL
                 : (loot[i].tier == 2 ? 0xFFD23FUL : loot[i].tier == 1 ? 0xFF9EC4UL : 0xE7C9A0UL);
-            if (loot[i].kind == 0) gameCoins++; else gameShells += SHELL_VALUE[loot[i].tier];
+            char msg[20];
+            if (loot[i].kind == 0) { gameCoins++; snprintf(msg, sizeof(msg), "+1 coin"); }
+            else { int v = SHELL_VALUE[loot[i].tier]; gameShells += v; snprintf(msg, sizeof(msg), "+%d shell%s", v, v == 1 ? "" : "s"); }
             spawnPulse(loot[i].x, loot[i].y, 1, pc);
+            spawnFloatText(loot[i].x, loot[i].y, pc, msg);
             loot[i].active = false; return true;
         }
     return false;
@@ -1382,10 +1435,16 @@ void updateFish() {
                     f.tx = constrain(sc2x + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
                     f.ty = constrain(sc2y + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
                     f.tz = constrain(sc2z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
-                } else {
+                } else if (f.type == FISH_ANGEL) {
                     f.tx = constrain(sacx + frandr(-120, 120), 30.0f, (float)(SCREEN_W - 30));
                     f.ty = constrain(sacy + frandr(-110, 110), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
                     f.tz = constrain(sacz + frandr(-0.18f, 0.18f), 0.05f, 0.72f);
+                } else {
+                    // Salmon (school size 0) + any solitary type: roam the whole tank
+                    // independently — no group centroid, so they don't shoal.
+                    f.tx = frandr(30.0f, (float)(SCREEN_W - 30));
+                    f.ty = frandr((float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+                    f.tz = constrain(f.tz + frandr(-0.12f, 0.12f), 0.05f, 0.72f);
                 }
             }
 
@@ -2394,6 +2453,7 @@ void loop() {
     updateCareer();            // age fish + spawn coins/shells/wanderers (career only)
     updateFoodBubbles();       // float/spawn "feed me" bubbles while hungry
     updatePulses();            // advance tap/collect feedback rings
+    updateFloatTexts();        // advance floating action labels
 
     drawBackground();
     drawWeatherSky();
@@ -2413,6 +2473,7 @@ void loop() {
     drawWanderers();           // wandering fish with catch halo
     drawFoodBubbles();         // "feed me" thought bubbles above hungry fish
     drawPulses();              // tap ripples + collect bursts (over entities, under rim)
+    drawFloatTexts();          // "Caught Salmon!" / "+1 coin" action feedback
     drawTankRim();
     drawGameHud();             // mode + wallet readout
     drawTelemetryStatus();

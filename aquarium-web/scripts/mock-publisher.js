@@ -211,11 +211,15 @@ function stepPhysics() {
           f.wanderCD = f.chasing ? 30 + Math.random() * 40 : 40 + Math.random() * 50;
         } else if (t === 3) { f.wanderCD = 8 + Math.random() * 20; }
         else { f.wanderCD = 15 + Math.random() * 35; }
-        const cg = cent[t + ':' + f._sub];
-        const cx = cg.x, cy = cg.y;
-        const spread = t === 3 ? 120 : t === 0 ? 0 : 160;
-        f.tx = clamp(cx + (Math.random() * 2 - 1) * spread, 30, W - 30);
-        f.ty = clamp(cy + (Math.random() * 2 - 1) * (t === 3 ? 110 : 90), TOP + 20, H - 80);
+        if (t === 4) {                         // salmon: solitary — roam the tank independently
+          f.tx = rnd(30, W - 30);
+          f.ty = rnd(TOP + 20, H - 80);
+        } else {
+          const cg = cent[t + ':' + f._sub];
+          const spread = t === 3 ? 120 : t === 0 ? 0 : 160;
+          f.tx = clamp(cg.x + (Math.random() * 2 - 1) * spread, 30, W - 30);
+          f.ty = clamp(cg.y + (Math.random() * 2 - 1) * (t === 3 ? 110 : 90), TOP + 20, H - 80);
+        }
       }
       const chasing = t === 0 && f.chasing;
       const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
@@ -415,6 +419,10 @@ async function step() {
   const cond = weatherOverride >= 0 ? weatherOverride : Math.floor((tick / 100) % 7);
   const snapshot = {
     aquarium_id: aquariumId,
+    // Self-register as an external device so the server treats this publisher as live
+    // hardware and its built-in web simulator defers (no double-driving the same tank).
+    device_id: 'mock-' + aquariumId,
+    device_name: 'Mock publisher (' + aquariumId + ')',
     platform: 'mock',
     fw_version: '1.5.5',
     uptime_ms: Date.now() - startMs,

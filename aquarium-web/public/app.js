@@ -1010,7 +1010,6 @@ const els = {
   newAquarium: document.getElementById('new-aquarium'),
   deviceList: document.getElementById('device-list'),
   deviceEmpty: document.getElementById('device-empty'),
-  newDevice: document.getElementById('new-device'),
   viewEmpty: document.getElementById('view-empty'),
   viewContent: document.getElementById('view-content'),
   stats: document.getElementById('stats'),
@@ -1029,6 +1028,7 @@ const els = {
   controls: document.getElementById('controls'),
   ctrlWeather: document.getElementById('ctrl-weather'),
   ctrlTime: document.getElementById('ctrl-time'),
+  ctrlTimeVal: document.getElementById('ctrl-time-val'),
   ctrlFish: document.getElementById('ctrl-fish'),
   ctrlFeed: document.getElementById('ctrl-feed'),
   ctrlPending: document.getElementById('ctrl-pending'),
@@ -1056,6 +1056,13 @@ const els = {
   profile: document.getElementById('entity-profile'),
   profileBody: document.getElementById('profile-body'),
   profileClose: document.getElementById('profile-close'),
+  dialog: document.getElementById('app-dialog'),
+  dialogForm: document.getElementById('dialog-form'),
+  dialogTitle: document.getElementById('dialog-title'),
+  dialogMessage: document.getElementById('dialog-message'),
+  dialogInput: document.getElementById('dialog-input'),
+  dialogOk: document.getElementById('dialog-ok'),
+  dialogCancel: document.getElementById('dialog-cancel'),
 };
 const ctx = els.canvas.getContext('2d');
 
@@ -1065,6 +1072,61 @@ const FISH_BASE_SELL = [6, 3, 22, 30];    // base sell value; school cheap to pr
 const FOOD_PRICE = 5;
 const SNAIL_PRICE = 50;
 const MAX_SNAILS = 6;
+
+// ─── Modal dialog (replaces native prompt/confirm) ───────────────────────────
+// A single reusable modal handles both name entry (input mode) and yes/no confirms.
+// openDialog() resolves to the typed string (input mode) / true (confirm mode) on OK,
+// or null on cancel/escape/backdrop. Convenience wrappers: promptDialog / confirmDialog.
+let _dialogState = null; // { resolve, input } while a dialog is open
+
+function _closeDialog(result) {
+  if (!_dialogState) return;
+  const { resolve } = _dialogState;
+  _dialogState = null;
+  els.dialog.hidden = true;
+  document.removeEventListener('keydown', _dialogKeydown, true);
+  resolve(result);
+}
+function _dialogKeydown(e) {
+  if (e.key === 'Escape') { e.preventDefault(); _closeDialog(null); }
+}
+function openDialog(opts = {}) {
+  if (_dialogState) _closeDialog(null); // a new dialog supersedes any open one
+  return new Promise((resolve) => {
+    _dialogState = { resolve, input: !!opts.input };
+    els.dialogTitle.textContent = opts.title || '';
+    if (opts.message) { els.dialogMessage.textContent = opts.message; els.dialogMessage.hidden = false; }
+    else els.dialogMessage.hidden = true;
+    if (opts.input) {
+      els.dialogInput.hidden = false;
+      els.dialogInput.value = opts.value || '';
+      els.dialogInput.placeholder = opts.placeholder || '';
+      els.dialogInput.maxLength = 24; // matches server MAX_NAME_LEN
+    } else {
+      els.dialogInput.hidden = true;
+    }
+    els.dialogOk.textContent = opts.okLabel || 'OK';
+    els.dialogCancel.textContent = opts.cancelLabel || 'Cancel';
+    els.dialogOk.classList.toggle('danger', !!opts.danger);
+    els.dialog.hidden = false;
+    document.addEventListener('keydown', _dialogKeydown, true);
+    if (opts.input) { els.dialogInput.focus(); els.dialogInput.select(); }
+    else els.dialogOk.focus();
+  });
+}
+function promptDialog(title, value, opts = {}) {
+  return openDialog({ title, input: true, value, ...opts }).then((r) => (r == null ? null : String(r).trim()));
+}
+function confirmDialog(title, message, opts = {}) {
+  return openDialog({ title, message, ...opts }).then((r) => r === true);
+}
+els.dialogForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  if (!_dialogState) return;
+  _closeDialog(_dialogState.input ? els.dialogInput.value : true);
+});
+els.dialogCancel.addEventListener('click', () => _closeDialog(null));
+els.dialog.addEventListener('mousedown', (e) => { if (e.target === els.dialog) _closeDialog(null); });
 
 // ─── Sidebar / list polling ────────────────────────────────────────────────
 let _aquariums = [];   // latest aquarium list (also used to build device assignment menus)
@@ -1097,16 +1159,20 @@ function renderDevices(devices) {
   for (const d of devices) {
     const li = document.createElement('li');
     li.className = 'dev-row' + (d.online ? '' : ' stale-row');
-    const kindBadge = d.kind === 'virtual' ? 'virtual' : escapeHtml(d.kind || 'device');
+    const kindBadge = escapeHtml(d.kind || 'device'); // physical platform (esp32 / pi / …)
     // Assignment menu: every known aquarium + this device's own (in case it's stale)
-    // + the unassigned option.
+    // + the unassigned option. Lets you point a real device at a different tank.
     const ids = new Set(_aquariums.map((a) => a.aquarium_id));
     if (d.aquariumId) ids.add(d.aquariumId);
     const opts = ['<option value="">— unassigned —</option>'].concat(
-      [...ids].map((id) => `<option value="${escapeHtml(id)}"${id === d.aquariumId ? ' selected' : ''}>${escapeHtml(id)}</option>`)
+      [...ids].map((id) => {
+        const a = _aquariums.find((x) => x.aquarium_id === id);
+        const label = a && a.name ? `${a.name} (${id})` : id;
+        return `<option value="${escapeHtml(id)}"${id === d.aquariumId ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+      })
     ).join('');
     li.innerHTML = `
-      <button class="dev-del" title="Delete this device" aria-label="Delete device">×</button>
+      <button class="dev-del" title="Forget this device" aria-label="Forget device">×</button>
       <div class="dev-name">
         <span class="dot ${d.online ? 'live' : 'stale'}"></span>${escapeHtml(d.name)}
         <span class="dev-kind">${kindBadge}</span>
@@ -1123,8 +1189,10 @@ function renderDevices(devices) {
 }
 
 async function createAquarium() {
-  const name = (window.prompt('Name your new aquarium:', 'My tank') || '').trim();
-  if (name === null) return;
+  const name = await promptDialog('New aquarium', '', {
+    placeholder: 'My tank', okLabel: 'Create',
+  });
+  if (!name) return; // cancelled or empty
   try {
     const res = await fetch('api/aquariums', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1134,18 +1202,6 @@ async function createAquarium() {
     await refreshList();
     if (data.aquariumId) { setRoute(data.aquariumId); select(data.aquariumId); } // jump to the new tank
   } catch { /* refresh will reflect reality */ }
-}
-
-async function createVirtualDevice() {
-  const name = (window.prompt('Name the virtual device:', 'Virtual device') || '').trim();
-  if (!name) return;
-  try {
-    await fetch('api/devices', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, kind: 'virtual' }),
-    });
-  } catch { /* ignore */ }
-  refreshDevices();
 }
 
 async function assignDevice(id, aquariumId) {
@@ -1159,7 +1215,7 @@ async function assignDevice(id, aquariumId) {
 }
 
 async function renameDevice(d) {
-  const name = (window.prompt('Rename device:', d.name) || '').trim();
+  const name = await promptDialog('Rename device', d.name, { okLabel: 'Save' });
   if (!name || name === d.name) return;
   try {
     await fetch('api/devices/' + encodeURIComponent(d.id), {
@@ -1171,7 +1227,10 @@ async function renameDevice(d) {
 }
 
 async function deleteDevice(d) {
-  if (!window.confirm(`Delete device "${d.name}"?\n\nIts aquarium stays saved but stops simulating until reassigned.`)) return;
+  const ok = await confirmDialog('Forget device?',
+    `Forget "${d.name}"? Its aquarium keeps running as a server simulation. The device reappears automatically if the hardware reports in again.`,
+    { okLabel: 'Forget', danger: true });
+  if (!ok) return;
   try { await fetch('api/devices/' + encodeURIComponent(d.id), { method: 'DELETE' }); } catch { /* ignore */ }
   refreshDevices();
 }
@@ -1197,13 +1256,18 @@ function setRoute(id) {
   }
 }
 
-// Forget an aquarium (stale device gone for good, or just decluttering). A live
-// device re-appears on its next telemetry post.
-async function removeAquarium(id, stale) {
-  const msg = `Remove aquarium "${id}"?` + (stale
-    ? '\n\nIt appears to be offline (stale).'
-    : '\n\nIt is still reporting and will reappear on its next update.');
-  if (!window.confirm(msg)) return;
+// Forget an aquarium (delete it permanently, or just declutter). A simulated tank is
+// gone for good; a hardware-backed one re-appears on the device's next telemetry post.
+async function removeAquarium(a) {
+  const id = a.aquarium_id;
+  const label = a.name || id;
+  const msg = (a.device
+    ? 'It is backed by a device and will reappear when the hardware next reports in.'
+    : 'It is simulated on the server and will be permanently removed.');
+  const ok = await confirmDialog('Remove aquarium?', `Remove "${label}"? ${msg}`, {
+    okLabel: 'Remove', danger: true,
+  });
+  if (!ok) return;
   try {
     await fetch('api/aquariums/' + encodeURIComponent(id), { method: 'DELETE' });
   } catch { /* ignore — the list refresh below reflects reality */ }
@@ -1225,16 +1289,21 @@ function renderList(items) {
     const li = document.createElement('li');
     li.className = (a.aquarium_id === selectedId ? 'active' : '') + (a.stale ? ' stale-row' : '');
     const weather = a.weather ? (WEATHER_NAMES[a.weather.condition] || '?') : '—';
+    const title = a.name || a.aquarium_id;
+    // Source badge: a live device drives the tank, otherwise the server web-simulates it.
+    const src = (a.device && a.device.online)
+      ? `<span class="aq-src device" title="Driven by ${escapeHtml(a.device.name)}">📟 ${escapeHtml(a.device.name)}</span>`
+      : `<span class="aq-src sim" title="Simulated on the server">🖥 web sim</span>`;
     li.innerHTML = `
       <button class="aq-del" title="Remove this aquarium" aria-label="Remove aquarium">×</button>
       <div class="aq-name">
-        <span class="dot ${a.stale ? 'stale' : 'live'}"></span>${escapeHtml(a.aquarium_id)}${a.conflict ? '<span class="aq-conflict">⚠ mismatch</span>' : ''}
+        <span class="dot ${a.stale ? 'stale' : 'live'}"></span>${escapeHtml(title)}${a.conflict ? '<span class="aq-conflict">⚠ mismatch</span>' : ''}
       </div>
-      <div class="aq-meta">${escapeHtml(a.platform)} · ${a.fishCount} fish · ${weather}</div>`;
+      <div class="aq-meta">${a.fishCount} fish · ${weather} ${src}</div>`;
     li.addEventListener('click', () => select(a.aquarium_id));
     li.querySelector('.aq-del').addEventListener('click', (e) => {
       e.stopPropagation();
-      removeAquarium(a.aquarium_id, a.stale);
+      removeAquarium(a);
     });
     els.list.appendChild(li);
   }
@@ -1678,8 +1747,8 @@ function resolvePending(snap) {
         if (wv === p.cmd.value) { p.confirmed = true; changed = true; }
         break;
       }
-      case 'time':
-        if (snap.time && snap.time.mode === p.cmd.value) { p.confirmed = true; changed = true; }
+      case 'timescale':
+        if (snap.time && ((snap.time.scale || 1) === p.cmd.value)) { p.confirmed = true; changed = true; }
         break;
       case 'fish': {
         if (p.baseline) {
@@ -1798,12 +1867,11 @@ function renderControls(snap) {
     els.ctrlWeather.value = String(wv);
   }
 
-  // Timescale active button.
-  if (now - _ctrlHold.time > CTRL_HOLD_MS) {
-    const mode = (snap.time && snap.time.mode) || 'REAL';
-    for (const b of els.ctrlTime.querySelectorAll('button')) {
-      b.classList.toggle('active', b.dataset.mode === mode);
-    }
+  // Timescale slider (1–5×). Don't fight the user while they're dragging or just set it.
+  if (now - _ctrlHold.time > CTRL_HOLD_MS && document.activeElement !== els.ctrlTime) {
+    const scale = Math.max(1, Math.min(5, (snap.time && snap.time.scale) || 1));
+    els.ctrlTime.value = String(scale);
+    if (els.ctrlTimeVal) els.ctrlTimeVal.textContent = scale + '×';
   }
 
   // Fish counts + cap-aware enabling.
@@ -1823,13 +1891,15 @@ els.ctrlWeather.addEventListener('change', () => {
   const wLabel = wv === -1 ? 'Auto' : (WEATHER_NAMES[wv] || String(wv));
   sendControl({ type: 'weather', value: wv }, 'Weather set ✓', { label: `Weather: ${wLabel}` });
 });
-els.ctrlTime.addEventListener('click', (e) => {
-  const btn = e.target.closest('button');
-  if (!btn) return;
+// Live label while dragging; commit the directive on release (change).
+els.ctrlTime.addEventListener('input', () => {
   _ctrlHold.time = Date.now();
-  for (const b of els.ctrlTime.querySelectorAll('button')) b.classList.toggle('active', b === btn);
-  const mode = btn.dataset.mode;
-  sendControl({ type: 'time', value: mode }, `Timescale: ${mode} ✓`, { label: `Timescale: ${mode}` });
+  if (els.ctrlTimeVal) els.ctrlTimeVal.textContent = els.ctrlTime.value + '×';
+});
+els.ctrlTime.addEventListener('change', () => {
+  _ctrlHold.time = Date.now();
+  const v = parseInt(els.ctrlTime.value, 10) || 1;
+  sendControl({ type: 'timescale', value: v }, `Timescale: ${v}× ✓`, { label: `Timescale: ${v}×` });
 });
 els.ctrlFeed.addEventListener('click', () =>
   sendControl({ type: 'feed', count: 1 }, 'Fed the fish 🐟', { label: 'Feed ×1' }));
@@ -2143,7 +2213,7 @@ async function sellFish(fishId) {
   const f = snap && snap.fish && snap.fish.find((x) => x.id === fishId);
   if (!f) return;
   const val = fishSellValue(f);
-  if (!confirm(`Sell ${fishName(f)} for ${val} coins?`)) return;
+  if (!(await confirmDialog('Sell fish?', `Sell ${fishName(f)} for ${val} coins?`, { okLabel: 'Sell' }))) return;
   closeProfile();
   await sendControl({ type: 'sell', fishId }, `Sold ${fishName(f)} for ${val} coins`, { label: 'Sell fish' });
 }
@@ -2239,7 +2309,7 @@ els.profile.addEventListener('click', (e) => { if (e.target === els.profile) clo
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeProfile(); });
 
 function drawTitle(s) {
-  els.viewName.textContent = s.aquarium_id || selectedId || '—';
+  els.viewName.textContent = s._name || s.aquarium_id || selectedId || '—';
   const weather = s.weather ? (WEATHER_NAMES[s.weather.condition] || '') : '';
   els.viewSub.textContent = [s.platform, s.fw_version ? 'fw ' + s.fw_version : '', weather]
     .filter(Boolean)
@@ -2507,8 +2577,7 @@ function drawStats(s) {
   const cards = [
     ['Weather', weather, s.weather && s.weather.override ? 'manual override' : 'auto'],
     ['Time of day', clock, (s.time && s.time.mode) || ''],
-    ['Fish', String((c.pair || 0) + (c.school || 0) + (c.school2 || 0) + (c.angel || 0) + (c.salmon || 0)),
-      `clownfish ${c.pair || 0} · guppy ${c.school || 0} · piranha ${c.school2 || 0} · angel ${c.angel || 0} · salmon ${c.salmon || 0}`],
+    ['Fish', String((c.pair || 0) + (c.school || 0) + (c.school2 || 0) + (c.angel || 0) + (c.salmon || 0)), ''],
     ['Platform', s.platform || '—', s.fw_version ? 'fw ' + s.fw_version : ''],
     ['Uptime', s.uptime_ms != null ? formatDuration(s.uptime_ms) : '—', ''],
     ['Last seen', lastSeen, s._stale ? '⚠ stale' : ''],
@@ -2629,7 +2698,6 @@ window.addEventListener('hashchange', () => {
   if (id && id !== selectedId) select(id);
 });
 if (els.newAquarium) els.newAquarium.addEventListener('click', createAquarium);
-if (els.newDevice) els.newDevice.addEventListener('click', createVirtualDevice);
 refreshList(); // first load honours the hash via renderList's default selection
 setInterval(refreshList, 5000);
 startWatchdog();

@@ -17,14 +17,13 @@
     <aside id="sidebar">
       <h2>Aquariums</h2>
       <ul id="aquarium-list"></ul>
-      <p id="empty-hint" class="hint">No aquariums reporting yet.</p>
-      <button id="new-aquarium" class="side-btn" title="Create a new aquarium and run it on a virtual device">+ New aquarium</button>
+      <p id="empty-hint" class="hint">No aquariums yet — create one to simulate it here.</p>
+      <button id="new-aquarium" class="side-btn" title="Create a new aquarium (simulated on the server)">+ New aquarium</button>
 
       <div class="devices-section">
         <h2>Devices</h2>
         <ul id="device-list"></ul>
-        <p id="device-empty" class="hint">No devices yet.</p>
-        <button id="new-device" class="side-btn" title="Create a virtual device (no aquarium until you assign one)">+ New virtual device</button>
+        <p id="device-empty" class="hint">No hardware connected. Aquariums without a device are simulated on the server.</p>
       </div>
 
       <div class="traffic-section">
@@ -122,11 +121,12 @@
                   <option value="6">Foggy</option>
                 </select>
               </div>
-              <div class="ctrl-group">
-                <span class="ctrl-label">Timescale</span>
-                <div class="seg" id="ctrl-time">
-                  <button type="button" data-mode="REAL">Real</button>
-                  <button type="button" data-mode="FAST">Fast</button>
+              <div class="ctrl-group ctrl-time-group">
+                <span class="ctrl-label">Timescale <span id="ctrl-time-val" class="ctrl-time-val">1×</span></span>
+                <input type="range" id="ctrl-time" class="ctrl-slider" min="1" max="5" step="1" value="1"
+                  aria-label="Simulation speed (1× real-time to 5× fast)" />
+                <div class="ctrl-ticks" aria-hidden="true">
+                  <span>1×</span><span>2×</span><span>3×</span><span>4×</span><span>5×</span>
                 </div>
               </div>
               <div class="ctrl-group" id="ctrl-fish-group">
@@ -152,6 +152,20 @@
       <button id="profile-close" class="profile-close" aria-label="Close profile">×</button>
       <div id="profile-body" class="profile-body"></div>
     </div>
+  </div>
+
+  <!-- Reusable modal dialog (replaces native prompt/confirm) for naming + confirms -->
+  <div id="app-dialog" class="app-dialog" hidden>
+    <form id="dialog-form" class="dialog-card">
+      <h3 id="dialog-title" class="dialog-title">Dialog</h3>
+      <p id="dialog-message" class="dialog-message" hidden></p>
+      <input id="dialog-input" class="dialog-input" type="text" hidden
+        autocomplete="off" autocapitalize="off" spellcheck="false" />
+      <div class="dialog-actions">
+        <button id="dialog-cancel" class="dialog-btn cancel" type="button">Cancel</button>
+        <button id="dialog-ok" class="dialog-btn ok" type="submit">OK</button>
+      </div>
+    </form>
   </div>
 
   <!-- Relative src so it works under the prefix -->

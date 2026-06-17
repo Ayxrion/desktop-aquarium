@@ -21,7 +21,8 @@ function freshPending() {
   return {
     restore: false,            // !RESTORE — re-fetch + adopt the server profile
     weather: null,             // !WEATHER:<-1..6>  (null = nothing queued)
-    time: null,                // !TIME:<0|1>       (0 REAL, 1 FAST)
+    time: null,                // !TIME:<0|1>       (0 REAL, 1 FAST) — legacy
+    timescale: null,           // !TIMESCALE:<1..5> (sim speed multiplier; null = nothing queued)
     fishAdd: [0, 0, 0, 0, 0],  // !FISHADD:<type>:<count>  per type 0..4 (incl. salmon)
     fishDel: [0, 0, 0, 0, 0],  // !FISHDEL:<type>:<count>
     feed: 0,                   // !FEED:<count>
@@ -182,22 +183,22 @@ const aquariums = new Map();
 (function _restore() {
   const rows = db.loadAll();
   for (const row of rows) {
-    if (!row.snapshot) continue;
     const entry = {
-      snapshot: row.snapshot,
-      saved: row.snapshot,                  // persisted snapshot is the baseline
-      savedSig: profileSig(row.snapshot),
+      snapshot: row.snapshot || null,
+      saved: row.snapshot || null,          // persisted snapshot is the baseline
+      savedSig: row.snapshot ? profileSig(row.snapshot) : null,
       conflict: null,
       awaitingRestore: false,
       adoptNext: false,
       pending: freshPending(),
       lastSeenMs: row.lastSeenMs,
       createdAt: row.createdAt,
+      name: row.name || null,     // friendly display name (dashboard-assigned)
       names: row.names,           // Map<fishId, name> from DB
       meta: new Map(),
     };
     // Re-seed fish meta from the persisted snapshot so ageMs is meaningful.
-    if (Array.isArray(row.snapshot.fish)) {
+    if (row.snapshot && Array.isArray(row.snapshot.fish)) {
       for (const f of row.snapshot.fish) {
         if (typeof f.id === 'number')
           entry.meta.set(f.id, { firstSeenMs: row.createdAt, lastSeenMs: row.lastSeenMs });
@@ -209,9 +210,10 @@ const aquariums = new Map();
 })();
 
 // ── Devices ────────────────────────────────────────────────────────────────────
-// A device is a first-class entity (virtual = server-simulated, or a physical Pi/ESP
-// that self-registers via telemetry). An aquarium is a standalone saved tank; a device
-// "plays" at most one aquarium at a time (`aquariumId`, null = unassigned).
+// A device is a physical Pi/ESP that self-registers via telemetry. (There are no
+// "virtual" devices any more — any aquarium WITHOUT a live device is run by the
+// server's built-in web simulator; see deviceManager.js.) An aquarium is a standalone
+// saved tank; a device "plays" at most one aquarium at a time (`aquariumId`).
 /** @type {Map<string, {id,name,kind,aquariumId,createdAt,lastSeenMs}>} */
 const devices = new Map();
 let _devSeq = 1;
@@ -230,6 +232,24 @@ function _unassignAquariumFromOthers(aquariumId, exceptId) {
 
 function listDevices() {
   return [...devices.values()].map((d) => ({ ...d, online: !isStale(d.lastSeenMs || 0) }));
+}
+// True when a (physical) device is currently live and bound to this aquarium. The
+// server simulator (deviceManager) defers to a real device whenever this is true.
+function hasLiveDevice(aquariumId) {
+  if (!aquariumId) return false;
+  for (const d of devices.values())
+    if (d.aquariumId === aquariumId && !isStale(d.lastSeenMs || 0)) return true;
+  return false;
+}
+// Device summary (if any) currently bound to an aquarium — live one preferred.
+function deviceForAquarium(aquariumId) {
+  let best = null;
+  for (const d of devices.values()) {
+    if (d.aquariumId !== aquariumId) continue;
+    const online = !isStale(d.lastSeenMs || 0);
+    if (!best || (online && !best.online)) best = { id: d.id, name: d.name, kind: d.kind, online };
+  }
+  return best;
 }
 function getDevice(id) {
   const d = devices.get(id);
@@ -319,6 +339,7 @@ function getOrCreate(id) {
   if (!entry) {
     entry = {
       snapshot: null, lastSeenMs: 0, createdAt: now(),
+      name: null,             // friendly display name (dashboard-assigned)
       names: new Map(), meta: new Map(),
       saved: null,            // source-of-truth snapshot (profile baseline)
       savedSig: null,         // profileSig(saved)
@@ -381,6 +402,7 @@ function enrich(entry) {
     : [];
   return {
     ...s, fish,
+    _name: entry.name || null,
     _lastSeenMs: entry.lastSeenMs,
     _stale: isStale(entry.lastSeenMs),
     _conflict: entry.conflict || null,
@@ -492,6 +514,7 @@ function getNamesText(id) {
   if (p.restore) { lines.push('!RESTORE'); p.restore = false; restoreEmitted = true; }
   if (p.weather !== null) { lines.push(`!WEATHER:${p.weather}`); p.weather = null; }
   if (p.time !== null) { lines.push(`!TIME:${p.time}`); p.time = null; }
+  if (p.timescale !== null) { lines.push(`!TIMESCALE:${p.timescale}`); p.timescale = null; }
   for (let t = 0; t < 5; t++) {
     if (p.fishAdd[t] > 0) { lines.push(`!FISHADD:${t}:${p.fishAdd[t]}`); p.fishAdd[t] = 0; }
   }
@@ -538,6 +561,12 @@ function queueControl(id, cmd) {
       const v = String(cmd.value).toUpperCase();
       if (v !== 'REAL' && v !== 'FAST') return { ok: false, error: 'bad_time' };
       p.time = v === 'FAST' ? 1 : 0;
+      break;
+    }
+    case 'timescale': {
+      const v = Number(cmd.value);
+      if (!Number.isInteger(v) || v < 1 || v > 5) return { ok: false, error: 'bad_timescale' };
+      p.timescale = v;
       break;
     }
     case 'fish': {
@@ -619,8 +648,10 @@ function list() {
     const counts = s.counts || {};
     const fishCount =
       (counts.pair || 0) + (counts.school || 0) + (counts.school2 || 0) + (counts.angel || 0) + (counts.salmon || 0);
+    const device = deviceForAquarium(id);
     out.push({
       aquarium_id: id,
+      name: entry.name || null,
       platform: s.platform || 'unknown',
       fw_version: s.fw_version || null,
       lastSeenMs: entry.lastSeenMs,
@@ -629,6 +660,8 @@ function list() {
       counts,
       weather: s.weather || null,
       conflict: !!entry.conflict,
+      device,                          // { id, name, kind, online } | null
+      simulated: !(device && device.online), // server web-sim drives it when no live device
     });
   }
   out.sort((a, b) => a.aquarium_id.localeCompare(b.aquarium_id));
@@ -697,6 +730,37 @@ function resolveConflict(id, choice) {
   return { ok: false, error: 'bad_choice' };
 }
 
+// All known aquarium ids (snapshot-bearing or freshly-created). The device manager
+// iterates these to decide which tanks need server-side simulation.
+function aquariumIds() {
+  return [...aquariums.keys()];
+}
+
+// Create a brand-new aquarium from the dashboard. It has no physical device, so the
+// server's web simulator (deviceManager) starts running it immediately. The id is a
+// URL-safe slug of the name (deduped); the friendly name is kept for display.
+function createAquarium(rawName) {
+  if (aquariums.size >= MAX_AQUARIUMS) return { ok: false, error: 'max_aquariums_reached' };
+  const name = sanitizeName(rawName) || '';
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32);
+  let id = slug || ('tank-' + now().toString(36));
+  if (aquariums.has(id)) id = `${id}-${now().toString(36).slice(-4)}`;
+  const entry = getOrCreate(id);
+  entry.name = name || null;
+  db.saveAquariumMeta(id, { name: entry.name, createdAt: entry.createdAt });
+  return { ok: true, aquariumId: id, name: entry.name };
+}
+
+// Rename an existing aquarium (display name only; the id/slug is immutable).
+function renameAquarium(id, rawName) {
+  const entry = aquariums.get(id);
+  if (!entry) return { ok: false, error: 'not_found' };
+  entry.name = sanitizeName(rawName) || null;
+  db.saveAquariumMeta(id, { name: entry.name, createdAt: entry.createdAt });
+  broadcast(entry); // open dashboards update their title immediately
+  return { ok: true, name: entry.name };
+}
+
 // Forget an aquarium: drop it from memory and delete its persisted file. A device
 // that is still alive will simply re-create it on its next telemetry POST; for a
 // stale (gone) device this is a permanent removal. Returns whether it existed.
@@ -715,6 +779,8 @@ module.exports = {
   upsert, list, get, bootstrap, resolveConflict, subscribe, setName, getNamesText,
   queueControl, remove, FISH_MAX,
   STALE_MS, MAX_AQUARIUMS,
-  // Device registry
+  // Aquarium lifecycle (dashboard-created tanks, simulated server-side)
+  createAquarium, renameAquarium, aquariumIds, hasLiveDevice,
+  // Device registry (physical hardware that self-registers via telemetry)
   listDevices, getDevice, createDevice, updateDevice, removeDevice,
 };
