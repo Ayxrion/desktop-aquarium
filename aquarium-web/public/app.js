@@ -781,13 +781,17 @@ function drawFlake(f) {
 }
 
 // ── Bottom dwellers ──
-function drawSnail(sn) {
+function drawSnail(sn, collector = false) {
   const bx = Math.round(sn.x), by = terrainY[clamp(bx, 0, SCREEN_W - 1)];
   const d = sn.facing_right ? 1 : -1;
-  const BODY = 0xDDB060;
-  fcirc(bx - d * 4, by - 8, 8, 0x7A2E0A);          // shell
-  scirc(bx - d * 3, by - 8, 5, 0xB05020);          // swirl
-  scirc(bx - d * 2, by - 8, 2, 0xB05020);
+  // Coin-collector snails wear an emerald "helper" shell so they read as a
+  // different, useful critter; pond snails keep the earthy brown shell.
+  const BODY  = collector ? 0x8FD89A : 0xDDB060;
+  const SHELL = collector ? 0x1F6B47 : 0x7A2E0A;
+  const SWIRL = collector ? 0x5FE0A0 : 0xB05020;
+  fcirc(bx - d * 4, by - 8, 8, SHELL);             // shell
+  scirc(bx - d * 3, by - 8, 5, SWIRL);             // swirl
+  scirc(bx - d * 2, by - 8, 2, SWIRL);
   fillEllipseC(bx, by - 3, 12, 3, hex(BODY));        // body
   fcirc(bx + d * 10, by - 5, 5, BODY);              // head
   ctx.strokeStyle = hex(BODY); ctx.lineWidth = 1;
@@ -2166,7 +2170,7 @@ function drawTank(s) {
 
   if (Array.isArray(s.flakes)) for (const f of s.flakes) drawFlake(f);
   if (s.snail) drawSnail(s.snail);
-  if (Array.isArray(s.snails)) for (const sn of s.snails) drawSnail(sn); // purchased coin collectors
+  if (Array.isArray(s.snails)) for (const sn of s.snails) drawSnail(sn, true); // purchased coin collectors
   if (s.starfish) drawStarfish(s.starfish);
 
   // Career collectibles, drawn on top so they're clearly visible + tappable.

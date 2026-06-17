@@ -1671,13 +1671,15 @@ void drawEacFish() {
   }
 }
 
-void drawSnailShape(int bx, bool facingRight) {
+void drawSnailShape(int bx, bool facingRight, bool collector = false) {
   int   by = terrainY[constrain(bx, 0, SCREEN_W - 1)];
   int   d  = facingRight ? 1 : -1;
 
-  const uint32_t BODY  = 0xDDB060UL;
-  const uint32_t SHELL = 0x7A2E0AUL;
-  const uint32_t SWIRL = 0xB05020UL;
+  // Coin-collector snails wear an emerald "helper" shell so they read as a
+  // different, useful critter; pond snails keep the earthy brown shell.
+  const uint32_t BODY  = collector ? 0x8FD89AUL : 0xDDB060UL;
+  const uint32_t SHELL = collector ? 0x1F6B47UL : 0x7A2E0AUL;
+  const uint32_t SWIRL = collector ? 0x5FE0A0UL : 0xB05020UL;
 
   canvas.fillCircle(bx - d * 4, by - 8, 8, SHELL);
   canvas.drawCircle(bx - d * 3, by - 8, 5, SWIRL);
@@ -1695,7 +1697,7 @@ void drawSnailShape(int bx, bool facingRight) {
 void drawSnail() { drawSnailShape((int)snail.x, snail.facingRight); }
 void drawCoinSnails() {                          // purchased coin collectors
   for (int i = 0; i < numSnails; i++)
-    if (coinSnails[i].active) drawSnailShape((int)coinSnails[i].x, coinSnails[i].facingRight);
+    if (coinSnails[i].active) drawSnailShape((int)coinSnails[i].x, coinSnails[i].facingRight, true);
 }
 
 void drawStarfish() {

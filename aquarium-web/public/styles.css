@@ -153,37 +153,29 @@ main {
   color: #f0c040;
 }
 
-/* Tank on the left, aquarium info floated to the right. */
+/* Canvas fills the flex column; info strip appears below it. */
 .tank-row {
-  display: flex;
-  gap: 18px;
-  align-items: stretch;     /* info column matches the canvas height, scrolls within */
-  flex: 1 1 auto;
+  flex: 1 1 0;
   min-height: 0;
+  display: flex;
+  align-items: flex-start;
 }
 .tank-info {
-  width: 312px;
   flex-shrink: 0;
   display: flex;
-  flex-direction: column;
-  gap: 12px;
-  min-height: 0;
-  overflow-y: auto;         /* fold everything in here; scroll internally, not the page */
-  padding-right: 2px;
-}
-.tank-info .stats {
-  grid-template-columns: 1fr 1fr;
-  margin-top: 0;
+  gap: 10px;
+  align-items: flex-start;
+  padding-top: 8px;
+  overflow-x: auto;
 }
 
 @media (max-width: 980px) {
   body { overflow: auto; }
   #view { overflow: visible; display: block; }
   #view-content { min-height: 0; display: block; }
-  .tank-row { flex-direction: column; min-height: 0; }
-  .tank-wrap { align-self: stretch; max-width: none; }
-  .tank-info { width: 100%; min-height: 0; overflow: visible; }
-  .tank-info .stats { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+  .tank-row { min-height: 0; }
+  .tank-wrap { max-width: none; }
+  .tank-info { flex-wrap: wrap; overflow-x: visible; }
 }
 
 .view-title {
@@ -198,16 +190,14 @@ main {
 
 .tank-wrap {
   flex: 1 1 auto;
-  align-self: flex-start;   /* keep the canvas aspect ratio; only the info column stretches */
+  align-self: flex-start;
   width: auto;
   min-width: 0;
-  /* Lock the wrapper to the canvas aspect ratio so the canvas fills it
-     completely — no letterbox bars, no border around the visual. */
   aspect-ratio: 800 / 480;
-  /* Cap the width so the derived height can't exceed the viewport → no page
-     scroll, while keeping the canvas full-size and undistorted. */
-  max-width: calc((100vh - 178px) * 800 / 480);
-  position: relative;       /* anchor for the floating legend overlay */
+  /* Cap width so the canvas height never pushes past the viewport once the
+     info strip (~130px) + title (~46px) + chrome (~90px) are accounted for. */
+  max-width: min(100%, calc((100vh - 280px) * 800 / 480));
+  position: relative;
   border-radius: 12px;
   overflow: hidden;
   box-shadow: 0 8px 30px #0009;
@@ -324,30 +314,35 @@ main {
 }
 
 .stats {
+  flex: 1 1 0;
+  min-width: 0;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 12px;
-  margin-top: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+  gap: 6px;
+  margin-top: 0;
+  align-content: start;
 }
 .stat {
   background: var(--panel);
-  border-radius: 8px;
-  padding: 12px 14px;
+  border-radius: 7px;
+  padding: 6px 10px;
 }
-.stat .label { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
-.stat .value { font-size: 20px; font-weight: 600; margin-top: 4px; }
-.stat .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.stat .label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); }
+.stat .value { font-size: 15px; font-weight: 600; margin-top: 2px; }
+.stat .sub { font-size: 11px; color: var(--muted); margin-top: 1px; }
 
 /* Device control panel (weather / timescale / fish / feed). */
 .controls {
-  margin-top: 14px;
+  flex-shrink: 0;
+  width: 250px;
+  margin-top: 0;
   background: var(--panel);
-  border-radius: 8px;
-  padding: 12px 14px;
+  border-radius: 7px;
+  padding: 8px 12px;
 }
 .controls h3 {
-  margin: 0 0 10px;
-  font-size: 11px;
+  margin: 0 0 6px;
+  font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 1px;
   color: var(--muted);
@@ -355,13 +350,13 @@ main {
 .ctrl-group {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 10px;
+  gap: 8px;
+  margin-bottom: 6px;
 }
 .ctrl-label {
-  font-size: 13px;
+  font-size: 12px;
   color: var(--muted);
-  width: 78px;
+  width: 66px;
   flex-shrink: 0;
 }
 .ctrl-select {
@@ -399,12 +394,12 @@ main {
 .seg button:hover { color: var(--text); }
 .seg button.active { background: var(--accent); color: #00131f; font-weight: 600; }
 
-.ctrl-fish { flex: 1; display: flex; flex-direction: column; gap: 5px; }
+.ctrl-fish { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 3px 6px; }
 .ctrl-fish-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 13px;
+  gap: 5px;
+  font-size: 12px;
 }
 .ctrl-fish-row .fish-name { flex: 1; min-width: 0; }
 .ctrl-fish-row .fish-count {
