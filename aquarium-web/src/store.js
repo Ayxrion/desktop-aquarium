@@ -22,16 +22,17 @@ function freshPending() {
     restore: false,            // !RESTORE — re-fetch + adopt the server profile
     weather: null,             // !WEATHER:<-1..6>  (null = nothing queued)
     time: null,                // !TIME:<0|1>       (0 REAL, 1 FAST)
-    fishAdd: [0, 0, 0, 0],     // !FISHADD:<type>:<count>  per type 0..3
-    fishDel: [0, 0, 0, 0],     // !FISHDEL:<type>:<count>
+    fishAdd: [0, 0, 0, 0, 0],  // !FISHADD:<type>:<count>  per type 0..4 (incl. salmon)
+    fishDel: [0, 0, 0, 0, 0],  // !FISHDEL:<type>:<count>
     feed: 0,                   // !FEED:<count>
     // ── Career-mode game directives ──
     mode: null,                // !MODE:<0|1>  (0 creative, 1 career; latest wins)
     catch: [],                 // !CATCH:<id,id,…>  wanderer/loot item ids to grab
-    buyFish: [0, 0, 0, 0],     // !BUYFISH:<type>:<count>  shop purchase (device deducts)
+    buyFish: [0, 0, 0, 0, 0],  // !BUYFISH:<type>:<count>  shop purchase (device deducts)
     buyFood: 0,                // !BUYFOOD:<count>
     buySnail: 0,               // !BUYSNAIL:<count>  coin-collector snail
     sellFish: [],              // !SELLFISH:<id,id,…>  sell fish by slot id (device removes + credits coins)
+    switchAq: null,            // !SWITCHAQ:<id>  tell a physical device to load a different aquarium
   };
 }
 
@@ -207,6 +208,94 @@ const aquariums = new Map();
   if (rows.length) console.log(`Store: restored ${rows.length} aquarium(s) from DB`);
 })();
 
+// ── Devices ────────────────────────────────────────────────────────────────────
+// A device is a first-class entity (virtual = server-simulated, or a physical Pi/ESP
+// that self-registers via telemetry). An aquarium is a standalone saved tank; a device
+// "plays" at most one aquarium at a time (`aquariumId`, null = unassigned).
+/** @type {Map<string, {id,name,kind,aquariumId,createdAt,lastSeenMs}>} */
+const devices = new Map();
+let _devSeq = 1;
+(function _restoreDevices() {
+  for (const d of db.loadDevices()) { if (d && d.id) devices.set(d.id, d); _devSeq++; }
+  if (devices.size) console.log(`Store: restored ${devices.size} device(s) from DB`);
+})();
+function _persistDevices() { db.saveDevices([...devices.values()]); }
+function _newDeviceId() { return 'dev-' + now().toString(36) + '-' + (_devSeq++); }
+// An aquarium has at most one device: assigning it to one frees it from any other.
+function _unassignAquariumFromOthers(aquariumId, exceptId) {
+  if (!aquariumId) return;
+  for (const d of devices.values())
+    if (d.id !== exceptId && d.aquariumId === aquariumId) d.aquariumId = null;
+}
+
+function listDevices() {
+  return [...devices.values()].map((d) => ({ ...d, online: !isStale(d.lastSeenMs || 0) }));
+}
+function getDevice(id) {
+  const d = devices.get(id);
+  return d ? { ...d, online: !isStale(d.lastSeenMs || 0) } : null;
+}
+function createDevice(opts = {}) {
+  const id = opts.id || _newDeviceId();
+  const d = {
+    id,
+    name: sanitizeName(opts.name) || (opts.kind === 'virtual' ? 'Virtual device' : 'Device'),
+    kind: opts.kind || 'virtual',
+    aquariumId: opts.aquariumId || null,
+    createdAt: now(),
+    lastSeenMs: 0,
+  };
+  if (d.aquariumId) _unassignAquariumFromOthers(d.aquariumId, id);
+  devices.set(id, d);
+  _persistDevices();
+  return d;
+}
+// Rename / (re)assign which aquarium a device plays. assignAquarium(null) unassigns.
+function updateDevice(id, patch = {}) {
+  const d = devices.get(id);
+  if (!d) return null;
+  if (patch.name != null) { const n = sanitizeName(patch.name); if (n) d.name = n; }
+  if ('aquariumId' in patch) {
+    const oldAq = d.aquariumId;
+    d.aquariumId = patch.aquariumId || null;
+    if (d.aquariumId) _unassignAquariumFromOthers(d.aquariumId, d.id);
+    // A physical device is still polling its OLD aquarium's directive channel; queue a
+    // !SWITCHAQ there so it loads the new tank. (Virtual devices are rebound by the
+    // tick manager directly, so they need no directive.)
+    if (d.kind !== 'virtual' && oldAq && d.aquariumId && oldAq !== d.aquariumId) {
+      const e = aquariums.get(oldAq);
+      if (e) { (e.pending || (e.pending = freshPending())).switchAq = d.aquariumId; }
+    }
+  }
+  _persistDevices();
+  return { ...d, online: !isStale(d.lastSeenMs || 0) };
+}
+function removeDevice(id) {
+  const ok = devices.delete(id);
+  if (ok) _persistDevices();
+  return ok;
+}
+// Self-registration from a telemetry POST (physical hardware can create its device +
+// aquarium before the server knew about either). Only persists on structural changes;
+// the per-tick lastSeenMs bump stays in memory.
+function registerDeviceFromTelemetry(snapshot) {
+  const id = snapshot.device_id;
+  if (!id) return;
+  let d = devices.get(id);
+  let structural = false;
+  if (!d) {
+    d = { id, name: sanitizeName(snapshot.device_name) || id,
+          kind: snapshot.platform || 'device', aquariumId: snapshot.aquarium_id || null,
+          createdAt: now(), lastSeenMs: now() };
+    devices.set(id, d);
+    structural = true;
+  } else {
+    if (snapshot.aquarium_id && d.aquariumId !== snapshot.aquarium_id) { d.aquariumId = snapshot.aquarium_id; structural = true; }
+    d.lastSeenMs = now();
+  }
+  if (structural) _persistDevices();
+}
+
 /** @type {Set<(snapshot: object) => void>} */
 const subscribers = new Set();
 
@@ -332,6 +421,7 @@ function upsert(snapshot) {
     return { ok: false, error: 'max_aquariums_reached' };
   }
   const entry = getOrCreate(id);
+  if (snapshot.device_id) registerDeviceFromTelemetry(snapshot); // physical/virtual self-register
   const t = now();
   const sig = profileSig(snapshot);
   // In Career mode the fish census changes constantly through legitimate play
@@ -398,19 +488,20 @@ function getNamesText(id) {
   // device scans for them explicitly). Drained here: one-shot per response.
   const p = entry.pending || (entry.pending = freshPending());
   let restoreEmitted = false;
+  if (p.switchAq) { lines.push(`!SWITCHAQ:${p.switchAq}`); p.switchAq = null; }
   if (p.restore) { lines.push('!RESTORE'); p.restore = false; restoreEmitted = true; }
   if (p.weather !== null) { lines.push(`!WEATHER:${p.weather}`); p.weather = null; }
   if (p.time !== null) { lines.push(`!TIME:${p.time}`); p.time = null; }
-  for (let t = 0; t < 4; t++) {
+  for (let t = 0; t < 5; t++) {
     if (p.fishAdd[t] > 0) { lines.push(`!FISHADD:${t}:${p.fishAdd[t]}`); p.fishAdd[t] = 0; }
   }
-  for (let t = 0; t < 4; t++) {
+  for (let t = 0; t < 5; t++) {
     if (p.fishDel[t] > 0) { lines.push(`!FISHDEL:${t}:${p.fishDel[t]}`); p.fishDel[t] = 0; }
   }
   if (p.feed > 0) { lines.push(`!FEED:${p.feed}`); p.feed = 0; }
   if (p.mode !== null) { lines.push(`!MODE:${p.mode}`); p.mode = null; }
   if (p.catch.length) { lines.push(`!CATCH:${p.catch.join(',')}`); p.catch = []; }
-  for (let t = 0; t < 4; t++) {
+  for (let t = 0; t < 5; t++) {
     if (p.buyFish[t] > 0) { lines.push(`!BUYFISH:${t}:${p.buyFish[t]}`); p.buyFish[t] = 0; }
   }
   if (p.buyFood > 0) { lines.push(`!BUYFOOD:${p.buyFood}`); p.buyFood = 0; }
@@ -624,4 +715,6 @@ module.exports = {
   upsert, list, get, bootstrap, resolveConflict, subscribe, setName, getNamesText,
   queueControl, remove, FISH_MAX,
   STALE_MS, MAX_AQUARIUMS,
+  // Device registry
+  listDevices, getDevice, createDevice, updateDevice, removeDevice,
 };

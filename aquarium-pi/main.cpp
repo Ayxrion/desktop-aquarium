@@ -2384,6 +2384,7 @@ void loop() {
     telemetryUpdate();
     telemetryProcessFlags();   // act on server directives (rebuild / re-check)
     telemetryApplyControls();  // apply dashboard weather/time/fish/feed directives
+    telemetryApplyAquariumSwitch(); // honor a !SWITCHAQ reassignment (re-bootstrap new tank)
     updateBoat();
     updateSnail();
     updateStarfish();

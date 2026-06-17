@@ -1007,6 +1007,10 @@ let _blendBoatFrom = null;
 const els = {
   list: document.getElementById('aquarium-list'),
   emptyHint: document.getElementById('empty-hint'),
+  newAquarium: document.getElementById('new-aquarium'),
+  deviceList: document.getElementById('device-list'),
+  deviceEmpty: document.getElementById('device-empty'),
+  newDevice: document.getElementById('new-device'),
   viewEmpty: document.getElementById('view-empty'),
   viewContent: document.getElementById('view-content'),
   stats: document.getElementById('stats'),
@@ -1063,15 +1067,113 @@ const SNAIL_PRICE = 50;
 const MAX_SNAILS = 6;
 
 // ─── Sidebar / list polling ────────────────────────────────────────────────
+let _aquariums = [];   // latest aquarium list (also used to build device assignment menus)
+
 async function refreshList() {
   try {
     const res = await fetch('api/aquariums');
     const items = await res.json();
+    _aquariums = items;
     renderList(items);
     setConn(true);
   } catch {
     setConn(false);
   }
+  refreshDevices();
+}
+
+// ─── Devices ───────────────────────────────────────────────────────────────
+async function refreshDevices() {
+  try {
+    const res = await fetch('api/devices');
+    renderDevices(await res.json());
+  } catch { /* leave the last render up */ }
+}
+
+function renderDevices(devices) {
+  if (!els.deviceList) return;
+  els.deviceEmpty.hidden = devices.length > 0;
+  els.deviceList.innerHTML = '';
+  for (const d of devices) {
+    const li = document.createElement('li');
+    li.className = 'dev-row' + (d.online ? '' : ' stale-row');
+    const kindBadge = d.kind === 'virtual' ? 'virtual' : escapeHtml(d.kind || 'device');
+    // Assignment menu: every known aquarium + this device's own (in case it's stale)
+    // + the unassigned option.
+    const ids = new Set(_aquariums.map((a) => a.aquarium_id));
+    if (d.aquariumId) ids.add(d.aquariumId);
+    const opts = ['<option value="">— unassigned —</option>'].concat(
+      [...ids].map((id) => `<option value="${escapeHtml(id)}"${id === d.aquariumId ? ' selected' : ''}>${escapeHtml(id)}</option>`)
+    ).join('');
+    li.innerHTML = `
+      <button class="dev-del" title="Delete this device" aria-label="Delete device">×</button>
+      <div class="dev-name">
+        <span class="dot ${d.online ? 'live' : 'stale'}"></span>${escapeHtml(d.name)}
+        <span class="dev-kind">${kindBadge}</span>
+      </div>
+      <div class="dev-assign">
+        <label>Aquarium</label>
+        <select class="dev-aq">${opts}</select>
+      </div>`;
+    li.querySelector('.dev-aq').addEventListener('change', (e) => assignDevice(d.id, e.target.value || null));
+    li.querySelector('.dev-name').addEventListener('click', () => renameDevice(d));
+    li.querySelector('.dev-del').addEventListener('click', (e) => { e.stopPropagation(); deleteDevice(d); });
+    els.deviceList.appendChild(li);
+  }
+}
+
+async function createAquarium() {
+  const name = (window.prompt('Name your new aquarium:', 'My tank') || '').trim();
+  if (name === null) return;
+  try {
+    const res = await fetch('api/aquariums', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const data = await res.json();
+    await refreshList();
+    if (data.aquariumId) { setRoute(data.aquariumId); select(data.aquariumId); } // jump to the new tank
+  } catch { /* refresh will reflect reality */ }
+}
+
+async function createVirtualDevice() {
+  const name = (window.prompt('Name the virtual device:', 'Virtual device') || '').trim();
+  if (!name) return;
+  try {
+    await fetch('api/devices', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, kind: 'virtual' }),
+    });
+  } catch { /* ignore */ }
+  refreshDevices();
+}
+
+async function assignDevice(id, aquariumId) {
+  try {
+    await fetch('api/devices/' + encodeURIComponent(id), {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ aquariumId }),
+    });
+  } catch { /* ignore */ }
+  refreshList();   // also refreshes devices (one-per-aquarium may have moved another)
+}
+
+async function renameDevice(d) {
+  const name = (window.prompt('Rename device:', d.name) || '').trim();
+  if (!name || name === d.name) return;
+  try {
+    await fetch('api/devices/' + encodeURIComponent(d.id), {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+  } catch { /* ignore */ }
+  refreshDevices();
+}
+
+async function deleteDevice(d) {
+  if (!window.confirm(`Delete device "${d.name}"?\n\nIts aquarium stays saved but stops simulating until reassigned.`)) return;
+  try { await fetch('api/devices/' + encodeURIComponent(d.id), { method: 'DELETE' }); } catch { /* ignore */ }
+  refreshDevices();
 }
 
 function setConn(online) {
@@ -2526,6 +2628,8 @@ window.addEventListener('hashchange', () => {
   const id = routeId();
   if (id && id !== selectedId) select(id);
 });
+if (els.newAquarium) els.newAquarium.addEventListener('click', createAquarium);
+if (els.newDevice) els.newDevice.addEventListener('click', createVirtualDevice);
 refreshList(); // first load honours the hash via renderList's default selection
 setInterval(refreshList, 5000);
 startWatchdog();

@@ -171,6 +171,36 @@ app.delete('/api/aquariums/:id', (req, res) => {
   return res.json(store.remove(req.params.id));
 });
 
+// ─── Aquarium + device management (open like the other dashboard APIs) ─────────
+// Create a brand-new aquarium and a virtual device to run it server-side ("as if
+// they had a Pi"). Body: { name? }. Returns the new aquarium + device ids.
+app.post('/api/aquariums', (req, res) => {
+  const name = (req.body && req.body.name) || '';
+  const slug = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32);
+  let aquariumId = slug || ('tank-' + Date.now().toString(36));
+  // Ensure uniqueness against existing aquariums.
+  const taken = new Set(store.list().map((a) => a.aquarium_id || a.id));
+  if (taken.has(aquariumId)) aquariumId = `${aquariumId}-${Date.now().toString(36).slice(-4)}`;
+  const device = store.createDevice({ name: name ? `${name} (virtual)` : 'Virtual device', kind: 'virtual', aquariumId });
+  return res.json({ ok: true, aquariumId, device });
+});
+
+// Devices: list / create / update (rename + (re)assign aquarium) / delete.
+app.get('/api/devices', (_req, res) => res.json(store.listDevices()));
+app.post('/api/devices', (req, res) => {
+  const b = req.body || {};
+  const kind = b.kind === 'virtual' ? 'virtual' : (b.kind || 'virtual');
+  return res.json({ ok: true, device: store.createDevice({ name: b.name, kind, aquariumId: b.aquariumId || null }) });
+});
+app.patch('/api/devices/:id', (req, res) => {
+  const d = store.updateDevice(req.params.id, req.body || {});
+  if (!d) return res.status(404).json({ ok: false, error: 'not_found' });
+  return res.json({ ok: true, device: d });
+});
+app.delete('/api/devices/:id', (req, res) => {
+  return res.json({ ok: store.removeDevice(req.params.id) });
+});
+
 // ─── Read APIs ───────────────────────────────────────────────────────────────
 app.get('/api/aquariums', (_req, res) => res.json(store.list()));
 
@@ -231,6 +261,9 @@ app.get(['/', '/index.html'], sendIndex);
 // their bare paths (/app.js, /styles.css) and are served from public/.
 app.use(express.static(PUBLIC_DIR));
 
+const deviceManager = require('./deviceManager');
+
 app.listen(PORT, () => {
   console.log(`aquarium-web listening on :${PORT} (stale after ${store.STALE_MS}ms)`);
+  deviceManager.start();   // tick all virtual devices (server-side, always-on)
 });

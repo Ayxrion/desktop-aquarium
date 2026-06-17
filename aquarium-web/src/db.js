@@ -25,6 +25,23 @@ function _ensureDir() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
+// Devices live in a single JSON file in the parent data dir (kept OUT of the
+// aquariums dir so loadAll() doesn't treat it as an aquarium).
+const DEVICES_FILE = path.join(DATA_DIR, '..', 'devices.json');
+
+function loadDevices() {
+  try { return JSON.parse(fs.readFileSync(DEVICES_FILE, 'utf8')); }
+  catch { return []; }
+}
+function saveDevices(devices) {
+  try {
+    fs.mkdirSync(path.dirname(DEVICES_FILE), { recursive: true });
+    const tmp = DEVICES_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(devices), 'utf8');
+    fs.renameSync(tmp, DEVICES_FILE);
+  } catch (err) { console.warn(`DB: failed to write devices: ${err.message}`); }
+}
+
 function _filePath(id) {
   // Sanitize id to prevent directory traversal: keep only safe chars.
   const safe = id.replace(/[^a-zA-Z0-9_\-]/g, '_');
@@ -126,4 +143,4 @@ function loadOne(aquariumId) {
   };
 }
 
-module.exports = { saveSnapshot, saveName, deleteAquarium, loadAll, loadOne };
+module.exports = { saveSnapshot, saveName, deleteAquarium, loadAll, loadOne, loadDevices, saveDevices };

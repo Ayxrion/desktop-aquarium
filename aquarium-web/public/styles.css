@@ -502,6 +502,48 @@ main {
 .pending-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pending-age   { flex-shrink: 0; font-size: 11px; color: var(--muted); }
 
+/* Sidebar action button (New aquarium / New virtual device) */
+.side-btn {
+  width: 100%;
+  margin-top: 8px;
+  padding: 7px 10px;
+  background: #1b6cff22;
+  color: #cfe0ff;
+  border: 1px solid #3a6abf;
+  border-radius: 7px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.side-btn:hover { background: #1b6cff44; }
+
+/* Devices section */
+.devices-section { margin-top: 20px; border-top: 1px solid #ffffff14; padding-top: 14px; }
+.devices-section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+#device-list { list-style: none; padding: 0; margin: 8px 0 0; }
+.dev-row {
+  position: relative;
+  padding: 8px 10px; margin-bottom: 6px;
+  background: var(--panel-2); border-radius: 8px;
+}
+.dev-row.stale-row { opacity: 0.65; }
+.dev-name { font-weight: 600; display: flex; align-items: center; gap: 7px; padding-right: 20px; cursor: pointer; }
+.dev-name:hover { color: #fff; }
+.dev-kind {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+  color: var(--muted); background: #ffffff10; border-radius: 4px; padding: 1px 5px;
+}
+.dev-assign { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+.dev-assign label { font-size: 11px; color: var(--muted); }
+.dev-aq { flex: 1; min-width: 0; background: #0c1726; color: #cfe0ff; border: 1px solid #2a456f; border-radius: 6px; padding: 3px 5px; font-size: 12px; }
+.dev-del {
+  position: absolute; top: 6px; right: 6px;
+  width: 18px; height: 18px; line-height: 16px; text-align: center;
+  background: transparent; color: var(--muted); border: none; border-radius: 4px;
+  cursor: pointer; opacity: 0.5;
+}
+.dev-row:hover .dev-del { opacity: 1; }
+.dev-del:hover { background: #c8593f33; color: var(--stale); }
+
 .traffic-section {
   margin-top: 20px;
   border-top: 1px solid #ffffff14;

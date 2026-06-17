@@ -42,6 +42,14 @@
 #ifndef TELEMETRY_AQUARIUM_ID
 #define TELEMETRY_AQUARIUM_ID "esp-aquarium"
 #endif
+// Stable per-DEVICE id so the server registers this physical unit as a first-class
+// device (separate from the aquarium it currently shows). Override in wifi_config.h.
+#ifndef TELEMETRY_DEVICE_ID
+#define TELEMETRY_DEVICE_ID "esp-device-1"
+#endif
+// Which aquarium this device currently shows — mutable at runtime via !SWITCHAQ:<id>.
+static char activeAquariumId[64] = TELEMETRY_AQUARIUM_ID;
+static char _pendingSwitchAq[64] = "";
 #ifndef TELEMETRY_INTERVAL_MS
 #define TELEMETRY_INTERVAL_MS 1000
 #endif
@@ -111,6 +119,14 @@ static std::atomic<int> _ctrlSellFishCount{0};
 // so a single substring match per token is sufficient.
 static void _telemetryParseControls(const char* body) {
     const char* d;
+    // !SWITCHAQ:<id> — dashboard reassigned this device to another aquarium (applied on
+    // the render thread by telemetryApplyAquariumSwitch()).
+    if ((d = strstr(body, "!SWITCHAQ:")) != nullptr) {
+        d += 10;
+        size_t i = 0;
+        while (d[i] && d[i] != '\n' && d[i] != '\t' && i < sizeof(_pendingSwitchAq) - 1) { _pendingSwitchAq[i] = d[i]; i++; }
+        _pendingSwitchAq[i] = '\0';
+    }
     if ((d = strstr(body, "!WEATHER:")) != nullptr) _ctrlWeatherReq.store(atoi(d + 9));
     if ((d = strstr(body, "!TIME:"))    != nullptr) _ctrlTimeReq.store(atoi(d + 6));
     if ((d = strstr(body, "!FEED:"))    != nullptr) _ctrlFeedReq.fetch_add(atoi(d + 6));
@@ -227,13 +243,13 @@ static int _buildTelemetryJson() {
     int wc = (int)currentWeather;
 
     o = _tAppend(o,
-        "{\"aquarium_id\":\"%s\",\"platform\":\"esp32\",\"fw_version\":\"%s\","
+        "{\"aquarium_id\":\"%s\",\"device_id\":\"%s\",\"platform\":\"esp32\",\"fw_version\":\"%s\","
         "\"uptime_ms\":%lu,\"tick\":%d,\"frame_ms\":%d,"
         "\"screen\":{\"w\":%d,\"h\":%d,\"tank_top\":%d},"
         "\"weather\":{\"condition\":%d,\"name\":\"%s\",\"override\":%s},"
         "\"time\":{\"day_progress\":%.4f,\"mode\":\"%s\"},"
         "\"counts\":{\"pair\":%d,\"school\":%d,\"school2\":%d,\"angel\":%d,\"salmon\":%d},",
-        TELEMETRY_AQUARIUM_ID, FIRMWARE_VERSION,
+        activeAquariumId, TELEMETRY_DEVICE_ID, FIRMWARE_VERSION,
         (unsigned long)millis(), (int)tick, FRAME_MS,
         SCREEN_W, SCREEN_H, TANK_TOP,
         wc, _telemetryWeatherName(wc), (weatherOverrideIdx >= 0) ? "true" : "false",
@@ -434,7 +450,7 @@ static bool _fetchBootstrapDoc(DynamicJsonDocument& doc) {
     if (TELEMETRY_HOST[0] == '\0' || !_wifiEnsureConnected()) return false;
     String base = String(TELEMETRY_HOST);
     if (base.endsWith("/api/telemetry")) base = base.substring(0, base.length() - 14);
-    String url = base + "/api/aquariums/" + TELEMETRY_AQUARIUM_ID + "/bootstrap";
+    String url = base + "/api/aquariums/" + activeAquariumId + "/bootstrap";
     WiFiClient client;
     HTTPClient http;
     if (!http.begin(client, url)) return false;
@@ -571,6 +587,17 @@ static void telemetryBootstrap() {
         Serial.println("Telemetry: no saved profile on server (keeping local tank)");
 }
 
+// Apply a pending !SWITCHAQ reassignment: point at the new aquarium + load its state.
+// Call from the render loop (core 1) — it rebuilds fish[] via the bootstrap restore.
+static void telemetryApplyAquariumSwitch() {
+    if (_pendingSwitchAq[0] == '\0') return;
+    strncpy(activeAquariumId, _pendingSwitchAq, sizeof(activeAquariumId) - 1);
+    activeAquariumId[sizeof(activeAquariumId) - 1] = '\0';
+    _pendingSwitchAq[0] = '\0';
+    Serial.printf("Telemetry: switching to aquarium '%s'\n", activeAquariumId);
+    telemetryFetchAndApplyProfile();
+}
+
 // Runtime re-enable: compare local profile to the server's; prompt if different.
 static void telemetryReenableCheck() {
     if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
@@ -590,7 +617,7 @@ static void _postResolve(const char* choice) {
     if (TELEMETRY_HOST[0] == '\0' || !_wifiEnsureConnected()) return;
     String base = String(TELEMETRY_HOST);
     if (base.endsWith("/api/telemetry")) base = base.substring(0, base.length() - 14);
-    String url  = base + "/api/aquariums/" + TELEMETRY_AQUARIUM_ID + "/resolve";
+    String url  = base + "/api/aquariums/" + activeAquariumId + "/resolve";
     String body = String("{\"choice\":\"") + choice + "\"}";
     WiFiClient client;
     HTTPClient http;

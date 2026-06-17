@@ -42,9 +42,20 @@
 #ifndef TELEMETRY_AQUARIUM_ID
 #define TELEMETRY_AQUARIUM_ID "pi-aquarium"
 #endif
+// Stable per-DEVICE id so the server can register this physical unit as a first-class
+// device (separate from the aquarium it currently shows). Set per-board in wifi_config.h.
+#ifndef TELEMETRY_DEVICE_ID
+#define TELEMETRY_DEVICE_ID "pi-device-1"
+#endif
 #ifndef TELEMETRY_INTERVAL_MS
 #define TELEMETRY_INTERVAL_MS 1000
 #endif
+
+// Which aquarium this device is currently showing. Mutable at runtime: the dashboard
+// can reassign the device to another tank via a !SWITCHAQ:<id> directive, after which
+// the device re-bootstraps and POSTs under the new id. Seeded from the compile-time id.
+static char activeAquariumId[64] = TELEMETRY_AQUARIUM_ID;
+static char _pendingSwitchAq[64] = "";   // set by the control parser; applied on the render thread
 
 static uint32_t _lastTelemetryMs = 0;
 
@@ -123,6 +134,14 @@ static std::atomic<int> _ctrlSellFishCount{0};
 // so a single substring match per token is sufficient.
 static void _telemetryParseControls(const char* body) {
     const char* d;
+    // !SWITCHAQ:<id> — dashboard reassigned this device to another aquarium. Stash the id;
+    // the render thread applies it (re-bootstrap) via telemetryApplyAquariumSwitch().
+    if ((d = strstr(body, "!SWITCHAQ:")) != nullptr) {
+        d += 10;
+        size_t i = 0;
+        while (d[i] && d[i] != '\n' && d[i] != '\t' && i < sizeof(_pendingSwitchAq) - 1) { _pendingSwitchAq[i] = d[i]; i++; }
+        _pendingSwitchAq[i] = '\0';
+    }
     if ((d = strstr(body, "!WEATHER:")) != nullptr) _ctrlWeatherReq.store(atoi(d + 9));
     if ((d = strstr(body, "!TIME:"))    != nullptr) _ctrlTimeReq.store(atoi(d + 6));
     if ((d = strstr(body, "!FEED:"))    != nullptr) _ctrlFeedReq.fetch_add(atoi(d + 6));
@@ -234,13 +253,13 @@ static std::string _buildTelemetryJson() {
 
     int wc = (int)currentWeather;
     snprintf(tmp, sizeof(tmp),
-        "{\"aquarium_id\":\"%s\",\"platform\":\"pi\",\"fw_version\":\"%s\","
+        "{\"aquarium_id\":\"%s\",\"device_id\":\"%s\",\"platform\":\"pi\",\"fw_version\":\"%s\","
         "\"uptime_ms\":%u,\"tick\":%d,\"frame_ms\":%d,"
         "\"screen\":{\"w\":%d,\"h\":%d,\"tank_top\":%d},"
         "\"weather\":{\"condition\":%d,\"name\":\"%s\",\"override\":%s},"
         "\"time\":{\"day_progress\":%.4f,\"mode\":\"%s\"},"
         "\"counts\":{\"pair\":%d,\"school\":%d,\"school2\":%d,\"angel\":%d,\"salmon\":%d},",
-        TELEMETRY_AQUARIUM_ID, FIRMWARE_VERSION,
+        activeAquariumId, TELEMETRY_DEVICE_ID, FIRMWARE_VERSION,
         (unsigned)millis(), (int)tick, FRAME_MS,
         SCREEN_W, SCREEN_H, TANK_TOP,
         wc, _weatherName(wc), (weatherOverrideIdx >= 0) ? "true" : "false",
@@ -540,7 +559,7 @@ static int _parseObjArray(const char* p, char outObjs[][256], int maxObjs) {
 static bool _fetchBootstrap() {
     if (TELEMETRY_HOST[0] == '\0') return false;
     std::string url = std::string(TELEMETRY_HOST)
-        + "/api/aquariums/" + TELEMETRY_AQUARIUM_ID + "/bootstrap";
+        + "/api/aquariums/" + activeAquariumId + "/bootstrap";
     std::string keyHeader = std::string("X-Api-Key: ") + TELEMETRY_API_KEY;
     CURL* curl = curl_easy_init();
     if (!curl) return false;
@@ -744,6 +763,17 @@ static void telemetryBootstrap() {
         printf("Telemetry: no saved profile on server (keeping local tank)\n");
 }
 
+// Apply a pending !SWITCHAQ: point this device at a new aquarium and load its state.
+// Call from the render thread (it rebuilds fish[] via the bootstrap restore).
+static void telemetryApplyAquariumSwitch() {
+    if (_pendingSwitchAq[0] == '\0') return;
+    strncpy(activeAquariumId, _pendingSwitchAq, sizeof(activeAquariumId) - 1);
+    activeAquariumId[sizeof(activeAquariumId) - 1] = '\0';
+    _pendingSwitchAq[0] = '\0';
+    printf("Telemetry: switching to aquarium '%s'\n", activeAquariumId);
+    telemetryBootstrap();   // load the new tank's saved state (or keep current if brand-new)
+}
+
 // Runtime re-enable: compare the local profile to the server's saved one and, if
 // they differ, raise the on-screen prompt instead of silently adopting either.
 static void telemetryReenableCheck() {
@@ -768,7 +798,7 @@ static void telemetryReenableCheck() {
 static void _postResolve(const char* choice) {
     if (TELEMETRY_HOST[0] == '\0') return;
     std::string url  = std::string(TELEMETRY_HOST)
-        + "/api/aquariums/" + TELEMETRY_AQUARIUM_ID + "/resolve";
+        + "/api/aquariums/" + activeAquariumId + "/resolve";
     std::string body = std::string("{\"choice\":\"") + choice + "\"}";
     CURL* curl = curl_easy_init();
     if (!curl) return;
