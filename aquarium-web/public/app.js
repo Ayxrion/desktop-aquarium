@@ -95,7 +95,7 @@ const _DAMPZ = 0.88;
 const SAND_Y = SCREEN_H - 20;   // floor coins rest on (matches device SAND_Y)
 const COIN_GRAV = 0.1;          // coin sink acceleration (px/frame²) — matches device
 const COIN_MAX_VY = 1.4;        // terminal sink speed (px/frame) — matches device
-const COIN_REST_FRAMES = 240;   // frames a landed coin sits before vanishing (~12s)
+const COIN_REST_FRAMES = 480;   // frames a landed coin sits before vanishing (~24s)
 
 // Smooth motion for the non-fish movers (boat, snail, starfish, flakes). Their
 // telemetry carries no velocity, so we dead-reckon: derive each one's velocity
@@ -340,6 +340,16 @@ function projY(y, z) { const cy = SCREEN_H * 0.45; return cy + (y - cy) * (1 - z
 // 0.22..1.0 (matches device fishScale); absent (creative / pre-game) → full size.
 function growth(f) { return typeof f.scale === 'number' ? clamp(f.scale, 0.2, 1) : 1; }
 
+function fishSellValue(f) {
+  const base = FISH_BASE_SELL[f.type] || 6;
+  const g = growth(f);
+  return base
+    + Math.round(base * g)
+    + Math.round(fishLuck(f) * 15)
+    + Math.min(Math.floor((f.xp || 0) / 100), 8)
+    + (isShiny(f) ? 12 : 0);
+}
+
 // Fish text size / half-width (device units) — drives shadow + glyph scale.
 function fishTS(f)    { return (f.type || 0) === 0 ? (f.z < 0.5 ? 3 : 2) : (f.z < 0.6 ? 2 : 1); }
 function fishChars(f) { return (f.type || 0) === 0 ? 5 : 3; }
@@ -369,50 +379,105 @@ function fillEllipseC(cx, cy, rx, ry, style) {
   ctx.beginPath(); ctx.ellipse(cx, cy, Math.max(0.5, rx), Math.max(0.5, ry), 0, 0, Math.PI * 2); ctx.fill();
 }
 
-// ── Sky: gradient, stars at night, sun/moon arc, drifting clouds ──
+// ── Sky: device-accurate dawn/night transitions, dynamic sun/moon, fog bands ──
+// Mirrors drawWeatherSky() in aquarium-pi/main.cpp exactly: night→dawn→day lerp,
+// sun color shifts orange-red near horizon (nearH), moon crescent with visibility fade.
 function drawSky(top, bright, cond, s) {
-  const skyTop = [0x1A78C8, 0x2288CC, 0x556677, 0x334455, 0x111827, 0x8899AA, 0x7788AA];
-  const skyBot = [0x64B5E8, 0x77AEDD, 0x8899AA, 0x556677, 0x1A2233, 0xAABBCC, 0xAABBCC];
-  const base = skyTop[cond] ?? 0x1A78C8;
-  const g = ctx.createLinearGradient(0, 0, 0, top);
-  g.addColorStop(0, shadeN(base, bright));
-  g.addColorStop(1, shadeN(skyBot[cond] ?? 0x64B5E8, bright));
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, SCREEN_W, top);
-
   const dp = (s.time && typeof s.time.day_progress === 'number') ? s.time.day_progress : 0.5;
 
-  if (bright < 0.55) {
-    const a = (0.55 - bright) / 0.55;
+  // Device day factor: 0=night, ramps dawn 0.18→0.28, full day 0.28→0.72, dusk 0.72→0.82.
+  let dayFactor;
+  if      (dp < 0.18) dayFactor = 0;
+  else if (dp < 0.28) dayFactor = (dp - 0.18) * 10;
+  else if (dp < 0.72) dayFactor = 1;
+  else if (dp < 0.82) dayFactor = 1 - (dp - 0.72) * 10;
+  else                dayFactor = 0;
+
+  const NIGHT_TOP = 0x000510, NIGHT_BOT = 0x001530;
+  const DAWN_TOP  = 0xBB4410, DAWN_BOT  = 0xFF8840;
+  const wdTop = [0x1A78C8, 0x2288CC, 0x556677, 0x334455, 0x111827, 0x8899AA, 0x7788AA][cond] ?? 0x1A78C8;
+  const wdBot = [0x64B5E8, 0x77AEDD, 0x8899AA, 0x556677, 0x1A2233, 0xAABBCC, 0xAABBCC][cond] ?? 0x64B5E8;
+
+  let skyTop, skyBot;
+  if (dayFactor < 0.5) {
+    const t = dayFactor * 2;
+    skyTop = lerpColorInt(NIGHT_TOP, DAWN_TOP, t);
+    skyBot = lerpColorInt(NIGHT_BOT, DAWN_BOT, t);
+  } else {
+    const t = (dayFactor - 0.5) * 2;
+    skyTop = lerpColorInt(DAWN_TOP, wdTop, t);
+    skyBot = lerpColorInt(DAWN_BOT, wdBot, t);
+  }
+
+  // 8-band gradient (matches device's band loop)
+  for (let band = 0; band < 8; band++) {
+    const y0 = Math.round(band * top / 8);
+    const y1 = Math.round((band + 1) * top / 8);
+    const t = band / 7;
+    const r = Math.round(((skyTop >> 16 & 0xff) * (1 - t)) + ((skyBot >> 16 & 0xff) * t));
+    const g = Math.round(((skyTop >> 8  & 0xff) * (1 - t)) + ((skyBot >> 8  & 0xff) * t));
+    const b = Math.round(((skyTop       & 0xff) * (1 - t)) + ((skyBot       & 0xff) * t));
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.fillRect(0, y0, SCREEN_W, Math.max(1, y1 - y0));
+  }
+
+  // Stars — fade out as day approaches (dayFactor < 0.9)
+  if (dayFactor < 0.9) {
+    const a = (0.9 - dayFactor) / 0.9;
     for (let i = 0; i < 50; i++) {
       const x = (i * 101) % SCREEN_W;
       const y = 3 + ((i * 53) % Math.max(1, top - 26));
       const tw = 0.55 + 0.45 * Math.sin(animTick * 0.07 + i * 0.13);
-      ctx.fillStyle = `rgba(220,230,255,${(a * tw).toFixed(2)})`;
+      const br = Math.round(a * tw * 210);
+      if (br < 15) continue;
+      ctx.fillStyle = `rgb(${br},${br},${Math.min(255, br + 35)})`;
       ctx.fillRect(x, y, 1, 1);
     }
   }
 
-  const alt = Math.sin(Math.PI * clamp(dp, 0, 1));
-  const cx = SCREEN_W * clamp(dp, 0, 1);
-  const cy = (top - 14) - alt * (top - 26);
-  if (dp > 0.22 && dp < 0.78) {
-    fillEllipseC(cx, cy, 13, 13, shadeN(0xFFE680, Math.max(bright, 0.7)));
-    fillEllipseC(cx, cy, 9, 9, shadeN(0xFFF0A0, Math.max(bright, 0.85)));
-    fillEllipseC(cx, cy, 5, 5, '#ffffff');
-  } else {
-    fillEllipseC(cx, cy, 8, 8, '#EEEEFF');
-    fillEllipseC(cx + 3, cy - 2, 8, 8, shadeN(base, bright)); // carve crescent
+  // Sun (dp 0.25→0.75): color lerps yellow-white at zenith → orange-red at horizon
+  if (dp >= 0.25 && dp <= 0.75 && dayFactor > 0.05) {
+    const sunProg = (dp - 0.25) / 0.50;
+    const sunX = Math.round(sunProg * SCREEN_W);
+    const sunY = Math.round((top - 8) - Math.sin(Math.PI * sunProg) * (top - 14));
+    const nearH = 1 - Math.sin(Math.PI * sunProg);        // 0=zenith, 1=horizon
+    const core  = lerpColorInt(lerpColorInt(0xFFFFAA, 0xFF8800, nearH), skyTop, 1 - dayFactor);
+    const glow  = lerpColorInt(lerpColorInt(0xFFDD44, 0xFF4400, nearH), skyTop, 1 - dayFactor);
+    fillEllipseC(sunX, sunY, 13, 13, hex(lerpColorInt(skyTop, glow, 0.45)));
+    fillEllipseC(sunX, sunY, 9, 9, hex(glow));
+    fillEllipseC(sunX, sunY, 5, 5, hex(core));
   }
 
+  // Moon (dp 0.75→1→0→0.25): crescent carved with shadow, fades with dayFactor
+  if ((dp > 0.75 || dp < 0.25) && dayFactor < 0.9) {
+    const nightLen = 0.50;
+    const moonProg = dp > 0.75 ? (dp - 0.75) / nightLen : (dp + 0.25) / nightLen;
+    const moonX = Math.round(moonProg * SCREEN_W);
+    const moonY = Math.round((top - 8) - Math.sin(Math.PI * moonProg) * (top - 14));
+    const moonVis   = 1 - dayFactor / 0.9;
+    const moonCol   = lerpColorInt(skyTop, 0xDDDDE8, moonVis);
+    const shadowCol = lerpColorInt(moonCol, skyTop, 0.85);
+    fillEllipseC(moonX,     moonY,     7, 7, hex(moonCol));
+    fillEllipseC(moonX + 3, moonY - 2, 6, 6, hex(shadowCol));
+  }
+
+  // Clouds (conditions: partly cloudy, cloudy, snowy, foggy)
   if (cond === 1 || cond === 2 || cond === 5 || cond === 6) {
-    const cc = cond === 2 ? 0xBBBBCC : cond === 5 ? 0xCCDDEE : cond === 6 ? 0xBBCCDD : 0xEEEEFF;
+    const ccDay = cond === 2 ? 0xBBBBCC : cond === 5 ? 0xCCDDEE : cond === 6 ? 0xBBCCDD : 0xEEEEFF;
+    const cloudCol = hex(lerpColorInt(0x223344, ccDay, dayFactor));
     const n = (cond === 2 || cond === 6) ? 4 : 2;
-    const col = shadeN(cc, bright);
     for (let i = 0; i < n; i++) {
       const cxp = ((i * 230 + animTick * 0.3) % (SCREEN_W + 140)) - 70;
-      drawCloud(cxp, 14 + (i % 2) * 12, 70, 26, col);
+      drawCloud(cxp, 14 + (i % 2) * 12, 70, 26, cloudCol);
     }
+  }
+
+  // Fog horizontal bands (device: fillRect every 12px, 5px tall, 0xAABBCC)
+  if (cond === 6) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(170,187,204,0.35)';
+    for (let y = 0; y < top; y += 12) ctx.fillRect(0, y, SCREEN_W, 5);
+    ctx.restore();
   }
 }
 
@@ -600,34 +665,111 @@ function drawShadows(fishArr) {
   ctx.restore();
 }
 
-// ── Decorative bubbles (not in telemetry) — local sim, like the device ──
-const bubbles = Array.from({ length: 20 }, () => ({
-  x: Math.random() * SCREEN_W,
-  y: TANK_TOP + Math.random() * (SCREEN_H - TANK_TOP),
-  spd: 0.8 + Math.random() * 1.7,
-  r: 3 + Math.floor(Math.random() * 6),
-  ph: Math.random() * Math.PI * 2,
+// ── Bubbles: source-aware (sand floor, plant tips, fish) ─────────────────────
+// Fewer bubbles than the device; each rises from a realistic origin rather than
+// spawning at random positions. Mirrors the device timing (df = device-frames).
+const MAX_BUBBLES = 12;
+const bubbles = [];
+
+// Fixed sand-floor emitters: staggered x positions, independent countdown timers.
+const _sandEmitters = [70, 155, 260, 370, 460, 580, 690, 750].map((x, i) => ({
+  x, nextIn: 40 + i * 22 + Math.random() * 60,
 }));
-// The device steps bubbles once per 50ms frame (FRAME_MS); the browser rAF runs
-// at ~60fps, so applying the per-frame delta every rAF made bubbles rise ~3x too
-// fast. Drive them by elapsed device-frames (df) instead so they match the device.
+
+// Plant-tip emitters — seeded once from the first snapshot that includes plants
+// (plants are static per aquarium). tipY = SCREEN_H - 20 - segs * 15.
+let _plantEmitters = null;
+
+// Single shared fish-bubble timer — picks a random fish each interval.
+let _fishBubbleTimer = 80 + Math.random() * 100;
+
+function _makeBubble(x, y, small) {
+  if (bubbles.length >= MAX_BUBBLES) return;
+  bubbles.push({
+    x: x + (Math.random() - 0.5) * 10,
+    y,
+    vy: small ? 0.5 + Math.random() * 0.5 : 0.7 + Math.random() * 1.1,
+    r: small ? 2 : 2 + Math.floor(Math.random() * 3),
+    ph: Math.random() * Math.PI * 2,
+  });
+}
+
 function tickBubbles(df) {
-  for (const b of bubbles) {
-    b.y -= b.spd * df;
+  const snap = latestSnapshot;
+
+  // Seed plant emitters once when the first snapshot with plants arrives.
+  if (!_plantEmitters && snap && snap.plants) {
+    _plantEmitters = [];
+    const addTips = (arr, defSegs) => {
+      if (!Array.isArray(arr)) return;
+      for (const p of arr) {
+        const segs = p.segs || defSegs;
+        _plantEmitters.push({ x: p.x, tipY: SCREEN_H - 20 - segs * 15,
+                              nextIn: 80 + Math.random() * 200 });
+      }
+    };
+    addTips(snap.plants.bg,       6);
+    addTips(snap.plants.weeds,    6);
+    addTips(snap.plants.hornwort, 5);
+  }
+
+  // Advance existing bubbles; remove ones that reached the surface.
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    b.y -= b.vy * df;
     b.x = clamp(b.x + Math.sin(animTick * 0.06 + b.ph) * 0.8 * df, 2, SCREEN_W - 2);
-    if (b.y < TANK_TOP) {
-      b.y = SCREEN_H + 10; b.x = Math.random() * SCREEN_W;
-      b.spd = 0.8 + Math.random() * 1.7; b.r = 3 + Math.floor(Math.random() * 6);
+    if (b.y < TANK_TOP) bubbles.splice(i, 1);
+  }
+
+  // Sand-floor spawns: slow, medium-sized bubbles rising from the substrate.
+  for (const em of _sandEmitters) {
+    em.nextIn -= df;
+    if (em.nextIn <= 0) {
+      const by = terrainY[clamp(Math.round(em.x), 0, SCREEN_W - 1)];
+      _makeBubble(em.x, by - 1, false);
+      em.nextIn = 100 + Math.random() * 200;
+    }
+  }
+
+  // Plant-tip spawns: tiny bubbles drifting up from photosynthesis.
+  if (_plantEmitters) {
+    for (const em of _plantEmitters) {
+      em.nextIn -= df;
+      if (em.nextIn <= 0) {
+        _makeBubble(em.x, em.tipY, true);
+        em.nextIn = 160 + Math.random() * 280;
+      }
+    }
+  }
+
+  // Fish bubbles: one small bubble from a random fish on each timer tick.
+  if (snap && Array.isArray(snap.fish) && snap.fish.length) {
+    _fishBubbleTimer -= df;
+    if (_fishBubbleTimer <= 0) {
+      const f = snap.fish[Math.floor(Math.random() * snap.fish.length)];
+      const z = f.z || 0;
+      _makeBubble(projX(f.x, z), projY(f.y, z) - 6, true);
+      _fishBubbleTimer = 80 + Math.random() * 100;
     }
   }
 }
+
 function drawBubbles(top) {
+  ctx.save();
   ctx.strokeStyle = 'rgba(85,204,255,0.7)'; ctx.lineWidth = 1;
   for (const b of bubbles) {
-    if (b.y - b.r < top) continue;
-    ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2); ctx.stroke();
-    if (b.r > 1) { ctx.beginPath(); ctx.arc(b.x, b.y, b.r - 1, 0, Math.PI * 2); ctx.stroke(); }
+    const bx = Math.round(b.x), by = Math.round(b.y);
+    if (by - b.r < top) continue;
+    ctx.beginPath(); ctx.arc(bx, by, b.r, 0, Math.PI * 2); ctx.stroke();
+    if (b.r > 2) {
+      ctx.beginPath(); ctx.arc(bx, by, b.r - 1, 0, Math.PI * 2); ctx.stroke();
+      // Tiny highlight for realism
+      ctx.fillStyle = 'rgba(200,240,255,0.4)';
+      const hr = Math.max(1, Math.round(b.r * 0.28));
+      ctx.beginPath(); ctx.arc(bx - hr, by - hr, hr, 0, Math.PI * 2); ctx.fill();
+    }
   }
+  ctx.restore();
 }
 
 // ── Food flakes — telemetry sends x/y/color only; draw a little cross ──
@@ -855,6 +997,8 @@ const els = {
   viewSub: document.getElementById('view-sub'),
   viewDot: document.getElementById('view-dot'),
   legend: document.getElementById('legend'),
+  legendOverlay: document.getElementById('legend-overlay'),
+  legendToggle: document.getElementById('legend-toggle'),
   conflictBar: document.getElementById('conflict-bar'),
   conflictDetail: document.getElementById('conflict-detail'),
   conflictServer: document.getElementById('conflict-server'),
@@ -892,7 +1036,8 @@ const els = {
 const ctx = els.canvas.getContext('2d');
 
 // Shop prices (coins), mirroring the firmware/mock economy.
-const FISH_PRICE = [10, 30, 45, 60];
+const FISH_PRICE     = [10, 30, 45, 60];
+const FISH_BASE_SELL = [6, 16, 22, 30];   // base sell value by type (≈55-60% of buy price)
 const FOOD_PRICE = 5;
 const SNAIL_PRICE = 50;
 const MAX_SNAILS = 6;
@@ -988,6 +1133,7 @@ function select(id) {
   _blendFrom.clear();
   _blendStartMs = 0;
   _blendBoatFrom = null;
+  _plantEmitters = null;
   highlightedFishId = null;
   hoveredKey = null;
   hitTargets = [];
@@ -1222,7 +1368,20 @@ function render() {
 // Legend: one row per fish, color-matched, with editable name, age, and
 // click-to-highlight. Reconciled by fish id so live updates don't clobber a
 // rename in progress.
+// Fish legend is hidden by default; a floating toggle over the tank shows it.
+let legendVisible = false;
+function setLegendVisible(on) {
+  legendVisible = on;
+  els.legendOverlay.hidden = !on;
+  els.legendToggle.classList.toggle('on', on);
+  els.legendToggle.setAttribute('aria-pressed', on ? 'true' : 'false');
+  if (on && latestSnapshot) renderLegend(latestSnapshot);
+}
+els.legendToggle.addEventListener('click', () => setLegendVisible(!legendVisible));
+setLegendVisible(false);
+
 function renderLegend(s) {
+  if (!legendVisible) return;   // skip DOM work while the list is hidden
   const fish = Array.isArray(s.fish) ? s.fish.filter((f) => typeof f.id === 'number') : [];
   const seen = new Set();
 
@@ -1568,7 +1727,7 @@ function renderGame(snap) {
   const career = g.mode === 'career';
   els.hudMode.textContent = career ? 'Career' : 'Creative';
   els.hudMode.className = 'hud-mode' + (career ? '' : ' creative');
-  els.hudCoins.textContent = '🪙 ' + (g.coins || 0);
+  els.hudCoins.innerHTML = '<span class="ci"></span> ' + (g.coins || 0);
   els.hudShells.textContent = '🐚 ' + (g.shells || 0);
   els.hudFood.textContent = '🍤 ' + (g.food || 0);
   els.hudSnails.textContent = '🐌 ' + ((snap.snails && snap.snails.length) || 0);
@@ -1591,7 +1750,7 @@ function buildShop() {
   for (let t = 0; t < 4; t++) {
     const b = document.createElement('button');
     b.type = 'button'; b.className = 'shop-buy'; b.dataset.type = String(t);
-    b.innerHTML = `<span>🐟 ${escapeHtml(FISH_TYPE_NAMES[t])}</span><span class="price">${FISH_PRICE[t]} 🪙</span>`;
+    b.innerHTML = `<span>🐟 ${escapeHtml(FISH_TYPE_NAMES[t])}</span><span class="price">${FISH_PRICE[t]} <span class="ci"></span></span>`;
     b.addEventListener('click', () => buyFish(t));
     els.shopFish.appendChild(b);
   }
@@ -1701,13 +1860,38 @@ els.canvas.addEventListener('mouseleave', () => {
   hideTooltip();
 });
 
+// Nudge nearby fish toward a canvas point (local effect — resets on next snapshot).
+// Modifies tx/ty on latestSnapshot.fish so the extrapolation engine picks it up.
+function herdFishToward(tx, ty) {
+  if (!latestSnapshot || !Array.isArray(latestSnapshot.fish)) return;
+  const HERD_RADIUS = 240;
+  for (const f of latestSnapshot.fish) {
+    const z = f.z || 0;
+    const dx = projX(f.x, z) - tx, dy = projY(f.y, z) - ty;
+    if (dx * dx + dy * dy > HERD_RADIUS * HERD_RADIUS) continue;
+    // Spread targets slightly so fish don't pile on the same point.
+    const spread = 35 + (f.id % 3) * 10;
+    const ang = (f.id * 1.618) % (Math.PI * 2);
+    f.tx = clamp(tx + Math.cos(ang) * spread, 30, SCREEN_W - 30);
+    f.ty = clamp(ty + Math.sin(ang) * spread * 0.6, TANK_TOP + 20, SCREEN_H - 80);
+    // Give an initial velocity boost toward the target.
+    const ddx = f.tx - f.x, ddy = f.ty - f.y, d = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
+    f.vx = (ddx / d) * 2.5; f.vy = (ddy / d) * 1.2;
+  }
+}
+
 // ─── Click: fish/snail → open profile; loot/wanderer → collect/catch ──────────
 els.canvas.addEventListener('click', (e) => {
   if (!latestSnapshot) return;
   const p = eventToScreen(e);
   spawnPulse(p.x, p.y, 'tap');     // glass-tap ripple wherever you click
   const t = pickTarget(p.x, p.y);
-  if (!t) { closeProfile(); return; }
+  if (!t) {
+    closeProfile();
+    // Herd fish toward the tap if clicking inside the water area.
+    if (p.y > TANK_TOP) herdFishToward(p.x, p.y);
+    return;
+  }
   if (t.kind === 'fish' || t.kind === 'snail') { openProfile(t); return; }
 
   const best = t.ref;
@@ -1717,7 +1901,7 @@ els.canvas.addEventListener('click', (e) => {
   spawnPulse(t.x, t.y, 'collect', pcol);   // celebratory burst on obtaining it
   sendControl({ type: 'catch', itemId: best.id },
     t.kind === 'wanderer' ? 'Caught a fish! 🎣'
-      : (best.kind === 'coin' ? 'Grabbed a coin 🪙' : 'Grabbed a shell 🐚'));
+      : (best.kind === 'coin' ? 'Grabbed a coin!' : 'Grabbed a shell 🐚'));
   // Optimistic: remove locally so it vanishes at once; next snapshot reconciles.
   if (t.kind === 'wanderer')
     latestSnapshot.wanderers = (latestSnapshot.wanderers || []).filter((w) => w.id !== best.id);
@@ -1761,7 +1945,7 @@ function lootTooltipHTML(it) {
   if (it.kind === 'coin')
     return ttTitle('Gold Coin', '#ffd23f', false) +
       `<div class="tt-sub">Spend it in the shop</div>` +
-      `<div class="tt-action grab">Click to collect 🪙</div>`;
+      `<div class="tt-action grab">Click to collect <span class="ci"></span></div>`;
   const names = ['Common Shell', 'Pink Shell', 'Golden Shell'];
   const cols = ['#e7c9a0', '#ff9ec4', '#ffd23f'];
   const ti = it.tier || 0;
@@ -1825,6 +2009,15 @@ function closeProfile() {
   profileKey = null;
   els.profile.hidden = true;
 }
+async function sellFish(fishId) {
+  const snap = latestSnapshot;
+  const f = snap && snap.fish && snap.fish.find((x) => x.id === fishId);
+  if (!f) return;
+  const val = fishSellValue(f);
+  if (!confirm(`Sell ${fishName(f)} for ${val} coins?`)) return;
+  closeProfile();
+  await sendControl({ type: 'sell', fishId }, `Sold ${fishName(f)} for ${val} coins`, { label: 'Sell fish' });
+}
 function pfStat(label, val) {
   return `<div class="pf-stat"><div class="pf-stat-l">${label}</div>` +
          `<div class="pf-stat-v">${escapeHtml(String(val))}</div></div>`;
@@ -1833,16 +2026,22 @@ function fishProfileHTML(f) {
   const r = rarityOf(f), shiny = isShiny(f);
   const q = Math.round(fishLuck(f) * 100), size = Math.round(growth(f) * 100);
   const col = fishColorHex(f);
+  const inCareer = latestSnapshot && latestSnapshot.game && latestSnapshot.game.mode === 'career';
+  const sellVal = inCareer ? fishSellValue(f) : 0;
   return `
     <div class="pf-head">
       <div class="pf-chip${shiny ? ' shiny' : ''}" style="--chip:${col}"></div>
       <div class="pf-head-text">
-        <input class="pf-name" maxlength="24" spellcheck="false"
-          placeholder="${escapeHtml(FISH_TYPE_NAMES[f.type] || 'Fish')} #${f.id}"
-          value="${escapeHtml(f.name || '')}" />
+        <div class="pf-name-row">
+          <input class="pf-name" maxlength="24" spellcheck="false" aria-label="Fish name"
+            placeholder="${escapeHtml(FISH_TYPE_NAMES[f.type] || 'Fish')} #${f.id}"
+            value="${escapeHtml(f.name || '')}" />
+          <button type="button" class="pf-name-save" title="Save name">Save</button>
+        </div>
         <div class="pf-rarity" style="color:${r.color}">${r.name} ${escapeHtml(FISH_TYPE_NAMES[f.type] || 'Fish')}${shiny ? ' · ✦ Shiny' : ''}</div>
       </div>
     </div>
+    <div class="pf-rename-hint">✎ Edit the name above, then press Enter or Save.</div>
     <div class="pf-bar"><div class="pf-bar-fill" style="width:${q}%;background:${r.color}"></div></div>
     <div class="pf-grid">
       ${pfStat('Quality', q + '%')}
@@ -1852,7 +2051,30 @@ function fishProfileHTML(f) {
       ${pfStat('Type', FISH_TYPE_NAMES[f.type] || 'Fish')}
       ${pfStat('Colour', col.toUpperCase())}
     </div>
-    ${shiny ? `<div class="pf-note">✦ A 1-in-${SHINY_ODDS} shiny — inverted colours and a glistening shimmer as it swims.</div>` : ''}`;
+    ${shiny ? `<div class="pf-note">✦ A 1-in-${SHINY_ODDS} shiny — inverted colours and a glistening shimmer as it swims.</div>` : ''}
+    ${inCareer ? `<div class="pf-sell-row">
+      <button type="button" class="pf-sell-btn" data-fish-id="${f.id}">
+        Sell for ${sellVal} <span class="ci"></span>
+      </button>
+    </div>` : ''}`;
+}
+// Wire the profile dialog's rename field: blur, Enter/Escape, and the Save button
+// all persist via saveName(); the Save button briefly confirms.
+function _wireProfileRename(input, fishId) {
+  const saveBtn = els.profileBody.querySelector('.pf-name-save');
+  const flash = () => {
+    if (!saveBtn) return;
+    saveBtn.textContent = 'Saved ✓';
+    saveBtn.classList.add('ok');
+    setTimeout(() => { saveBtn.textContent = 'Save'; saveBtn.classList.remove('ok'); }, 1400);
+  };
+  const commit = () => { saveName(fishId, input.value); flash(); };
+  input.addEventListener('blur', () => saveName(fishId, input.value));
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); commit(); input.blur(); }
+    if (e.key === 'Escape') { input.value = ''; input.blur(); }
+  });
+  if (saveBtn) saveBtn.addEventListener('click', commit);
 }
 function snailProfileHTML(ent) {
   const collector = ent.role === 'collector';
@@ -1878,13 +2100,9 @@ function renderProfile() {
   els.profileBody.innerHTML = ent.kind === 'fish' ? fishProfileHTML(ent.ref) : snailProfileHTML(ent);
   if (ent.kind === 'fish') {
     const input = els.profileBody.querySelector('.pf-name');
-    if (input) {
-      input.addEventListener('blur', () => saveName(ent.ref.id, input.value));
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') input.blur();
-        if (e.key === 'Escape') { input.value = ''; input.blur(); }
-      });
-    }
+    if (input) _wireProfileRename(input, ent.ref.id);
+    const sellBtn = els.profileBody.querySelector('.pf-sell-btn');
+    if (sellBtn) sellBtn.addEventListener('click', () => sellFish(ent.ref.id));
   }
 }
 els.profileClose.addEventListener('click', closeProfile);
@@ -1927,11 +2145,8 @@ function drawTank(s) {
   if (s.boat && s.boat.active) drawBoat(s.boat.x, top); // behind the rim → sits slightly submerged
   drawRim(top, bright);            // metal frame + glass over the waterline (drawn over the boat)
 
-  if (s.plants) {                  // back-to-front plant layers, each swaying
-    drawBgPlants(s.plants, bright);
-    drawSeaweed(s.plants, bright);
-    drawFgHornwort(s.plants, bright);
-  }
+  // Background plants (behind fish for depth — tall stems on the back glass)
+  if (s.plants) drawBgPlants(s.plants, bright);
 
   drawEacZone(bright);             // background traffic silhouettes
 
@@ -1940,6 +2155,13 @@ function drawTank(s) {
     // Far (deeper) fish first so nearer fish overlap them correctly.
     const ordered = s.fish.slice().sort((a, b) => (b.z || 0) - (a.z || 0));
     for (const f of ordered) drawFish(f);
+  }
+
+  // Foreground plants (seaweed + hornwort) drawn AFTER fish so fish swim behind
+  // them, then BEFORE bottom-dwellers so snails/loot are in front of the vegetation.
+  if (s.plants) {
+    drawSeaweed(s.plants, bright);
+    drawFgHornwort(s.plants, bright);
   }
 
   if (Array.isArray(s.flakes)) for (const f of s.flakes) drawFlake(f);

@@ -61,7 +61,9 @@
         <div class="tank-row">
           <div class="tank-wrap">
             <canvas id="tank" width="800" height="480"></canvas>
-            <div id="legend-overlay" class="legend-overlay">
+            <button id="legend-toggle" class="legend-toggle" type="button" aria-pressed="false"
+              title="Show or hide the fish list">🐟 Fish list</button>
+            <div id="legend-overlay" class="legend-overlay" hidden>
               <div class="legend-head">
                 <h3>Fish</h3>
                 <span class="hint">click a row to highlight · click a name to rename</span>
@@ -73,7 +75,7 @@
             <div id="game-panel" class="game-panel" hidden>
               <div class="hud">
                 <span class="hud-mode" id="hud-mode">Career</span>
-                <span class="hud-item" id="hud-coins" title="Coins">🪙 0</span>
+                <span class="hud-item" id="hud-coins" title="Coins"><span class="ci"></span> 0</span>
                 <span class="hud-item" id="hud-shells" title="Shells">🐚 0</span>
                 <span class="hud-item" id="hud-food" title="Fish food">🍤 0</span>
                 <span class="hud-item" id="hud-snails" title="Collector snails">🐌 0</span>
@@ -89,8 +91,8 @@
               <div id="shop" class="shop" hidden>
                 <div class="shop-head">🛒 Shop <span class="hint">spend coins to grow your tank</span></div>
                 <div id="shop-fish" class="shop-fish"></div>
-                <button type="button" id="shop-food" class="shop-buy">🍤 Buy fish food — 5 🪙</button>
-                <button type="button" id="shop-snail" class="shop-buy">🐌 Buy collector snail — 50 🪙</button>
+                <button type="button" id="shop-food" class="shop-buy">🍤 Buy fish food — 5 <span class="ci"></span></button>
+                <button type="button" id="shop-snail" class="shop-buy">🐌 Buy collector snail — 50 <span class="ci"></span></button>
               </div>
             </div>
             <div id="stats" class="stats"></div>

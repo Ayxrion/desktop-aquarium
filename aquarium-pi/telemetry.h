@@ -88,7 +88,7 @@ static bool                     _telemetryStarted    = false;
 // types/colors + plant layout). If the local tank diverges, the device shows an
 // on-screen prompt to keep local or adopt the server's saved profile. Flags set
 // by the POST worker are consumed on the main (render) thread.
-static char              _bootstrapJson[16384] = "";    // last bootstrap body
+static char              _bootstrapJson[49152] = "";    // last bootstrap body (matched to _BootstrapResp)
 static std::atomic<bool> telemetryConflictPending{false}; // → draw the modal
 static std::atomic<bool> _telemetryRestoreReq{false};     // worker→main: rebuild
 static std::atomic<bool> _telemetryConflictHint{false};   // worker→main: re-check
@@ -114,6 +114,9 @@ static std::atomic<int> _ctrlBuySnailReq{0};       // shop coin-collector snail 
 #define CTRL_CATCH_MAX 24
 static std::atomic<uint32_t> _ctrlCatchIds[CTRL_CATCH_MAX]; // wanderer/loot ids to grab
 static std::atomic<int> _ctrlCatchCount{0};
+#define CTRL_SELL_MAX 16
+static std::atomic<int> _ctrlSellFishIds[CTRL_SELL_MAX];    // fish slot indices to sell
+static std::atomic<int> _ctrlSellFishCount{0};
 
 // Parse the control directives out of a POST response body into the atomics above.
 // Each command type appears at most once per response (the server collapses them),
@@ -144,6 +147,20 @@ static void _telemetryParseControls(const char* body) {
             if (idx >= CTRL_CATCH_MAX) break;
             _ctrlCatchIds[idx].store((uint32_t)strtoul(p, nullptr, 10));
             _ctrlCatchCount.store(idx + 1);
+            const char* c = strchr(p, ',');
+            if (!c || (nl && c > nl)) break;
+            p = c + 1;
+        }
+    }
+    // !SELLFISH:<slot,slot,…> — append fish slot indices to sell (drained on main thread).
+    if ((d = strstr(body, "!SELLFISH:")) != nullptr) {
+        const char* p = d + 10;
+        const char* nl = strchr(p, '\n');
+        while (*p && p != nl) {
+            int cnt = _ctrlSellFishCount.load();
+            if (cnt >= CTRL_SELL_MAX) break;
+            _ctrlSellFishIds[cnt].store(atoi(p));
+            _ctrlSellFishCount.store(cnt + 1);
             const char* c = strchr(p, ',');
             if (!c || (nl && c > nl)) break;
             p = c + 1;
@@ -432,7 +449,7 @@ static void _telemetryWorker() {
 // positions, velocities, wander targets, and names to the live fish[] array.
 // Called synchronously from telemetryInit() before the render loop starts.
 
-struct _BootstrapResp { char data[16384]; size_t len; };
+struct _BootstrapResp { char data[49152]; size_t len; };  // 48 KB — MAX_FISH=56 × ~300B/fish ≈ 17 KB; 48 KB leaves room for full career state
 static size_t _bootstrapCapture(void* ptr, size_t sz, size_t n, void* ud) {
     _BootstrapResp* r = static_cast<_BootstrapResp*>(ud);
     size_t bytes = sz * n;

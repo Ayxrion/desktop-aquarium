@@ -26,14 +26,15 @@ const SHELL_BASE_CD = 2600;                   // frames between shell spawns
 const WANDER_BASE_CD = 7000;                  // wandering fish are very rare (~6 min)
 const COIN_GRAV = 0.1;                         // coin sink acceleration (px/frame²) — very gentle, water-like
 const COIN_MAX_VY = 1.4;                        // terminal sink speed so coins drift slowly down, not plummet
-const COIN_REST = 240;                         // frames a landed coin sits before vanishing (~12s)
+const COIN_REST = 480;                         // frames a landed coin sits before vanishing (~24s); timer starts on landing
 const SHELL_TTL = 220;                         // shells linger on the sand a bit longer
 const SAND_Y = H - 20;                         // resting line on the sea floor
-const FISH_PRICE = [10, 30, 45, 60];          // shop fish price (coins) by type
+const FISH_PRICE    = [10, 30, 45, 60];         // shop fish price (coins) by type
+const FISH_BASE_SELL = [6, 16, 22, 30];         // base sell value by type (≈55% of buy)
 const FOOD_PRICE = 5;                          // coins per food unit
 const SNAIL_PRICE = 50;                        // coins per coin-collector snail
 const MAX_SNAILS = 6;
-const SNAIL_REACH = 26;                        // px a snail can grab a coin from
+const SNAIL_REACH = 36;                        // px a snail can grab a coin from
 const SHELL_VALUE = [2, 5, 12];               // shells granted per shell tier
 
 function bound(v, lo, hi) {
@@ -78,7 +79,7 @@ let wanderCD = WANDER_BASE_CD;
 
 function addSnail() {
   if (snails.length >= MAX_SNAILS) return false;
-  snails.push({ x: rnd(80, W - 80), spd: rnd(0.5, 1.0), facing_right: Math.random() > 0.5 });
+  snails.push({ x: rnd(80, W - 80), spd: rnd(1.5, 2.5), facing_right: Math.random() > 0.5 });
   return true;
 }
 
@@ -124,6 +125,15 @@ function removeFish(type) {
     if (fish[i].type === type) { fish.splice(i, 1); return true; }
   }
   return false;
+}
+
+function fishSellValue(f) {
+  const base = FISH_BASE_SELL[f.type] || 6;
+  return base
+    + Math.round(base * scaleOf(f))
+    + Math.round((f.fishLuck || 0) * 15)
+    + Math.min(Math.floor((f.xp || 0) / 100), 8)
+    + (f.shiny ? 12 : 0);
 }
 
 // ── Resident fish physics (mirrors device updateFish) ──
@@ -243,21 +253,27 @@ function stepCareer() {
       } else { it.ttl -= 1; }
     }
     for (const sn of snails) {
-      // Steer toward the nearest coin nearing the floor, else patrol + bounce.
-      let target = null, td = Infinity;
+      // Prefer landed coins (sprint); otherwise intercept any falling coin at its predicted
+      // landing x (coins fall straight down, so landing x == current x).
+      let target = null, td = Infinity, targetLanded = false;
       for (const it of loot) {
-        if (it.kind !== 'coin' || it.y < SAND_Y - 90) continue;
+        if (it.kind !== 'coin') continue;
         const d = Math.abs(it.x - sn.x);
-        if (d < td) { td = d; target = it; }
+        if (it.landed) {
+          if (!targetLanded || d < td) { td = d; target = it; targetLanded = true; }
+        } else if (!targetLanded && d < td) { td = d; target = it; }
       }
-      if (target) { sn.facing_right = target.x > sn.x; sn.x += (sn.facing_right ? 1 : -1) * sn.spd * 1.6; }
-      else {
+      if (target) {
+        sn.facing_right = target.x > sn.x;
+        const mult = targetLanded ? 4.0 : 2.0;
+        sn.x += (sn.facing_right ? 1 : -1) * sn.spd * mult;
+      } else {
         sn.x += (sn.facing_right ? 1 : -1) * sn.spd;
         if (sn.x > W - 55) { sn.x = W - 55; sn.facing_right = false; }
         if (sn.x < 55)     { sn.x = 55;     sn.facing_right = true; }
       }
       for (const it of loot)
-        if (it.kind === 'coin' && it.y > SAND_Y - 40 && Math.abs(it.x - sn.x) < SNAIL_REACH) {
+        if (it.kind === 'coin' && it.landed && Math.abs(it.x - sn.x) < SNAIL_REACH) {
           coins += 1; it.ttl = -1;
         }
     }
@@ -306,6 +322,12 @@ function applyDirectives(text) {
         if (mode === 'career') { if (food <= 0) break; food -= 1; }
         const f = fish[Math.floor(Math.random() * fish.length)];
         if (f) { f.xp += 10; f.fishLuck = clamp(f.fishLuck + 0.06, 0, 1); f.age += 40; }
+      }
+    } else if (line.startsWith('!SELLFISH:')) {
+      for (const idStr of line.slice(10).split(',')) {
+        const id = parseInt(idStr, 10);
+        const fi = fish.findIndex((f) => f.id === id);
+        if (fi >= 0) { coins += fishSellValue(fish[fi]); fish.splice(fi, 1); }
       }
     } else if (line.startsWith('!FISHADD:')) {
       const [, t, n] = line.split(':');

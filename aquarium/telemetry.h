@@ -102,6 +102,9 @@ static std::atomic<int> _ctrlBuySnailReq{0};       // shop coin-collector snail 
 #define CTRL_CATCH_MAX 24
 static std::atomic<uint32_t> _ctrlCatchIds[CTRL_CATCH_MAX]; // wanderer/loot ids to grab
 static std::atomic<int> _ctrlCatchCount{0};
+#define CTRL_SELL_MAX 16
+static std::atomic<int> _ctrlSellFishIds[CTRL_SELL_MAX];    // fish slot indices to sell
+static std::atomic<int> _ctrlSellFishCount{0};
 
 // Parse the control directives out of a POST response body into the atomics above.
 // Each command type appears at most once per response (the server collapses them),
@@ -131,6 +134,19 @@ static void _telemetryParseControls(const char* body) {
             if (idx >= CTRL_CATCH_MAX) break;
             _ctrlCatchIds[idx].store((uint32_t)strtoul(p, nullptr, 10));
             _ctrlCatchCount.store(idx + 1);
+            const char* c = strchr(p, ',');
+            if (!c || (nl && c > nl)) break;
+            p = c + 1;
+        }
+    }
+    if ((d = strstr(body, "!SELLFISH:")) != nullptr) {
+        const char* p = d + 10;
+        const char* nl = strchr(p, '\n');
+        while (*p && p != nl) {
+            int cnt = _ctrlSellFishCount.load();
+            if (cnt >= CTRL_SELL_MAX) break;
+            _ctrlSellFishIds[cnt].store(atoi(p));
+            _ctrlSellFishCount.store(cnt + 1);
             const char* c = strchr(p, ',');
             if (!c || (nl && c > nl)) break;
             p = c + 1;
@@ -515,7 +531,7 @@ static void _applyServerProfileDoc(DynamicJsonDocument& doc) {
 bool telemetryProfileLoaded = false;
 
 static bool telemetryFetchAndApplyProfile() {
-    DynamicJsonDocument doc(12288);
+    DynamicJsonDocument doc(49152);  // 48 KB — MAX_FISH=56 × ~300B/fish ≈ 17 KB JSON; ArduinoJson needs ~2-3× internally
     if (!_fetchBootstrapDoc(doc) || !doc["exists"].as<bool>()) return false;
     _applyServerProfileDoc(doc);
     telemetryProfileLoaded = true;
@@ -532,7 +548,7 @@ static void telemetryBootstrap() {
 // Runtime re-enable: compare local profile to the server's; prompt if different.
 static void telemetryReenableCheck() {
     if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
-    DynamicJsonDocument doc(12288);
+    DynamicJsonDocument doc(49152);  // 48 KB — MAX_FISH=56 × ~300B/fish ≈ 17 KB JSON; ArduinoJson needs ~2-3× internally
     if (!_fetchBootstrapDoc(doc) || !doc["exists"].as<bool>()) return;
     const char* ss = doc["profile_sig"] | "";
     if (_localProfileSig() == String(ss)) return; // matches → no conflict
