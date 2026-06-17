@@ -510,6 +510,20 @@ static void _applyServerProfileDoc(DynamicJsonDocument& doc) {
         }
     }
 
+    // Coin-collector snails — purchased & durable, so restore them across a reboot.
+    // (Loot/wanderers are transient with short TTLs and are intentionally not restored.)
+    numSnails = 0;
+    for (int i = 0; i < MAX_SNAILS; i++) coinSnails[i].active = false;
+    for (JsonObject s : doc["snails"].as<JsonArray>()) {
+        if (numSnails >= MAX_SNAILS) break;
+        CoinSnail& cs = coinSnails[numSnails];
+        cs.x           = s["x"]            | (float)(SCREEN_W / 2);
+        cs.spd         = s["spd"]          | 2.0f;
+        cs.facingRight = s["facing_right"] | true;
+        cs.active      = true;
+        numSnails++;
+    }
+
     for (JsonObject jf : doc["fish"].as<JsonArray>()) {
         int id = jf["id"] | -1;
         if (id < 0 || id >= MAX_FISH || !isFishActive(id)) continue;

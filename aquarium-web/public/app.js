@@ -4,10 +4,13 @@
 // reverse-proxy prefix the deploy service configures.
 
 const WEATHER_NAMES = ['Sunny', 'Partly Cloudy', 'Cloudy', 'Rainy', 'Stormy', 'Snowy', 'Foggy'];
-const FISH_TYPE_NAMES = ['Pair', 'School', 'School 2', 'Angel'];
+const FISH_TYPE_NAMES = ['Pair', 'Guppy', 'Piranha', 'Angel'];
 // Per-type caps + snapshot count keys, mirroring the firmware (main.cpp / aquarium.ino).
-const FISH_MAX = [8, 4, 20, 12];
+// Count keys stay pair/school/school2/angel (persisted slot identifiers); school=Guppy,
+// school2=Piranha. Schooling is a characteristic (FISH_SCHOOLS), not the type's identity.
+const FISH_MAX = [8, 16, 20, 12];
 const FISH_COUNT_KEYS = ['pair', 'school', 'school2', 'angel'];
+const FISH_SCHOOLS = [false, true, true, false]; // does this type shoal with its own kind?
 const TANK_TOP = 72;
 const SCREEN_W = 800;
 const SCREEN_H = 480;
@@ -18,7 +21,7 @@ const SCREEN_H = 480;
 // blend is capped by LUCK_TINT_STRENGTH so even a legendary fish keeps a hint of
 // its type colour. Re-theme the whole tank by editing these four lines; the
 // canvas, legend, tooltips and profiles all follow along.
-const FISH_PRIMARY = [0x2E8BFF, 0x33D17A, 0xFF7A33, 0xB45CFF]; // Pair, School, School 2, Angel
+const FISH_PRIMARY = [0x2E8BFF, 0x33D17A, 0xFF7A33, 0xB45CFF]; // Pair, Guppy, Piranha, Angel
 const LUCK_TINT_COLOR = 0xFFE14D;   // high-luck fish shift toward this (warm gold)
 const LUCK_TINT_STRENGTH = 0.7;     // max blend toward the tint at luck = 1
 const SHINY_ODDS = 1000;            // 1-in-N fish are shiny (inverted + glistening)
@@ -197,8 +200,8 @@ function _extrapolateSnapshot(snap, elapsedMs) {
       let ay = (f.ty - f.y) * seekStr;
       let az = (f.tz - f.z) * 0.010;
 
-      // Cohesion toward group centroid (school / angel), x, y and z.
-      if (t === 1 || t === 2) {
+      // Cohesion toward group centroid — schooling types shoal with their own kind.
+      if (FISH_SCHOOLS[t]) {
         ax += (cent[t].x - f.x) * 0.010;
         ay += (cent[t].y - f.y) * 0.007;
         az += (cent[t].z - f.z) * 0.007;
@@ -1471,7 +1474,7 @@ function formatAge(ms) {
 
 function fmtCounts(c) {
   if (!c) return '—';
-  return `pair ${c.pair || 0} · school ${c.school || 0}/${c.school2 || 0} · angel ${c.angel || 0}`;
+  return `pair ${c.pair || 0} · guppy ${c.school || 0} · piranha ${c.school2 || 0} · angel ${c.angel || 0}`;
 }
 
 // Show/hide the profile-mismatch banner from the snapshot's _conflict field.
@@ -1760,7 +1763,6 @@ function renderGame(snap) {
 function buildShop() {
   els.shopFish.innerHTML = '';
   for (let t = 0; t < 4; t++) {
-    if (t === 1) continue; // school fish are catch-only (wanderers); not sold in shop
     const b = document.createElement('button');
     b.type = 'button'; b.className = 'shop-buy'; b.dataset.type = String(t);
     b.innerHTML = `<span>🐟 ${escapeHtml(FISH_TYPE_NAMES[t])}</span><span class="price">${FISH_PRICE[t]} <span class="ci"></span></span>`;
@@ -2392,7 +2394,7 @@ function drawStats(s) {
     ['Weather', weather, s.weather && s.weather.override ? 'manual override' : 'auto'],
     ['Time of day', clock, (s.time && s.time.mode) || ''],
     ['Fish', String((c.pair || 0) + (c.school || 0) + (c.school2 || 0) + (c.angel || 0)),
-      `pair ${c.pair || 0} · school ${c.school || 0}/${c.school2 || 0} · angel ${c.angel || 0}`],
+      `pair ${c.pair || 0} · guppy ${c.school || 0} · piranha ${c.school2 || 0} · angel ${c.angel || 0}`],
     ['Platform', s.platform || '—', s.fw_version ? 'fw ' + s.fw_version : ''],
     ['Uptime', s.uptime_ms != null ? formatDuration(s.uptime_ms) : '—', ''],
     ['Last seen', lastSeen, s._stale ? '⚠ stale' : ''],

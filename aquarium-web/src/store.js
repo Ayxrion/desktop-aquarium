@@ -92,7 +92,7 @@ function _extrapolateSnapshot(snapshot, elapsedMs) {
         let ax = (f.tx - f.x) * seekStr;
         let ay = (f.ty - f.y) * seekStr;
         let az = (f.tz - f.z) * 0.010;
-        if (t === 1 || t === 2) {
+        if (FISH_SCHOOLS[t]) {
           ax += (cent[t].x - f.x) * 0.010; ay += (cent[t].y - f.y) * 0.007; az += (cent[t].z - f.z) * 0.007;
         } else if (t === 3) {
           ax += (cent[3].x - f.x) * 0.012; ay += (cent[3].y - f.y) * 0.010; az += (cent[3].z - f.z) * 0.008;
@@ -418,7 +418,9 @@ function getNamesText(id) {
 
 // Fish-type caps mirror the firmware (main.cpp / aquarium.ino) so the dashboard
 // and server can validate without a round-trip.
-const FISH_MAX = [8, 4, 20, 12]; // pair, school, school2, angel
+const FISH_MAX = [8, 16, 20, 12]; // pair, guppy(school), piranha(school2), angel
+// Schooling is a per-type characteristic (not the type itself); drives shoaling physics.
+const FISH_SCHOOLS = [false, true, true, false];
 
 // Buffer a downstream control directive for the device's next telemetry response.
 // Returns { ok } or { ok:false, error } on bad input.
@@ -483,7 +485,6 @@ function queueControl(id, cmd) {
       if (what === 'fish') {
         const ft = Number(cmd.fishType);
         if (!Number.isInteger(ft) || ft < 0 || ft > 3) return { ok: false, error: 'bad_fish_type' };
-        if (ft === 1) return { ok: false, error: 'school_catch_only' }; // school fish are catch-only
         p.buyFish[ft] += Math.max(1, Math.min(64, Number(cmd.count) || 1));
       } else if (what === 'food') {
         p.buyFood += Math.max(1, Math.min(99, Number(cmd.count) || 1));
@@ -564,6 +565,7 @@ function bootstrap(id) {
     screen: base.screen || null,
     plants: base.plants || null,
     game: base.game || null,   // mode/coins/shells/food/luck — restore career state
+    snails: base.snails || null, // purchased coin-collector snails — durable, must survive reboot
     fish,                      // each fish already carries age/xp/fish_luck via {...f}
   };
 }

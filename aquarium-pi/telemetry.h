@@ -705,6 +705,26 @@ static void _applyServerProfile(const char* json) {
         }
     }
 
+    // 2b) Coin-collector snails — a purchased, durable object, so restore them
+    //     instead of letting a reboot wipe the player's investment. (Loot/wanderers
+    //     are transient with short TTLs and are intentionally not restored.)
+    numSnails = 0;
+    for (int i = 0; i < MAX_SNAILS; i++) coinSnails[i].active = false;
+    const char* snp = strstr(json, "\"snails\":");
+    if (snp) {
+        char sobjs[MAX_SNAILS][256];
+        int nc = _parseObjArray(snp, sobjs, MAX_SNAILS);
+        for (int i = 0; i < nc && numSnails < MAX_SNAILS; i++) {
+            int x; float spd; bool fr;
+            CoinSnail& s = coinSnails[numSnails];
+            s.x           = _jGetInt(sobjs[i], "x", &x)              ? (float)x : frandr(80, SCREEN_W - 80);
+            s.spd         = _jGetFloat(sobjs[i], "spd", &spd)        ? spd      : frandr(1.5f, 2.5f);
+            s.facingRight = _jGetBool(sobjs[i], "facing_right", &fr) ? fr       : true;
+            s.active      = true;
+            numSnails++;
+        }
+    }
+
     // 3) Overlay the saved fish positions + names.
     _applyBootstrap(json);
     telemetryProfileLoaded = true;

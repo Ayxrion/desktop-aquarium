@@ -282,7 +282,12 @@ struct Flake {
 Flake flakes[MAX_FLAKES];
 
 // ─── Fish ────────────────────────────────────────────────────────────────────
+// Species identities. FISH_SCHOOL = Guppy, FISH_SCHOOL2 = Piranha (legacy enum/telemetry
+// names kept for the persisted slot layout). Schooling is NOT a type — it's the per-species
+// characteristic below: a schooling fish prefers to swim with others of its own type.
 enum FishType : uint8_t { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
+static const bool FISH_SCHOOLS[4] = { false, true, true, false }; // pair, guppy, piranha, angel
+static inline bool typeSchools(FishType t) { return FISH_SCHOOLS[(int)t & 3]; }
 
 struct Fish {
   float    x, y, z;
@@ -304,7 +309,7 @@ struct Fish {
 // Fixed-slot layout: [0..MAX_PAIR-1] pair, [MAX_PAIR..MAX_PAIR+MAX_SCHOOL-1] school1,
 // [MAX_PAIR+MAX_SCHOOL..MAX_FISH-1] school2.  Only the first num* slots are active.
 #define MAX_PAIR    8
-#define MAX_SCHOOL  4               // school caps at 4; grows automatically once you own any
+#define MAX_SCHOOL  16              // guppy capacity (each is an individual fish)
 #define MAX_SCHOOL2 20
 #define MAX_ANGEL   12
 #define MAX_FISH    (MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + MAX_ANGEL)
@@ -329,7 +334,6 @@ int gameCoins = 0, gameShells = 0, gameFood = 0;
 #define COIN_BASE_CD  3000
 #define SHELL_BASE_CD 2600
 #define WANDER_BASE_CD 7000
-#define SCHOOL_GROW_CD 7200             // frames between auto-grow ticks for the school
 #define COIN_GRAV     0.1f              // coin sink acceleration (px/frame²) — very gentle, water-like
 #define COIN_MAX_VY   1.4f              // terminal sink speed so coins drift slowly down, not plummet
 #define COIN_REST     480               // frames a landed coin sits before vanishing (~24s); timer starts on landing
@@ -439,7 +443,7 @@ int numSnails = 0;
 
 static uint32_t nextItemId = 1;
 static float coinCD[MAX_FISH] = {};
-static float shellCD = SHELL_BASE_CD, wanderCD = WANDER_BASE_CD, schoolGrowCd = 0;
+static float shellCD = SHELL_BASE_CD, wanderCD = WANDER_BASE_CD;
 
 // ─── Menu ─────────────────────────────────────────────────────────────────────
 #define HBTN_X   748
@@ -1257,6 +1261,7 @@ void addSnail() {
 void spawnWanderer(float luck) {
   for (int i = 0; i < MAX_WANDER; i++) if (!wanderers[i].active) {
     float r = frandr(0, 1);
+    // guppy (~8%) is a rare wild catch; angel biased by luck; pair most common
     uint8_t type = (r < 0.1f + 0.3f * luck) ? 3 : (r < 0.55f) ? 0 : (r < 0.63f) ? 1 : 2;
     bool fromLeft = (random(0, 2) == 0);
     Wanderer& w = wanderers[i];
@@ -1339,13 +1344,6 @@ void updateCareer() {
     uint8_t tier = (r < 0.05f + 0.25f * luck) ? 2 : (r < 0.15f + 0.45f * luck) ? 1 : 0;
     spawnLoot(1, frandr(40, SCREEN_W - 40), (float)(SCREEN_H - 26), tier);
     shellCD = SHELL_BASE_CD * frandr(0.7f, 1.3f);
-  }
-  // School auto-grow: if any school fish exist but haven't hit the cap, add one every SCHOOL_GROW_CD frames.
-  if (numSchool > 0 && numSchool < MAX_SCHOOL) {
-    if (schoolGrowCd <= 0.0f) schoolGrowCd = SCHOOL_GROW_CD;
-    if ((schoolGrowCd -= 1.0f) <= 0.0f) { addFish(FISH_SCHOOL); schoolGrowCd = SCHOOL_GROW_CD; }
-  } else {
-    schoolGrowCd = 0.0f;
   }
   int activeW = 0;
   for (int i = 0; i < MAX_WANDER; i++) if (wanderers[i].active) activeW++;
@@ -1661,7 +1659,7 @@ void updateFish() {
       ay += (f.ty - f.y) * seekStr;
       az += (f.tz - f.z) * 0.010f;
 
-      if (f.type == FISH_SCHOOL || f.type == FISH_SCHOOL2) {
+      if (typeSchools(f.type)) {                 // schooling: cohere to same-type group
         float cx = (f.type == FISH_SCHOOL) ? scx  : sc2x;
         float cy = (f.type == FISH_SCHOOL) ? scy  : sc2y;
         float cz = (f.type == FISH_SCHOOL) ? scz  : sc2z;
@@ -2402,26 +2400,13 @@ void drawShopPanel() {
     canvas.setTextColor(can ? 0xCCFFDDUL : 0x334455UL);
     canvas.setCursor(rx + 157, SP_Y + 70); canvas.print("BUY");
   }
-  // Fish types (school fish are catch-only — shown grayed with CATCH label, no BUY button)
-  const char* fNames[4] = { "LARGE FISH","SCHOOL FISH","DEEP FISH","ANGELFISH" };
+  // Fish types — each is an individual fish, all buyable (guppy/piranha too).
+  const char* fNames[4] = { "LARGE FISH","GUPPY","PIRANHA","ANGELFISH" };
   int cnts[4] = { numPair, numSchool, numSchool2, numAngel };
   int mxs[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
-  int shopRow = 0;
   for (int t = 0; t < 4; t++) {
-    int fy = SP_Y + 108 + shopRow * 44;
+    int fy = SP_Y + 108 + t * 44;
     canvas.setTextSize(1);
-    if (t == 1) {
-      // School fish: show count/max + CATCH label; no buy button
-      canvas.setTextColor(0x667788UL);
-      canvas.setCursor(rx, fy + 8); canvas.print(fNames[t]);
-      char cbuf[10]; snprintf(cbuf, sizeof(cbuf), "%d/%d", cnts[t], mxs[t]);
-      canvas.setCursor(rx + 100, fy + 8); canvas.print(cbuf);
-      canvas.fillRect(rx + 148, fy, 56, 28, 0x0C1A2AUL);
-      canvas.drawRect(rx + 148, fy, 56, 28, 0x223344UL);
-      canvas.setTextColor(0x334455UL);
-      canvas.setCursor(rx + 151, fy + 10); canvas.print("CATCH");
-      shopRow++; continue;
-    }
     bool can = cnts[t] < mxs[t] && gameCoins >= FISH_PRICE[t];
     canvas.setTextColor(0xAADDFFUL);
     canvas.setCursor(rx, fy + 8); canvas.print(fNames[t]);
@@ -2432,7 +2417,6 @@ void drawShopPanel() {
     canvas.drawRect(rx + 148, fy, 56, 28, can ? 0xFFD23FUL : 0x223344UL);
     canvas.setTextColor(can ? 0x111111UL : 0x334455UL);
     canvas.setCursor(rx + 157, fy + 10); canvas.print("BUY");
-    shopRow++;
   }
   // Close button
   canvas.fillRect(SP_X + SP_W - 36, SP_Y + 4, 28, 20, 0x1A0000UL);
@@ -2486,7 +2470,7 @@ void drawMenu() {
 
   canvas.drawFastHLine(MENU_X + 8, MENU_Y + 34, MENU_W - 16, 0x2244AAUL);
 
-  const char* labels[4] = { "LARGE FISH", "SCHOOL FISH", "DEEP FISH", "ANGELFISH" };
+  const char* labels[4] = { "LARGE FISH", "GUPPY", "PIRANHA", "ANGELFISH" };
   int counts[4]         = { numPair, numSchool, numSchool2, numAngel };
   int maxes[4]          = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
 
@@ -2517,7 +2501,7 @@ void drawMenu() {
 
     // [+] add (creative free) / buy with coins (career)
     bool atCap  = counts[row] >= maxes[row];
-    bool canAdd = career ? (!atCap && row != 1 && gameCoins >= FISH_PRICE[row]) : !atCap;
+    bool canAdd = career ? (!atCap && gameCoins >= FISH_PRICE[row]) : !atCap;
     canvas.fillRect(MENU_X + 210, ry, 30, 30, canAdd ? (career ? 0x3A2E0AUL : 0x1A3355UL) : 0x0C1A2AUL);
     canvas.drawRect(MENU_X + 210, ry, 30, 30, canAdd ? (career ? 0xFFD23FUL : 0x4488CCUL) : 0x223344UL);
     canvas.setTextSize(2);
@@ -2777,11 +2761,8 @@ void loop() {
         const FishType T[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
         int cnts[4] = { numPair, numSchool, numSchool2, numAngel };
         int mxs[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
-        int shopRow2 = 0;
         for (int t = 0; t < 4; t++) {
-          int fy = SP_Y + 108 + shopRow2 * 44;
-          shopRow2++;
-          if (t == 1) continue; // school fish are catch-only; no buy button
+          int fy = SP_Y + 108 + t * 44;
           if (tx >= (uint16_t)(rx + 148) && tx < (uint16_t)(rx + 204) &&
               ty >= (uint16_t)fy          && ty < (uint16_t)(fy + 28)) {
             if (cnts[t] < mxs[t] && gameCoins >= FISH_PRICE[t]) {
@@ -2820,10 +2801,10 @@ void loop() {
         }
         if (tx >= (uint16_t)(MENU_X + 210) && tx < (uint16_t)(MENU_X + 240) &&
             ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
-          if (gameMode == MODE_CAREER) {           // buy with coins (guard cap; school fish are catch-only)
+          if (gameMode == MODE_CAREER) {           // buy with coins (guard the cap)
             int cnt[4] = { numPair, numSchool, numSchool2, numAngel };
             int mx[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
-            if (row != 1 && cnt[row] < mx[row] && gameCoins >= FISH_PRICE[row]) {
+            if (cnt[row] < mx[row] && gameCoins >= FISH_PRICE[row]) {
               gameCoins -= FISH_PRICE[row]; addFish(rowType[row]);
             }
           } else {

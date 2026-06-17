@@ -125,7 +125,12 @@ struct Flake { float x, y, spd; bool active; uint8_t shape; uint8_t colorIdx; };
 Flake flakes[MAX_FLAKES];
 
 // ─── Fish ────────────────────────────────────────────────────────────────────
+// Species identities. FISH_SCHOOL = Guppy, FISH_SCHOOL2 = Piranha (legacy enum/telemetry
+// names kept for the persisted slot layout). Schooling is NOT a type — it's the per-species
+// characteristic below: a schooling fish prefers to swim with others of its own type.
 enum FishType : uint8_t { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
+static const bool FISH_SCHOOLS[4] = { false, true, true, false }; // pair, guppy, piranha, angel
+static inline bool typeSchools(FishType t) { return FISH_SCHOOLS[(int)t & 3]; }
 struct Fish {
     float   x, y, z, vx, vy, vz, tx, ty, tz, wanderCD;
     bool    facingRight;
@@ -141,7 +146,7 @@ struct Fish {
 };
 
 #define MAX_PAIR    8
-#define MAX_SCHOOL  4               // school caps at 4; grows automatically once you own any
+#define MAX_SCHOOL  16              // guppy capacity (each is an individual fish)
 #define MAX_SCHOOL2 20
 #define MAX_ANGEL   12
 #define MAX_FISH    (MAX_PAIR + MAX_SCHOOL + MAX_SCHOOL2 + MAX_ANGEL)
@@ -167,7 +172,6 @@ int gameCoins = 0, gameShells = 0, gameFood = 0;
 #define COIN_BASE_CD  3000              // frames between a fish's coin rolls
 #define SHELL_BASE_CD 2600
 #define WANDER_BASE_CD  7000            // wandering fish are very rare
-#define SCHOOL_GROW_CD  7200            // frames between school auto-grows (6 min @20fps)
 #define COIN_GRAV     0.1f              // coin sink acceleration (px/frame²) — very gentle, water-like
 #define COIN_MAX_VY   1.4f              // terminal sink speed so coins drift slowly down, not plummet
 #define COIN_REST     480               // frames a landed coin sits before vanishing (~24s); timer starts on landing
@@ -224,7 +228,6 @@ static float bubbleSpawnCd = 0;
 static uint32_t nextItemId = 1;
 static float coinCD[MAX_FISH] = {};     // per-fish coin-roll countdown
 static float shellCD = SHELL_BASE_CD, wanderCD = WANDER_BASE_CD;
-static float schoolGrowCd = 0;          // countdown until next school auto-grow
 
 // ─── Menu ─────────────────────────────────────────────────────────────────────
 #define HBTN_X   748
@@ -964,7 +967,7 @@ void addSnail() {
 void spawnWanderer(float luck) {
     for (int i = 0; i < MAX_WANDER; i++) if (!wanderers[i].active) {
         float r = frandr(0, 1);
-        // school fish (~8%) are rare catch-only; angel biased by luck; pair most common
+        // guppy (~8%) is a rare wild catch; angel biased by luck; pair most common
         uint8_t type = (r < 0.1f + 0.3f * luck) ? 3 : (r < 0.55f) ? 0 : (r < 0.63f) ? 1 : 2;
         bool fromLeft = (random(0, 2) == 0);
         Wanderer& w = wanderers[i];
@@ -1050,18 +1053,6 @@ void updateCareer() {
         spawnLoot(1, frandr(40, SCREEN_W - 40), (float)(SCREEN_H - 26), tier);
         shellCD = SHELL_BASE_CD * frandr(0.7f, 1.3f);
     }
-    // School auto-grow: once any school fish are caught, one more joins every SCHOOL_GROW_CD
-    // frames until the school reaches MAX_SCHOOL (4). School fish are catch-only in career.
-    if (numSchool > 0 && numSchool < MAX_SCHOOL) {
-        if (schoolGrowCd <= 0.0f) schoolGrowCd = SCHOOL_GROW_CD;
-        if ((schoolGrowCd -= 1.0f) <= 0.0f) {
-            addFish(FISH_SCHOOL);
-            schoolGrowCd = SCHOOL_GROW_CD;
-        }
-    } else {
-        schoolGrowCd = 0.0f;
-    }
-
     int activeW = 0;
     for (int i = 0; i < MAX_WANDER; i++) if (wanderers[i].active) activeW++;
     if ((wanderCD -= 1.0f) <= 0 && activeW < MAX_WANDER) {
@@ -1386,7 +1377,7 @@ void updateFish() {
             ay += (f.ty - f.y) * seekStr;
             az += (f.tz - f.z) * 0.010f;
 
-            if (f.type == FISH_SCHOOL || f.type == FISH_SCHOOL2) {
+            if (typeSchools(f.type)) {                 // schooling: cohere to same-type group
                 float cx = (f.type == FISH_SCHOOL) ? scx  : sc2x;
                 float cy = (f.type == FISH_SCHOOL) ? scy  : sc2y;
                 float cz = (f.type == FISH_SCHOOL) ? scz  : sc2z;
@@ -1965,25 +1956,12 @@ void drawShopPanel() {
         canvas.setTextColor(can ? 0xCCFFDDUL : 0x334455UL);
         canvas.setCursor(rx + 157, SP_Y + 70); canvas.print("BUY");
     }
-    // Fish types (school fish are catch-only — wanderers only, not sold in shop)
-    const char* fNames[4] = { "LARGE FISH","SCHOOL FISH","DEEP FISH","ANGELFISH" };
+    // Fish types — each is an individual fish, all buyable (guppy/piranha too).
+    const char* fNames[4] = { "LARGE FISH","GUPPY","PIRANHA","ANGELFISH" };
     int cnts[4] = { numPair, numSchool, numSchool2, numAngel };
     int mxs[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
-    int shopRow = 0;
     for (int t = 0; t < 4; t++) {
-        int fy = SP_Y + 108 + shopRow * 44;
-        if (t == 1) {   // school fish: show count + "CATCH" label, no buy button
-            canvas.setTextSize(1); canvas.setTextColor(0x8899AAUL);
-            canvas.setCursor(rx, fy + 8); canvas.print(fNames[t]);
-            char cbuf[12]; snprintf(cbuf, sizeof(cbuf), "%d/%d", cnts[t], mxs[t]);
-            canvas.setTextColor(0x556677UL);
-            canvas.setCursor(rx + 100, fy + 8); canvas.print(cbuf);
-            canvas.fillRect(rx + 148, fy, 56, 28, 0x0C1A2AUL);
-            canvas.drawRect(rx + 148, fy, 56, 28, 0x223344UL);
-            canvas.setTextColor(0x334455UL);
-            canvas.setCursor(rx + 151, fy + 10); canvas.print("CATCH");
-            shopRow++; continue;
-        }
+        int fy = SP_Y + 108 + t * 44;
         bool can = cnts[t] < mxs[t] && gameCoins >= FISH_PRICE[t];
         canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
         canvas.setCursor(rx, fy + 8); canvas.print(fNames[t]);
@@ -1994,7 +1972,6 @@ void drawShopPanel() {
         canvas.drawRect(rx + 148, fy, 56, 28, can ? 0xFFD23FUL : 0x223344UL);
         canvas.setTextColor(can ? 0x111111UL : 0x334455UL);
         canvas.setCursor(rx + 157, fy + 10); canvas.print("BUY");
-        shopRow++;
     }
     // Close button
     canvas.fillRect(SP_X + SP_W - 36, SP_Y + 4, 28, 20, 0x1A0000UL);
@@ -2038,7 +2015,7 @@ void drawMenu() {
     }
     canvas.drawFastHLine(MENU_X + 8, MENU_Y + 34, MENU_W - 16, 0x2244AAUL);
 
-    const char* labels[4] = { "LARGE FISH", "SCHOOL FISH", "DEEP FISH", "ANGELFISH" };
+    const char* labels[4] = { "LARGE FISH", "GUPPY", "PIRANHA", "ANGELFISH" };
     int counts[4]         = { numPair, numSchool, numSchool2, numAngel };
     int maxes[4]          = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
     for (int row = 0; row < 4; row++) {
@@ -2054,8 +2031,7 @@ void drawMenu() {
         canvas.setTextSize(2); canvas.setTextColor(0xFFEE88UL);
         canvas.setCursor(MENU_X + 184, ry + 7); canvas.print(buf);
         bool atCap  = counts[row] >= maxes[row];
-        // School fish (row 1) are catch-only in career — never purchasable via menu
-        bool canAdd = career ? (!atCap && row != 1 && gameCoins >= FISH_PRICE[row]) : !atCap;
+        bool canAdd = career ? (!atCap && gameCoins >= FISH_PRICE[row]) : !atCap;
         canvas.fillRect(MENU_X + 210, ry, 30, 30, canAdd ? (career ? 0x3A2E0AUL : 0x1A3355UL) : 0x0C1A2AUL);
         canvas.drawRect(MENU_X + 210, ry, 30, 30, canAdd ? (career ? 0xFFD23FUL : 0x4488CCUL) : 0x223344UL);
         canvas.setTextSize(2); canvas.setTextColor(canAdd ? 0xFFFFFFUL : 0x334455UL);
@@ -2265,15 +2241,12 @@ void loop() {
                 if (tx >= (uint16_t)(rx + 148) && tx < (uint16_t)(rx + 204) &&
                     ty >= (uint16_t)(SP_Y + 63) && ty < (uint16_t)(SP_Y + 89))
                     if (gameCoins >= SNAIL_PRICE && numSnails < MAX_SNAILS) { gameCoins -= SNAIL_PRICE; addSnail(); }
-                // Fish buy (school fish catch-only — no buy button, skip type 1)
+                // Fish buy — every species (incl. guppy/piranha) is an individual, buyable fish
                 const FishType T[4] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL };
                 int cnts[4] = { numPair, numSchool, numSchool2, numAngel };
                 int mxs[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
-                int shopRow = 0;
                 for (int t = 0; t < 4; t++) {
-                    int fy = SP_Y + 108 + shopRow * 44;
-                    shopRow++;
-                    if (t == 1) continue; // school fish: catch-only, no buy
+                    int fy = SP_Y + 108 + t * 44;
                     if (tx >= (uint16_t)(rx + 148) && tx < (uint16_t)(rx + 204) &&
                         ty >= (uint16_t)fy          && ty < (uint16_t)(fy + 28)) {
                         if (cnts[t] < mxs[t] && gameCoins >= FISH_PRICE[t]) {
@@ -2310,10 +2283,10 @@ void loop() {
                 }
                 if (tx >= (uint16_t)(MENU_X + 210) && tx < (uint16_t)(MENU_X + 240) &&
                     ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
-                    if (gameMode == MODE_CAREER) {            // buy with coins (guard cap + school catch-only)
+                    if (gameMode == MODE_CAREER) {            // buy with coins (guard the cap)
                         int cnt[4] = { numPair, numSchool, numSchool2, numAngel };
                         int mx[4]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL };
-                        if (row != 1 && cnt[row] < mx[row] && gameCoins >= FISH_PRICE[row]) {
+                        if (cnt[row] < mx[row] && gameCoins >= FISH_PRICE[row]) {
                             gameCoins -= FISH_PRICE[row]; addFish(rowType[row]);
                         }
                     } else {

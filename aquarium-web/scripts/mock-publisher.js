@@ -13,7 +13,8 @@ const apiKey = process.env.API_KEY || 'change-me';
 
 const W = 800, H = 480, TOP = 72;
 const PALETTE = [0x00ee66, 0xffdd00, 0xff6600, 0xcc44ff, 0x44ddff, 0xff44aa, 0x00ffff, 0xeeeeee];
-const FISH_MAX = [8, 4, 20, 12];            // pair, school, school2, angel
+const FISH_MAX = [8, 16, 20, 12];           // pair, guppy(school), piranha(school2), angel
+const FISH_SCHOOLS = [false, true, true, false]; // schooling is a per-type characteristic
 
 const FRAME_MS = 50;
 const FRAMES_PER_PUBLISH = 1000 / FRAME_MS; // 20 frames per 1Hz publish
@@ -24,7 +25,6 @@ const GROW_FRAMES = 3600;                     // juvenile→mature growth span (
 const COIN_BASE_CD = 3000;                    // frames between a fish's coin rolls (~2.5 min)
 const SHELL_BASE_CD = 2600;                   // frames between shell spawns
 const WANDER_BASE_CD = 7000;                  // wandering fish are very rare (~6 min)
-const SCHOOL_GROW_CD = 7200;                  // frames between school auto-grows (6 min @20fps)
 const COIN_GRAV = 0.1;                         // coin sink acceleration (px/frame²) — very gentle, water-like
 const COIN_MAX_VY = 1.4;                        // terminal sink speed so coins drift slowly down, not plummet
 const COIN_REST = 480;                         // frames a landed coin sits before vanishing (~24s); timer starts on landing
@@ -85,7 +85,6 @@ let timeMode = 'FAST';
 let coinTimers = new Map();        // fishId → frames until next coin roll
 let shellCD = SHELL_BASE_CD;
 let wanderCD = WANDER_BASE_CD;
-let schoolGrowCD = 0;
 
 // Feeding-schedule state (career). mealFed[s] = slot s satisfied today.
 let mealFed = [false, false, false];
@@ -103,7 +102,6 @@ function resetCareer() {
   wanderers = []; loot = []; snails = [];
   coins = 0; shells = 0; food = 0;
   coinTimers.clear();
-  schoolGrowCD = 0;
   mealFed = [false, false, false];
   mealsToday = 0; overfeedToday = 0; feedSchedInit = false; tankHungry = false;
 }
@@ -214,7 +212,7 @@ function stepPhysics() {
       const maxV = chasing || t === 3 ? 7.0 : 5.5;
       let ax = (f.tx - f.x) * seekStr;
       let ay = (f.ty - f.y) * seekStr;
-      if (t === 1 || t === 2) {
+      if (FISH_SCHOOLS[t]) {
         ax += (cent[t].x - f.x) * 0.010; ay += (cent[t].y - f.y) * 0.007;
         for (const o of fish) {
           if (o === f || o.type !== t) continue;
@@ -270,20 +268,7 @@ function stepCareer() {
     shellCD = SHELL_BASE_CD * rnd(0.7, 1.3);
   }
 
-  // School auto-grow: once you own any school fish, one more joins every SCHOOL_GROW_CD
-  // frames until the school reaches FISH_MAX[1] (4). School is catch-only — never sold
-  // in the shop — so this mechanic is the main way to build up the school.
-  const numSchool = fish.filter((f) => f.type === 1).length;
-  if (numSchool > 0 && numSchool < FISH_MAX[1]) {
-    if (schoolGrowCD <= 0) schoolGrowCD = SCHOOL_GROW_CD;
-    schoolGrowCD -= dt;
-    if (schoolGrowCD <= 0) { addFish(1); schoolGrowCD = SCHOOL_GROW_CD; }
-  } else {
-    schoolGrowCD = 0;
-  }
-
-  // Wandering fish are very rare; school fish (~8%) are rare — you need to catch one
-  // to start a school, then it auto-grows. Type biased toward rarer fish by luck.
+  // Wandering fish are very rare; guppy (~8%) is a rare wild catch. Type biased by luck.
   wanderCD -= dt;
   if (wanderCD <= 0 && wanderers.length < 2) {
     const r = Math.random();
@@ -369,7 +354,6 @@ function applyDirectives(text) {
     } else if (line.startsWith('!BUYFISH:')) {
       const [, t, n] = line.split(':');
       const type = parseInt(t, 10), qty = parseInt(n, 10) || 1;
-      if (type === 1) continue; // school fish are catch-only, not purchasable
       for (let k = 0; k < qty; k++) {
         if (coins >= FISH_PRICE[type] && addFish(type)) coins -= FISH_PRICE[type];
       }
