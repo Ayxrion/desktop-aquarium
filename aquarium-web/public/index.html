@@ -61,7 +61,9 @@
         <div class="tank-row">
           <div class="tank-wrap">
             <canvas id="tank" width="800" height="480"></canvas>
-            <div id="legend-overlay" class="legend-overlay">
+            <button id="legend-toggle" class="legend-toggle" type="button" aria-pressed="false"
+              title="Show or hide the fish list">🐟 Fish list</button>
+            <div id="legend-overlay" class="legend-overlay" hidden>
               <div class="legend-head">
                 <h3>Fish</h3>
                 <span class="hint">click a row to highlight · click a name to rename</span>

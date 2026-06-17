@@ -214,6 +214,33 @@ main {
 }
 #tank { width: 100%; height: 100%; display: block; image-rendering: auto; }
 
+/* Floating toggle that shows/hides the fish legend (hidden by default). */
+.legend-toggle {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 11px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #dbe9f7;
+  background: rgba(8, 16, 26, 0.72);
+  border: 1px solid #ffffff24;
+  border-radius: 999px;
+  cursor: pointer;
+  backdrop-filter: blur(3px);
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.legend-toggle:hover { background: rgba(20, 34, 52, 0.85); border-color: #ffffff3a; }
+.legend-toggle.on {
+  background: rgba(40, 120, 170, 0.82);
+  border-color: #7fd3ff66;
+  color: #f2fbff;
+}
+
 /* Fish legend floats over the bottom of the tank instead of taking page space. */
 .legend-overlay {
   position: absolute;
@@ -231,6 +258,8 @@ main {
               rgba(5, 11, 19, 0));
   backdrop-filter: blur(2px);
 }
+/* `display:flex` above otherwise defeats the [hidden] attribute. */
+.legend-overlay[hidden] { display: none; }
 
 .legend-head {
   display: flex;
@@ -682,10 +711,12 @@ main {
   100% { filter: hue-rotate(360deg) brightness(1.05); box-shadow: 0 0 0 1px #0006, 0 4px 14px #0007, 0 0 20px -2px #5ffbf1; }
 }
 .pf-head-text { flex: 1; min-width: 0; }
+.pf-name-row { display: flex; align-items: center; gap: 6px; }
 .pf-name {
-  width: 100%;
-  background: transparent;
-  border: 1px solid transparent;
+  flex: 1;
+  min-width: 0;
+  background: #0b1622;
+  border: 1px solid #ffffff26;
   border-radius: 6px;
   color: var(--text);
   font: inherit;
@@ -694,8 +725,23 @@ main {
   padding: 3px 6px;
 }
 .pf-name::placeholder { color: var(--muted); font-style: italic; font-weight: 600; }
-.pf-name:hover { border-color: #ffffff22; }
+.pf-name:hover { border-color: #ffffff3a; }
 .pf-name:focus { outline: none; border-color: var(--accent); background: #0b1622; }
+.pf-name-save {
+  flex: 0 0 auto;
+  padding: 6px 11px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: #eaf4ff;
+  background: var(--accent, #2a6ea8);
+  border: 1px solid #ffffff26;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.pf-name-save:hover { filter: brightness(1.12); }
+.pf-name-save.ok { background: #2e8b57; }
+.pf-rename-hint { font-size: 11.5px; color: var(--muted); margin: 6px 0 12px; }
 .pf-name-static { font-size: 19px; font-weight: 700; padding: 3px 6px; }
 .pf-rarity {
   font-size: 12px;

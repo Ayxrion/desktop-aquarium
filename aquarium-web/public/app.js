@@ -855,6 +855,8 @@ const els = {
   viewSub: document.getElementById('view-sub'),
   viewDot: document.getElementById('view-dot'),
   legend: document.getElementById('legend'),
+  legendOverlay: document.getElementById('legend-overlay'),
+  legendToggle: document.getElementById('legend-toggle'),
   conflictBar: document.getElementById('conflict-bar'),
   conflictDetail: document.getElementById('conflict-detail'),
   conflictServer: document.getElementById('conflict-server'),
@@ -1222,7 +1224,20 @@ function render() {
 // Legend: one row per fish, color-matched, with editable name, age, and
 // click-to-highlight. Reconciled by fish id so live updates don't clobber a
 // rename in progress.
+// Fish legend is hidden by default; a floating toggle over the tank shows it.
+let legendVisible = false;
+function setLegendVisible(on) {
+  legendVisible = on;
+  els.legendOverlay.hidden = !on;
+  els.legendToggle.classList.toggle('on', on);
+  els.legendToggle.setAttribute('aria-pressed', on ? 'true' : 'false');
+  if (on && latestSnapshot) renderLegend(latestSnapshot);
+}
+els.legendToggle.addEventListener('click', () => setLegendVisible(!legendVisible));
+setLegendVisible(false);
+
 function renderLegend(s) {
+  if (!legendVisible) return;   // skip DOM work while the list is hidden
   const fish = Array.isArray(s.fish) ? s.fish.filter((f) => typeof f.id === 'number') : [];
   const seen = new Set();
 
@@ -1837,12 +1852,16 @@ function fishProfileHTML(f) {
     <div class="pf-head">
       <div class="pf-chip${shiny ? ' shiny' : ''}" style="--chip:${col}"></div>
       <div class="pf-head-text">
-        <input class="pf-name" maxlength="24" spellcheck="false"
-          placeholder="${escapeHtml(FISH_TYPE_NAMES[f.type] || 'Fish')} #${f.id}"
-          value="${escapeHtml(f.name || '')}" />
+        <div class="pf-name-row">
+          <input class="pf-name" maxlength="24" spellcheck="false" aria-label="Fish name"
+            placeholder="${escapeHtml(FISH_TYPE_NAMES[f.type] || 'Fish')} #${f.id}"
+            value="${escapeHtml(f.name || '')}" />
+          <button type="button" class="pf-name-save" title="Save name">Save</button>
+        </div>
         <div class="pf-rarity" style="color:${r.color}">${r.name} ${escapeHtml(FISH_TYPE_NAMES[f.type] || 'Fish')}${shiny ? ' · ✦ Shiny' : ''}</div>
       </div>
     </div>
+    <div class="pf-rename-hint">✎ Edit the name above, then press Enter or Save.</div>
     <div class="pf-bar"><div class="pf-bar-fill" style="width:${q}%;background:${r.color}"></div></div>
     <div class="pf-grid">
       ${pfStat('Quality', q + '%')}
@@ -1853,6 +1872,24 @@ function fishProfileHTML(f) {
       ${pfStat('Colour', col.toUpperCase())}
     </div>
     ${shiny ? `<div class="pf-note">✦ A 1-in-${SHINY_ODDS} shiny — inverted colours and a glistening shimmer as it swims.</div>` : ''}`;
+}
+// Wire the profile dialog's rename field: blur, Enter/Escape, and the Save button
+// all persist via saveName(); the Save button briefly confirms.
+function _wireProfileRename(input, fishId) {
+  const saveBtn = els.profileBody.querySelector('.pf-name-save');
+  const flash = () => {
+    if (!saveBtn) return;
+    saveBtn.textContent = 'Saved ✓';
+    saveBtn.classList.add('ok');
+    setTimeout(() => { saveBtn.textContent = 'Save'; saveBtn.classList.remove('ok'); }, 1400);
+  };
+  const commit = () => { saveName(fishId, input.value); flash(); };
+  input.addEventListener('blur', () => saveName(fishId, input.value));
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); commit(); input.blur(); }
+    if (e.key === 'Escape') { input.value = ''; input.blur(); }
+  });
+  if (saveBtn) saveBtn.addEventListener('click', commit);
 }
 function snailProfileHTML(ent) {
   const collector = ent.role === 'collector';
@@ -1878,13 +1915,7 @@ function renderProfile() {
   els.profileBody.innerHTML = ent.kind === 'fish' ? fishProfileHTML(ent.ref) : snailProfileHTML(ent);
   if (ent.kind === 'fish') {
     const input = els.profileBody.querySelector('.pf-name');
-    if (input) {
-      input.addEventListener('blur', () => saveName(ent.ref.id, input.value));
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') input.blur();
-        if (e.key === 'Escape') { input.value = ''; input.blur(); }
-      });
-    }
+    if (input) _wireProfileRename(input, ent.ref.id);
   }
 }
 els.profileClose.addEventListener('click', closeProfile);
