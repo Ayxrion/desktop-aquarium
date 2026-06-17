@@ -167,14 +167,14 @@ int gameCoins = 0, gameShells = 0, gameFood = 0;
 #define WANDER_BASE_CD 7000             // wandering fish are very rare
 #define COIN_GRAV     0.1f              // coin sink acceleration (px/frame²) — very gentle, water-like
 #define COIN_MAX_VY   1.4f              // terminal sink speed so coins drift slowly down, not plummet
-#define COIN_REST     240               // frames a landed coin sits before vanishing (~12s)
+#define COIN_REST     480               // frames a landed coin sits before vanishing (~24s); timer starts on landing
 #define SHELL_TTL     220               // shells linger on the sand a bit longer
 #define SAND_Y        (SCREEN_H - 20)   // resting line on the sea floor
 static const int FISH_PRICE[4] = { 10, 30, 45, 60 };
 #define FOOD_PRICE    5
 #define SNAIL_PRICE   50                // coins per coin-collector snail
 #define MAX_SNAILS    6
-#define SNAIL_REACH   26                // px a snail can grab a coin from
+#define SNAIL_REACH   36                // px a snail can grab a coin from
 static const int SHELL_VALUE[3] = { 2, 5, 12 };
 
 #define MAX_WANDER 4
@@ -822,7 +822,7 @@ void spawnLoot(uint8_t kind, float x, float y, uint8_t tier) {
 void addSnail() {
     if (numSnails >= MAX_SNAILS) return;
     CoinSnail& s = coinSnails[numSnails];
-    s.active = true; s.x = frandr(80, SCREEN_W - 80); s.spd = frandr(0.5f, 1.0f);
+    s.active = true; s.x = frandr(80, SCREEN_W - 80); s.spd = frandr(1.5f, 2.5f);
     s.facingRight = (random(0, 2) == 0);
     numSnails++;
 }
@@ -935,24 +935,30 @@ void updateCareer() {
         } else if (--it.ttl <= 0) { it.active = false; }
     }
 
-    // Coin-collector snails: steer toward the nearest coin nearing the floor + grab it.
+    // Coin-collector snails: intercept any coin (predict landing x = current x since coins
+    // fall straight down); sprint 4× for landed coins, fast-walk 2× for falling coins.
     for (int s = 0; s < numSnails; s++) {
         if (!coinSnails[s].active) continue;
         CoinSnail& sn = coinSnails[s];
-        int tgt = -1; float td = 1e9f;
+        int tgt = -1; float td = 1e9f; bool tgtLanded = false;
         for (int i = 0; i < MAX_LOOT; i++) {
-            if (!loot[i].active || loot[i].kind != 0 || loot[i].y < SAND_Y - 90) continue;
+            if (!loot[i].active || loot[i].kind != 0) continue;
             float d = fabsf(loot[i].x - sn.x);
-            if (d < td) { td = d; tgt = i; }
+            if (loot[i].landed) {
+                if (!tgtLanded || d < td) { td = d; tgt = i; tgtLanded = true; }
+            } else if (!tgtLanded && d < td) { td = d; tgt = i; }
         }
-        if (tgt >= 0) { sn.facingRight = loot[tgt].x > sn.x; sn.x += (sn.facingRight ? 1 : -1) * sn.spd * 1.6f; }
-        else {
+        if (tgt >= 0) {
+            sn.facingRight = loot[tgt].x > sn.x;
+            float mult = tgtLanded ? 4.0f : 2.0f;
+            sn.x += (sn.facingRight ? 1 : -1) * sn.spd * mult;
+        } else {
             sn.x += (sn.facingRight ? 1 : -1) * sn.spd;
             if (sn.x > SCREEN_W - 55) { sn.x = SCREEN_W - 55; sn.facingRight = false; }
             if (sn.x < 55)            { sn.x = 55;            sn.facingRight = true; }
         }
         for (int i = 0; i < MAX_LOOT; i++)
-            if (loot[i].active && loot[i].kind == 0 && loot[i].y > SAND_Y - 40 &&
+            if (loot[i].active && loot[i].kind == 0 && loot[i].landed &&
                 fabsf(loot[i].x - sn.x) < SNAIL_REACH) { gameCoins++; loot[i].active = false; }
     }
 }
