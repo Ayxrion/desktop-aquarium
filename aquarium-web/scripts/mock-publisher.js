@@ -54,6 +54,33 @@ function bound(v, lo, hi) {
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const rnd = (a, b) => a + Math.random() * (b - a);
 
+// How many upcoming wander targets each fish precomputes and ships in telemetry so the
+// web replication seeks identical targets (matches sim.js / firmware WANDER_LOOKAHEAD).
+const WANDER_LOOKAHEAD = 4;
+
+// Resolve ONE upcoming wander move — the only place wander RNG is drawn. Mirrors the
+// retarget block in stepPhysics exactly. (Mock has no z motion, so tz tracks z.)
+function computeWanderMove(f, cent, chasingIn) {
+  const t = f.type;
+  let wcd, chasing = chasingIn;
+  if (t === 0) {
+    chasing = !chasingIn;
+    wcd = chasing ? 30 + Math.random() * 40 : 40 + Math.random() * 50;
+  } else if (t === 3) { wcd = 8 + Math.random() * 20; }
+  else { wcd = 15 + Math.random() * 35; }
+  let tx, ty;
+  if (t === 4) {                         // salmon: solitary — roam the tank independently
+    tx = rnd(30, W - 30);
+    ty = rnd(TOP + 20, H - 80);
+  } else {
+    const cg = cent[t + ':' + f._sub];
+    const spread = t === 3 ? 120 : t === 0 ? 0 : 160;
+    tx = clamp(cg.x + (Math.random() * 2 - 1) * spread, 30, W - 30);
+    ty = clamp(cg.y + (Math.random() * 2 - 1) * (t === 3 ? 110 : 90), TOP + 20, H - 80);
+  }
+  return { wcd, tx, ty, tz: f.z, chasing };
+}
+
 let nextId = 0;       // fish ids
 let nextItemId = 1;   // wanderer + loot ids (shared id space the web catches by)
 
@@ -64,6 +91,7 @@ function makeFish(type, x, y) {
     vx: 0, vy: 0,
     tx: rnd(40, W - 40), ty: rnd(TOP + 30, H - 90),
     wanderCD: Math.floor(rnd(10, 50)),
+    wanderQ: [],                 // upcoming wander targets, filled lazily in stepPhysics
     facing_right: Math.random() > 0.5,
     color: PALETTE[(type * 3 + nextId) % PALETTE.length],
     going_for_food: false, chasing: false,
@@ -204,22 +232,17 @@ function stepPhysics() {
     for (const f of fish) {
       const t = f.type;
       f.age += 1;
+      // Keep the lookahead queue full (the only wander RNG draw); the web drains it.
+      let tailChasing = f.wanderQ.length ? f.wanderQ[f.wanderQ.length - 1].chasing : f.chasing;
+      while (f.wanderQ.length < WANDER_LOOKAHEAD) {
+        const mv = computeWanderMove(f, cent, tailChasing);
+        f.wanderQ.push(mv);
+        tailChasing = mv.chasing;
+      }
       f.wanderCD--;
-      if (f.wanderCD <= 0) {
-        if (t === 0) {
-          f.chasing = !f.chasing;
-          f.wanderCD = f.chasing ? 30 + Math.random() * 40 : 40 + Math.random() * 50;
-        } else if (t === 3) { f.wanderCD = 8 + Math.random() * 20; }
-        else { f.wanderCD = 15 + Math.random() * 35; }
-        if (t === 4) {                         // salmon: solitary — roam the tank independently
-          f.tx = rnd(30, W - 30);
-          f.ty = rnd(TOP + 20, H - 80);
-        } else {
-          const cg = cent[t + ':' + f._sub];
-          const spread = t === 3 ? 120 : t === 0 ? 0 : 160;
-          f.tx = clamp(cg.x + (Math.random() * 2 - 1) * spread, 30, W - 30);
-          f.ty = clamp(cg.y + (Math.random() * 2 - 1) * (t === 3 ? 110 : 90), TOP + 20, H - 80);
-        }
+      if (f.wanderCD <= 0) {               // commit to the next precomputed target
+        const mv = f.wanderQ.shift();
+        f.tx = mv.tx; f.ty = mv.ty; f.chasing = mv.chasing; f.wanderCD = mv.wcd;
       }
       const chasing = t === 0 && f.chasing;
       const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
@@ -441,7 +464,12 @@ async function step() {
       x: parseFloat(f.x.toFixed(1)), y: parseFloat(f.y.toFixed(1)), z: f.z,
       vx: parseFloat(f.vx.toFixed(2)), vy: parseFloat(f.vy.toFixed(2)), vz: 0,
       tx: parseFloat(f.tx.toFixed(1)), ty: parseFloat(f.ty.toFixed(1)), tz: f.z,
-      wander_cd: f.wanderCD,
+      wander_cd: parseFloat(f.wanderCD.toFixed(2)),
+      // Upcoming wander targets the web should seek next: [wcd, tx, ty, tz, chasing].
+      wander_q: f.wanderQ.map((m) => [
+        parseFloat(m.wcd.toFixed(2)), parseFloat(m.tx.toFixed(1)),
+        parseFloat(m.ty.toFixed(1)), parseFloat(m.tz.toFixed(3)), m.chasing ? 1 : 0,
+      ]),
       type: f.type, facing_right: f.facing_right, color: f.color,
       going_for_food: f.going_for_food, chasing: f.chasing,
       age: Math.round(f.age), scale: parseFloat(scaleOf(f).toFixed(3)),

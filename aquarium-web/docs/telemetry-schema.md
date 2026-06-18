@@ -47,11 +47,20 @@ history) and pushes it to browsers over SSE. Unknown fields are ignored; only
     {
       "id": 3,                    // stable per-device fish slot — used for naming/age
       "x": 120, "y": 210, "z": 0.3,
-      "type": 1,                  // 0 pair,1 school,2 school2,3 angel
+      "vx": 1.2, "vy": -0.4, "vz": 0.0,
+      "tx": 180, "ty": 240, "tz": 0.3,   // current wander target
+      "wander_cd": 12.50,         // FLOAT — frames until the next retarget (fractional)
+      "type": 1,                  // 0 pair,1 school,2 school2,3 angel,4 salmon
       "facing_right": true,
       "color": 65382,             // 0xRRGGBB
       "going_for_food": false,
-      "chasing": false
+      "chasing": false,
+      // Precomputed upcoming wander targets (FIFO, up to 4). Each entry is
+      // [wcd, tx, ty, tz, chasing]. The web replication drains this queue when a fish's
+      // countdown expires so it seeks the EXACT targets this device will, instead of
+      // rolling its own random target and drifting until the next snapshot. The device
+      // commits to these same values, so device + web stay in sync between snapshots.
+      "wander_q": [ [40.0, 360, 230, 0.3, 0], [22.5, 150, 280, 0.3, 0] ]
     }
   ],
 

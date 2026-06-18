@@ -106,9 +106,10 @@ function fishName(f) { return f.name || `${FISH_TYPE_NAMES[f.type] || 'Fish'} #$
 // real time — not a telemetry interval behind — we forward-simulate the device's OWN
 // fish physics from the latest snapshot up to the live edge (its current tick,
 // estimated from the snapshot cadence). That physics is deterministic and matches the
-// device exactly, EXCEPT for the random wander target a fish picks when its countdown
-// expires (unknowable until the next snapshot). That's the only divergence, and it's
-// small over one ~1 s interval. Each snapshot is authoritative: we reseed from it and
+// device exactly: the device now precomputes its upcoming wander targets and ships them
+// per fish (wander_q), so when a countdown expires we seek the SAME target it will, with
+// no random divergence. (If we ever predict past the precomputed queue we fall back to a
+// local roll, reconciled at the next snapshot.) Each snapshot is authoritative: we reseed
 // let the tiny prediction error decay away smoothly (errById) so corrections are
 // invisible — real time, no lag, no rubber-banding. The live clock also phases every
 // decorative animation, so the whole scene stays locked to the device.
@@ -164,9 +165,9 @@ function boundA(v, lo, hi, k) {
 // (sim.js stepPhysics / firmware updateFish): sub-school centroids, cohesion, pairwise
 // separation, target seeking, boundary springs, damping, AND wander retargeting — so
 // the fish keep roaming during long gaps between telemetry instead of gliding to a
-// stale target and stopping. The device's retarget RNG differs from ours, so positions
-// diverge slightly between snapshots; the error-decay reconciliation (errById) then
-// eases them onto the authoritative truth on the next snapshot (no snap, no freeze).
+// stale target and stopping. Retargets drain the device-supplied wander_q so we pick the
+// same targets the device does; any residual float-rounding drift is eased onto the
+// authoritative truth on the next snapshot by the error-decay reconciliation (errById).
 function stepFishOnce(fish) {
   const cent = {}; const order = [0, 0, 0, 0, 0];
   for (const f of fish) {
@@ -184,7 +185,14 @@ function stepFishOnce(fish) {
     // does (clownfish toggle chase; salmon roam solo; schoolers/angel aim near centroid).
     if (f.wcd > 0) {
       f.wcd--;
+    } else if (f.wq && f.wq.length) {
+      // Seek the exact next target the device committed to (drained from telemetry's
+      // wander_q), so prediction matches the device instead of diverging on a fresh roll.
+      const mv = f.wq.shift();
+      f.tx = mv.tx; f.ty = mv.ty; f.tz = mv.tz; f.chasing = mv.chasing; f.wcd = mv.wcd;
     } else {
+      // Queue exhausted (predicted further than the device precomputed): fall back to a
+      // local roll — no worse than before; the next snapshot reconciles any drift.
       if (t === 0) {
         f.chasing = !f.chasing;
         f.wcd = f.chasing ? 30 + Math.random() * 40 : 40 + Math.random() * 50;
@@ -240,6 +248,12 @@ function makePredFish(snap) {
     tx: f.tx != null ? f.tx : f.x, ty: f.ty != null ? f.ty : f.y,
     tz: typeof f.tz === 'number' ? f.tz : (f.z || 0),
     wcd: typeof f.wander_cd === 'number' ? f.wander_cd : 30,
+    // Upcoming wander targets the device precomputed: [wcd, tx, ty, tz, chasing]. We pop
+    // these instead of rolling our own random target, so we seek exactly what the device
+    // will — eliminating the only prediction divergence between snapshots.
+    wq: Array.isArray(f.wander_q)
+      ? f.wander_q.map((a) => ({ wcd: a[0], tx: a[1], ty: a[2], tz: a[3], chasing: !!a[4] }))
+      : [],
     chasing: !!f.chasing, going_for_food: !!f.going_for_food,
     facing_right: f.facing_right,
   }));

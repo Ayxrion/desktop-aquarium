@@ -276,14 +276,14 @@ static std::string _buildTelemetryJson() {
         snprintf(tmp, sizeof(tmp),
             "%s{\"id\":%d,\"x\":%.1f,\"y\":%.1f,\"z\":%.3f,"
             "\"vx\":%.2f,\"vy\":%.2f,\"vz\":%.4f,"
-            "\"tx\":%.1f,\"ty\":%.1f,\"tz\":%.3f,\"wander_cd\":%d,"
+            "\"tx\":%.1f,\"ty\":%.1f,\"tz\":%.3f,\"wander_cd\":%.2f,"
             "\"type\":%d,\"facing_right\":%s,"
             "\"color\":%u,\"going_for_food\":%s,\"chasing\":%s,"
-            "\"age\":%d,\"scale\":%.3f,\"xp\":%d,\"fish_luck\":%.3f}",
+            "\"age\":%d,\"scale\":%.3f,\"xp\":%d,\"fish_luck\":%.3f,\"wander_q\":[",
             first ? "" : ",", i,
             f.x, f.y, f.z,
             f.vx, f.vy, f.vz,
-            f.tx, f.ty, f.tz, (int)f.wanderCD,
+            f.tx, f.ty, f.tz, f.wanderCD,
             (int)f.type,
             f.facingRight ? "true" : "false",
             (unsigned)fishColor(i),
@@ -291,6 +291,14 @@ static std::string _buildTelemetryJson() {
             f.chasing ? "true" : "false",
             (int)f.age, fishScale(f), (int)f.xp, f.fishLuck);
         j += tmp;
+        // Upcoming wander targets the web should seek next: [wcd, tx, ty, tz, chasing].
+        for (uint8_t q = 0; q < f.wanderQN; q++) {
+            WanderMove& m = f.wanderQ[q];
+            snprintf(tmp, sizeof(tmp), "%s[%.2f,%.1f,%.1f,%.3f,%d]",
+                q ? "," : "", m.wcd, m.tx, m.ty, m.tz, m.chasing ? 1 : 0);
+            j += tmp;
+        }
+        j += "]}";
         first = false;
     }
     j += "],";
@@ -605,8 +613,8 @@ static void _applyBootstrap(const char* json) {
         }
         // Null-terminate a local copy of this fish object
         size_t objLen = (size_t)(end - p);
-        if (objLen >= 512) { p = end; continue; }
-        char obj[512]; memcpy(obj, p, objLen); obj[objLen] = '\0';
+        if (objLen >= 768) { p = end; continue; }   // headroom for the wander_q array
+        char obj[768]; memcpy(obj, p, objLen); obj[objLen] = '\0';
 
         int id = -1;
         if (!_jGetInt(obj, "id", &id) || id < 0 || id >= MAX_FISH || !isFishActive(id)) {
@@ -621,7 +629,7 @@ static void _applyBootstrap(const char* json) {
         if (_jGetFloat(obj, "vy",      &fv)) f.vy       = fv;
         if (_jGetInt(obj, "tx",        &iv)) f.tx       = (float)iv;
         if (_jGetInt(obj, "ty",        &iv)) f.ty       = (float)iv;
-        if (_jGetInt(obj, "wander_cd", &iv)) f.wanderCD = (float)iv;
+        if (_jGetFloat(obj, "wander_cd", &fv)) f.wanderCD = fv;  // queue (wander_q) refills lazily
         if (_jGetBool(obj, "chasing",  &bv)) f.chasing  = bv;
         if (_jGetInt(obj, "age",       &iv)) f.age      = (float)iv;
         if (_jGetInt(obj, "xp",        &iv)) f.xp       = iv;

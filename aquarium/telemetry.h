@@ -60,7 +60,7 @@ static uint32_t _lastTelemetryMs = 0;
 // Worst case ~45 fish (~110 chars each) + plants + header ≈ 6 KB; 12 KB is safe.
 // Written by the loop thread (build) only while the worker is idle; read by the
 // worker only while busy — see _telemetryBusy below — so no lock is needed.
-static char _telemetryBuf[20480];
+static char _telemetryBuf[28672];   // headroom for per-fish wander_q lookahead arrays
 static int  _telemetryBufLen = 0;
 
 // ── Runtime state ─────────────────────────────────────────────────────────────
@@ -265,20 +265,27 @@ static int _buildTelemetryJson() {
         o = _tAppend(o,
             "%s{\"id\":%d,\"x\":%.1f,\"y\":%.1f,\"z\":%.3f,"
             "\"vx\":%.2f,\"vy\":%.2f,\"vz\":%.4f,"
-            "\"tx\":%.1f,\"ty\":%.1f,\"tz\":%.3f,\"wander_cd\":%d,"
+            "\"tx\":%.1f,\"ty\":%.1f,\"tz\":%.3f,\"wander_cd\":%.2f,"
             "\"type\":%d,\"facing_right\":%s,"
             "\"color\":%u,\"going_for_food\":%s,\"chasing\":%s,"
-            "\"age\":%d,\"scale\":%.3f,\"xp\":%d,\"fish_luck\":%.3f}",
+            "\"age\":%d,\"scale\":%.3f,\"xp\":%d,\"fish_luck\":%.3f,\"wander_q\":[",
             first ? "" : ",", i,
             f.x, f.y, f.z,
             f.vx, f.vy, f.vz,
-            f.tx, f.ty, f.tz, (int)f.wanderCD,
+            f.tx, f.ty, f.tz, f.wanderCD,
             (int)f.type,
             f.facingRight ? "true" : "false",
             (unsigned)fishColor(i),
             f.goingForFood ? "true" : "false",
             f.chasing ? "true" : "false",
             (int)f.age, fishScale(f), (int)f.xp, f.fishLuck);
+        // Upcoming wander targets the web should seek next: [wcd, tx, ty, tz, chasing].
+        for (uint8_t q = 0; q < f.wanderQN; q++) {
+            WanderMove& m = f.wanderQ[q];
+            o = _tAppend(o, "%s[%.2f,%.1f,%.1f,%.3f,%d]",
+                q ? "," : "", m.wcd, m.tx, m.ty, m.tz, m.chasing ? 1 : 0);
+        }
+        o = _tAppend(o, "]}");
         first = false;
     }
     o = _tAppend(o, "],");
@@ -573,7 +580,7 @@ static void _applyServerProfileDoc(DynamicJsonDocument& doc) {
 bool telemetryProfileLoaded = false;
 
 static bool telemetryFetchAndApplyProfile() {
-    DynamicJsonDocument doc(49152);  // 48 KB — MAX_FISH=56 × ~300B/fish ≈ 17 KB JSON; ArduinoJson needs ~2-3× internally
+    DynamicJsonDocument doc(65536);  // 64 KB — MAX_FISH=72 × ~430B/fish (incl. wander_q) ≈ 31 KB JSON; ArduinoJson needs ~2× internally
     if (!_fetchBootstrapDoc(doc) || !doc["exists"].as<bool>()) return false;
     _applyServerProfileDoc(doc);
     telemetryProfileLoaded = true;
@@ -601,7 +608,7 @@ static void telemetryApplyAquariumSwitch() {
 // Runtime re-enable: compare local profile to the server's; prompt if different.
 static void telemetryReenableCheck() {
     if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
-    DynamicJsonDocument doc(49152);  // 48 KB — MAX_FISH=56 × ~300B/fish ≈ 17 KB JSON; ArduinoJson needs ~2-3× internally
+    DynamicJsonDocument doc(65536);  // 64 KB — MAX_FISH=72 × ~430B/fish (incl. wander_q) ≈ 31 KB JSON; ArduinoJson needs ~2× internally
     if (!_fetchBootstrapDoc(doc) || !doc["exists"].as<bool>()) return;
     const char* ss = doc["profile_sig"] | "";
     if (_localProfileSig() == String(ss)) return; // matches → no conflict

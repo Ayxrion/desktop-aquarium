@@ -292,6 +292,19 @@ enum FishType : uint8_t { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH
 static const int  FISH_SCHOOL_SIZE[5] = { 2, 6, 4, 0, 0 }; // clownfish, guppy, piranha, angel, salmon
 static inline bool typeSchools(FishType t) { return t == FISH_SCHOOL || t == FISH_SCHOOL2; }
 
+// How many upcoming wander targets each fish precomputes and ships in telemetry so the
+// web replication seeks the EXACT targets this device will use (rather than rolling its
+// own random ones and drifting). 4 covers a full 20-frame publish window even for the
+// snappiest angelfish (wander_cd as low as 8), with margin.
+#define WANDER_LOOKAHEAD 4
+
+// One fully-resolved wander target + how long it stays active. Precomputed and queued so
+// the random draw happens here (device side) and the result rides telemetry to the web.
+struct WanderMove {
+  float wcd, tx, ty, tz;
+  bool  chasing;
+};
+
 struct Fish {
   float    x, y, z;
   float    vx, vy, vz;
@@ -307,6 +320,8 @@ struct Fish {
   float    age;        // career: frames alive → growth scale (no death)
   int      xp;         // career: feeding XP
   float    fishLuck;   // career: 0..1, raised by feeding/XP
+  WanderMove wanderQ[WANDER_LOOKAHEAD];  // precomputed upcoming targets (FIFO)
+  uint8_t  wanderQN;                     // entries currently queued
 };
 
 // Fixed-slot layout: [0..MAX_PAIR-1] pair, [MAX_PAIR..MAX_PAIR+MAX_SCHOOL-1] school1,
@@ -517,8 +532,9 @@ bool     menuOpen      = false;
 #define SP_W     780
 #define SP_H     (SCREEN_H - TANK_TOP - 4)
 #define SP_MID   (SP_X + SP_W / 2)
-#define SP_ROW_H 40
-#define SP_ROWS  9
+#define SP_LEFT_W ((SP_MID - SP_X) - 8)
+#define SP_ROW_H 56
+#define SP_ROWS  6
 bool shopOpen     = false;
 int  shopSellPage = 0;
 
@@ -691,6 +707,7 @@ void initFishEntry(int idx,
   f.vy         = 0;
   f.vz         = 0;
   f.wanderCD   = frandr(40, 130);
+  f.wanderQN   = 0;                        // queue fills lazily on first updateFish()
   f.facingRight = (vx >= 0);
   f.type        = type;
   f.partner     = partner;
@@ -1614,6 +1631,66 @@ int nearestFlake(const Fish& f) {
   return best;
 }
 
+// Resolve ONE upcoming wander move for a fish, given the current sub-school centroids and
+// the chase state it starts from. This is the only place wander RNG is drawn: the result
+// (a fully-resolved absolute target + its countdown) is queued and shipped in telemetry,
+// so the web replication seeks identical targets rather than rolling its own. Mirrors the
+// retarget block in updateFish() exactly.
+WanderMove computeWanderMove(Fish& f, bool chasingIn,
+                             float scx, float scy, float scz,
+                             float sc2x, float sc2y, float sc2z,
+                             float sacx, float sacy, float sacz) {
+  WanderMove m;
+  m.chasing = chasingIn;
+  if (f.type == FISH_PAIR) {
+    m.chasing  = !chasingIn;
+    m.wcd = m.chasing ? frandr(30, 70) : frandr(40, 90);
+  } else if (f.type == FISH_ANGEL) {
+    m.wcd = frandr(8, 28);   // more frequent — snappier movement
+  } else {
+    m.wcd = frandr(15, 50);
+  }
+
+  if (f.type == FISH_PAIR && f.partner >= 0 && isFishActive(f.partner)) {
+    Fish& partner = fish[f.partner];
+    if (m.chasing) {
+      m.tx = constrain(partner.x + frandr(-40, 40), 30.0f, (float)(SCREEN_W - 30));
+      m.ty = constrain(partner.y + frandr(-30, 30), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+      m.tz = constrain(partner.z + frandr(-0.10f, 0.10f), 0.05f, 0.72f);
+    } else {
+      float fleeX = f.x + (f.x - partner.x) * 1.5f;
+      float fleeY = f.y + (f.y - partner.y) * 1.2f;
+      m.tx = constrain(fleeX + frandr(-60, 60), 30.0f, (float)(SCREEN_W - 30));
+      m.ty = constrain(fleeY + frandr(-40, 40), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+      m.tz = constrain(partner.z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
+    }
+  } else if (f.type == FISH_PAIR) {
+    // Solo pair fish — wander freely
+    m.tx = frandr(30.0f, (float)(SCREEN_W - 30));
+    m.ty = frandr((float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+    m.tz = constrain(f.tz + frandr(-0.12f, 0.12f), 0.05f, 0.72f);
+  } else if (f.type == FISH_SCHOOL) {
+    m.tx = constrain(scx + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
+    m.ty = constrain(scy + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+    m.tz = constrain(scz + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
+  } else if (f.type == FISH_SCHOOL2) {
+    m.tx = constrain(sc2x + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
+    m.ty = constrain(sc2y + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+    m.tz = constrain(sc2z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
+  } else if (f.type == FISH_ANGEL) {
+    // Angelfish — tighter spread, more vertical range
+    m.tx = constrain(sacx + frandr(-120, 120), 30.0f, (float)(SCREEN_W - 30));
+    m.ty = constrain(sacy + frandr(-110, 110), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+    m.tz = constrain(sacz + frandr(-0.18f, 0.18f), 0.05f, 0.72f);
+  } else {
+    // Salmon (school size 0) + any solitary type: roam the whole tank independently.
+    m.tx = frandr(30.0f, (float)(SCREEN_W - 30));
+    m.ty = frandr((float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+    m.tz = constrain(f.tz + frandr(-0.12f, 0.12f), 0.05f, 0.72f);
+  }
+  return m;
+}
+
 void updateFish() {
   // School 1 centroid
   float scx = 0, scy = 0, scz = 0;
@@ -1677,53 +1754,22 @@ void updateFish() {
     // ── Wander / flock ───────────────────────────────────────────────────────
     else {
       f.wanderCD -= 1.0f;
-      if (f.wanderCD <= 0.0f) {
-        if (f.type == FISH_PAIR) {
-          f.chasing  = !f.chasing;
-          f.wanderCD = f.chasing ? frandr(30, 70) : frandr(40, 90);
-        } else if (f.type == FISH_ANGEL) {
-          f.wanderCD = frandr(8, 28);   // more frequent — snappier movement
-        } else {
-          f.wanderCD = frandr(15, 50);
-        }
-
-        if (f.type == FISH_PAIR && f.partner >= 0 && isFishActive(f.partner)) {
-          Fish& partner = fish[f.partner];
-          if (f.chasing) {
-            f.tx = constrain(partner.x + frandr(-40, 40), 30.0f, (float)(SCREEN_W - 30));
-            f.ty = constrain(partner.y + frandr(-30, 30), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-            f.tz = constrain(partner.z + frandr(-0.10f, 0.10f), 0.05f, 0.72f);
-          } else {
-            float fleeX = f.x + (f.x - partner.x) * 1.5f;
-            float fleeY = f.y + (f.y - partner.y) * 1.2f;
-            f.tx = constrain(fleeX + frandr(-60, 60), 30.0f, (float)(SCREEN_W - 30));
-            f.ty = constrain(fleeY + frandr(-40, 40), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-            f.tz = constrain(partner.z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
-          }
-        } else if (f.type == FISH_PAIR) {
-          // Solo pair fish — wander freely
-          f.tx = frandr(30.0f, (float)(SCREEN_W - 30));
-          f.ty = frandr((float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-          f.tz = constrain(f.tz + frandr(-0.12f, 0.12f), 0.05f, 0.72f);
-        } else if (f.type == FISH_SCHOOL) {
-          f.tx = constrain(scx + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
-          f.ty = constrain(scy + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-          f.tz = constrain(scz + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
-        } else if (f.type == FISH_SCHOOL2) {
-          f.tx = constrain(sc2x + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
-          f.ty = constrain(sc2y + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-          f.tz = constrain(sc2z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
-        } else if (f.type == FISH_ANGEL) {
-          // Angelfish — tighter spread, more vertical range
-          f.tx = constrain(sacx + frandr(-120, 120), 30.0f, (float)(SCREEN_W - 30));
-          f.ty = constrain(sacy + frandr(-110, 110), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-          f.tz = constrain(sacz + frandr(-0.18f, 0.18f), 0.05f, 0.72f);
-        } else {
-          // Salmon (school size 0) + any solitary type: roam the whole tank independently.
-          f.tx = frandr(30.0f, (float)(SCREEN_W - 30));
-          f.ty = frandr((float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-          f.tz = constrain(f.tz + frandr(-0.12f, 0.12f), 0.05f, 0.72f);
-        }
+      // Keep the lookahead queue full, computed against the current centroids/partner.
+      // New entries are pushed here (the only wander RNG draw); the web drains this queue
+      // verbatim from telemetry, so it never has to guess a target.
+      bool tailChasing = (f.wanderQN > 0) ? f.wanderQ[f.wanderQN - 1].chasing : f.chasing;
+      while (f.wanderQN < WANDER_LOOKAHEAD) {
+        f.wanderQ[f.wanderQN] = computeWanderMove(f, tailChasing,
+                                                  scx, scy, scz, sc2x, sc2y, sc2z,
+                                                  sacx, sacy, sacz);
+        tailChasing = f.wanderQ[f.wanderQN].chasing;
+        f.wanderQN++;
+      }
+      if (f.wanderCD <= 0.0f) {                 // commit to the next precomputed target
+        WanderMove m = f.wanderQ[0];
+        for (uint8_t q = 1; q < f.wanderQN; q++) f.wanderQ[q - 1] = f.wanderQ[q];
+        f.wanderQN--;
+        f.tx = m.tx; f.ty = m.ty; f.tz = m.tz; f.chasing = m.chasing; f.wanderCD = m.wcd;
       }
 
       float seekStr = (f.type == FISH_PAIR && f.chasing) ? 0.018f
@@ -2400,6 +2446,105 @@ void drawCartButton() {
   canvas.drawLine(cx - 14, cy - 8, cx - 17, cy - 8, 0xFFD23FUL);
 }
 
+void formatFishAgeStr(const Fish& f, char* buf, size_t n) {
+  if (gameMode != MODE_CAREER) { snprintf(buf, n, "Adult"); return; }
+  int s = (int)(f.age / 20.0f + 0.5f);
+  if (s < 60)       snprintf(buf, n, "%ds", s);
+  else if (s < 3600) snprintf(buf, n, "%dm", s / 60);
+  else               snprintf(buf, n, "%dh%02dm", s / 3600, (s / 60) % 60);
+}
+
+void drawFishSellPreview(int idx, int boxX, int boxY, int boxW, int boxH) {
+  if (!isFishActive(idx)) return;
+  const Fish& f = fish[idx];
+  canvas.fillRect(boxX, boxY, boxW, boxH, 0x0A1220UL);
+  canvas.drawRect(boxX, boxY, boxW, boxH, 0x224466UL);
+  int cx = boxX + boxW / 2;
+  int cy = boxY + boxH / 2 + 2;
+  uint32_t col = fishColor(idx);
+  int ts = fishTS(f);
+  if (ts > 2) ts = 2;
+  canvas.setTextSize(ts);
+  canvas.setTextColor(col);
+  int chars = (f.type == FISH_PAIR) ? 5 : 3;
+  int hw = (chars * 6 * ts) / 2;   // ESP canvas uses fixed 6px char width
+  if (f.type == FISH_PAIR) {
+    canvas.setCursor(cx - hw, cy - 4 * ts);
+    canvas.print("><(o>");
+  } else if (f.type == FISH_ANGEL) {
+    canvas.setTextSize(1);
+    canvas.setCursor(cx - 3, cy - 4 * ts - 6);
+    canvas.print("\\");
+    canvas.setTextSize(ts);
+    canvas.setCursor(cx - hw, cy - 4 * ts);
+    canvas.print("><>");
+    canvas.setTextSize(1);
+    canvas.setCursor(cx - 3, cy + 4 * ts);
+    canvas.print("/");
+  } else {
+    canvas.setCursor(cx - hw, cy - 4 * ts);
+    canvas.print("><>");
+  }
+  if (fishIsShiny((uint32_t)idx)) {
+    canvas.setTextSize(1);
+    canvas.setTextColor(0xFFFFAAUL);
+    canvas.setCursor(boxX + 2, boxY + 2);
+    canvas.print("*");
+  }
+}
+
+void drawSellFishRow(int idx, int ry) {
+  const Fish& f = fish[idx];
+  static const char* tNames[5] = { "Clownfish", "Guppy", "Piranha", "Angel", "Salmon" };
+  int t = (int)f.type < 5 ? (int)f.type : 0;
+  int sv = fishSellValue(idx);
+  int btnY = ry + (SP_ROW_H - 28) / 2;
+
+  canvas.fillRect(SP_X + 4, ry, SP_LEFT_W, SP_ROW_H - 2, 0x0C1528UL);
+  canvas.drawFastHLine(SP_X + 4, ry + SP_ROW_H - 2, SP_LEFT_W, 0x1A2844UL);
+
+  drawFishSellPreview(idx, SP_X + 8, ry + 5, 50, SP_ROW_H - 12);
+
+  char name[TELEMETRY_NAME_LEN];
+  telemetryGetFishName(idx, name, sizeof(name));
+  char title[TELEMETRY_NAME_LEN + 12];
+  if (name[0]) snprintf(title, sizeof(title), "%s", name);
+  else         snprintf(title, sizeof(title), "%s #%d", tNames[t], idx);
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(0xE8F4FFUL);
+  canvas.setCursor(SP_X + 64, ry + 6);
+  canvas.print(title);
+
+  char ageBuf[12];
+  formatFishAgeStr(f, ageBuf, sizeof(ageBuf));
+  int sizePct = (int)(fishScale(f) * 100.0f + 0.5f);
+  int qualPct = (int)(f.fishLuck * 100.0f + 0.5f);
+  char meta[56];
+  snprintf(meta, sizeof(meta), "%s  %s  %d%%", tNames[t], ageBuf, sizePct);
+  canvas.setTextColor(0x88AACCUL);
+  canvas.setCursor(SP_X + 64, ry + 18);
+  canvas.print(meta);
+
+  char detail[32];
+  snprintf(detail, sizeof(detail), "Q %d%%  XP %d", qualPct, (int)f.xp);
+  canvas.setTextColor(0x667788UL);
+  canvas.setCursor(SP_X + 64, ry + 30);
+  canvas.print(detail);
+
+  char valBuf[12];
+  snprintf(valBuf, sizeof(valBuf), "%dc", sv);
+  canvas.setTextColor(0xFFD23FUL);
+  canvas.setCursor(SP_X + 248, ry + 8);
+  canvas.print(valBuf);
+
+  canvas.fillRect(SP_X + 270, btnY, 52, 28, 0x3A1800UL);
+  canvas.drawRect(SP_X + 270, btnY, 52, 28, 0xD9A441UL);
+  canvas.setTextColor(0xFFD23FUL);
+  canvas.setCursor(SP_X + 279, btnY + 10);
+  canvas.print("SELL");
+}
+
 void drawShopPanel() {
   if (!shopOpen) return;
   canvas.fillRect(SP_X, SP_Y, SP_W, SP_H, 0x080E1CUL);
@@ -2418,19 +2563,10 @@ void drawShopPanel() {
   int pages = (nActive + SP_ROWS - 1) / SP_ROWS;
   if (shopSellPage >= pages) shopSellPage = pages > 0 ? pages - 1 : 0;
   int start = shopSellPage * SP_ROWS;
-  static const char* tNames[5] = { "CLOWN","GUPPY","PIRANHA","ANGEL","SALMON" };
   for (int r = 0; r < SP_ROWS && (start + r) < nActive; r++) {
     int idx = activeFish[start + r];
     int ry = SP_Y + 28 + r * SP_ROW_H;
-    int sv = fishSellValue(idx);
-    char line[40];
-    snprintf(line, sizeof(line), "#%-2d %s  %dc", idx, tNames[(int)fish[idx].type < 5 ? (int)fish[idx].type : 0], sv);
-    canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
-    canvas.setCursor(SP_X + 8, ry + 4); canvas.print(line);
-    canvas.fillRect(SP_X + 270, ry, 52, 28, 0x3A1800UL);
-    canvas.drawRect(SP_X + 270, ry, 52, 28, 0xD9A441UL);
-    canvas.setTextColor(0xFFD23FUL);
-    canvas.setCursor(SP_X + 279, ry + 10); canvas.print("SELL");
+    drawSellFishRow(idx, ry);
   }
   if (pages > 1) {
     int nav_y = SP_Y + SP_H - 30;
@@ -2810,8 +2946,9 @@ void loop() {
         int start = shopSellPage * SP_ROWS;
         for (int r = 0; r < SP_ROWS && (start + r) < nActive; r++) {
           int ry = SP_Y + 28 + r * SP_ROW_H;
+          int btnY = ry + (SP_ROW_H - 28) / 2;
           if (tx >= (uint16_t)(SP_X + 270) && tx < (uint16_t)(SP_X + 322) &&
-              ty >= (uint16_t)ry            && ty < (uint16_t)(ry + 28)) {
+              ty >= (uint16_t)btnY          && ty < (uint16_t)(btnY + 28)) {
             sellFishSlot(activeFish[start + r]);
             break;
           }

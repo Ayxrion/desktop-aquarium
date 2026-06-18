@@ -15,11 +15,18 @@
 #include <csignal>
 #include <ctime>
 #include <cstdlib>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <mutex>
+#include <thread>
 #include "compat.h"
 #include "canvas.h"
 #include "weather.h"
 #include "daynight.h"
 #include "version.h"
+#include "prompt_server.h"
 
 // ─── Screen ──────────────────────────────────────────────────────────────────
 #define SCREEN_W  800
@@ -134,6 +141,19 @@ Flake flakes[MAX_FLAKES];
 enum FishType : uint8_t { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
 static const int  FISH_SCHOOL_SIZE[5] = { 2, 6, 4, 0, 0 }; // clownfish, guppy, piranha, angel, salmon
 static inline bool typeSchools(FishType t) { return t == FISH_SCHOOL || t == FISH_SCHOOL2; }
+// How many upcoming wander targets each fish precomputes and ships in telemetry so the
+// web replication seeks the EXACT targets this device will use (rather than rolling its
+// own random ones and drifting). 4 covers a full 20-frame publish window even for the
+// snappiest angelfish (wander_cd as low as 8), with margin.
+#define WANDER_LOOKAHEAD 4
+
+// One fully-resolved wander target + how long it stays active. Precomputed and queued so
+// the random draw happens here (device side) and the result rides telemetry to the web.
+struct WanderMove {
+    float wcd, tx, ty, tz;
+    bool  chasing;
+};
+
 struct Fish {
     float   x, y, z, vx, vy, vz, tx, ty, tz, wanderCD;
     bool    facingRight;
@@ -146,6 +166,8 @@ struct Fish {
     float   age;        // career: frames alive → growth scale (no death)
     int     xp;         // career: feeding XP
     float   fishLuck;   // career: 0..1, raised by feeding/XP
+    WanderMove wanderQ[WANDER_LOOKAHEAD];  // precomputed upcoming targets (FIFO)
+    uint8_t wanderQN;                      // entries currently queued
 };
 
 #define MAX_PAIR    8               // clownfish slots
@@ -516,6 +538,7 @@ void initFishEntry(int idx, float x, float y, float z, float vx,
     f.x = f.tx = x; f.y = f.ty = y; f.z = f.tz = z;
     f.vx = vx; f.vy = 0; f.vz = 0;
     f.wanderCD     = frandr(40, 130);
+    f.wanderQN     = 0;                       // queue fills lazily on first updateFish()
     f.facingRight  = (vx >= 0);
     f.type         = type;
     f.partner      = partner;
@@ -842,6 +865,7 @@ void setup() {
     initWeather();
     initDayNight();
     telemetryInit();
+    promptServerStart(8888);  // HTTP prompt server for Claude Code hooks
 
     for (int x = 0; x < SCREEN_W; x++) {
         float h = sinf(x * 0.018f) * 4.0f
@@ -1367,6 +1391,59 @@ int nearestFlake(const Fish& f) {
     return best;
 }
 
+// Resolve ONE upcoming wander move for a fish, given the current sub-school centroids and
+// the chase state it starts from. This is the only place wander RNG is drawn: the result
+// (a fully-resolved absolute target + its countdown) is queued and shipped in telemetry,
+// so the web replication seeks identical targets rather than rolling its own. Mirrors the
+// retarget block in updateFish() exactly.
+WanderMove computeWanderMove(Fish& f, bool chasingIn,
+                             float scx, float scy, float scz,
+                             float sc2x, float sc2y, float sc2z,
+                             float sacx, float sacy, float sacz) {
+    WanderMove m;
+    m.chasing = chasingIn;
+    if (f.type == FISH_PAIR)  { m.chasing = !chasingIn; m.wcd = m.chasing ? frandr(30, 70) : frandr(40, 90); }
+    else if (f.type == FISH_ANGEL) { m.wcd = frandr(8, 28); }
+    else                           { m.wcd = frandr(15, 50); }
+
+    if (f.type == FISH_PAIR && f.partner >= 0 && isFishActive(f.partner)) {
+        Fish& partner = fish[f.partner];
+        if (m.chasing) {
+            m.tx = constrain(partner.x + frandr(-40, 40), 30.0f, (float)(SCREEN_W - 30));
+            m.ty = constrain(partner.y + frandr(-30, 30), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+            m.tz = constrain(partner.z + frandr(-0.10f, 0.10f), 0.05f, 0.72f);
+        } else {
+            float fleeX = f.x + (f.x - partner.x) * 1.5f;
+            float fleeY = f.y + (f.y - partner.y) * 1.2f;
+            m.tx = constrain(fleeX + frandr(-60, 60), 30.0f, (float)(SCREEN_W - 30));
+            m.ty = constrain(fleeY + frandr(-40, 40), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+            m.tz = constrain(partner.z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
+        }
+    } else if (f.type == FISH_PAIR) {
+        m.tx = frandr(30.0f, (float)(SCREEN_W - 30));
+        m.ty = frandr((float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+        m.tz = constrain(f.tz + frandr(-0.12f, 0.12f), 0.05f, 0.72f);
+    } else if (f.type == FISH_SCHOOL) {
+        m.tx = constrain(scx + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
+        m.ty = constrain(scy + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+        m.tz = constrain(scz + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
+    } else if (f.type == FISH_SCHOOL2) {
+        m.tx = constrain(sc2x + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
+        m.ty = constrain(sc2y + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+        m.tz = constrain(sc2z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
+    } else if (f.type == FISH_ANGEL) {
+        m.tx = constrain(sacx + frandr(-120, 120), 30.0f, (float)(SCREEN_W - 30));
+        m.ty = constrain(sacy + frandr(-110, 110), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+        m.tz = constrain(sacz + frandr(-0.18f, 0.18f), 0.05f, 0.72f);
+    } else {
+        // Salmon (school size 0) + any solitary type: roam the whole tank independently.
+        m.tx = frandr(30.0f, (float)(SCREEN_W - 30));
+        m.ty = frandr((float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+        m.tz = constrain(f.tz + frandr(-0.12f, 0.12f), 0.05f, 0.72f);
+    }
+    return m;
+}
+
 void updateFish() {
     // Whole-type centroids — used as the wander-retarget seed below. (Cohesion uses
     // per-sub-school centroids computed inline in the loop, so schools cap correctly.)
@@ -1405,47 +1482,22 @@ void updateFish() {
             }
         } else {
             f.wanderCD -= 1.0f;
-            if (f.wanderCD <= 0.0f) {
-                if (f.type == FISH_PAIR)  { f.chasing = !f.chasing; f.wanderCD = f.chasing ? frandr(30, 70) : frandr(40, 90); }
-                else if (f.type == FISH_ANGEL) { f.wanderCD = frandr(8, 28); }
-                else                           { f.wanderCD = frandr(15, 50); }
-
-                if (f.type == FISH_PAIR && f.partner >= 0 && isFishActive(f.partner)) {
-                    Fish& partner = fish[f.partner];
-                    if (f.chasing) {
-                        f.tx = constrain(partner.x + frandr(-40, 40), 30.0f, (float)(SCREEN_W - 30));
-                        f.ty = constrain(partner.y + frandr(-30, 30), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-                        f.tz = constrain(partner.z + frandr(-0.10f, 0.10f), 0.05f, 0.72f);
-                    } else {
-                        float fleeX = f.x + (f.x - partner.x) * 1.5f;
-                        float fleeY = f.y + (f.y - partner.y) * 1.2f;
-                        f.tx = constrain(fleeX + frandr(-60, 60), 30.0f, (float)(SCREEN_W - 30));
-                        f.ty = constrain(fleeY + frandr(-40, 40), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-                        f.tz = constrain(partner.z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
-                    }
-                } else if (f.type == FISH_PAIR) {
-                    f.tx = frandr(30.0f, (float)(SCREEN_W - 30));
-                    f.ty = frandr((float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-                    f.tz = constrain(f.tz + frandr(-0.12f, 0.12f), 0.05f, 0.72f);
-                } else if (f.type == FISH_SCHOOL) {
-                    f.tx = constrain(scx + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
-                    f.ty = constrain(scy + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-                    f.tz = constrain(scz + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
-                } else if (f.type == FISH_SCHOOL2) {
-                    f.tx = constrain(sc2x + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
-                    f.ty = constrain(sc2y + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-                    f.tz = constrain(sc2z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
-                } else if (f.type == FISH_ANGEL) {
-                    f.tx = constrain(sacx + frandr(-120, 120), 30.0f, (float)(SCREEN_W - 30));
-                    f.ty = constrain(sacy + frandr(-110, 110), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-                    f.tz = constrain(sacz + frandr(-0.18f, 0.18f), 0.05f, 0.72f);
-                } else {
-                    // Salmon (school size 0) + any solitary type: roam the whole tank
-                    // independently — no group centroid, so they don't shoal.
-                    f.tx = frandr(30.0f, (float)(SCREEN_W - 30));
-                    f.ty = frandr((float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-                    f.tz = constrain(f.tz + frandr(-0.12f, 0.12f), 0.05f, 0.72f);
-                }
+            // Keep the lookahead queue full, computed against the current centroids/partner.
+            // New entries are pushed here (the only wander RNG draw); the web drains this
+            // queue verbatim from telemetry, so it never has to guess a target.
+            bool tailChasing = (f.wanderQN > 0) ? f.wanderQ[f.wanderQN - 1].chasing : f.chasing;
+            while (f.wanderQN < WANDER_LOOKAHEAD) {
+                f.wanderQ[f.wanderQN] = computeWanderMove(f, tailChasing,
+                                                          scx, scy, scz, sc2x, sc2y, sc2z,
+                                                          sacx, sacy, sacz);
+                tailChasing = f.wanderQ[f.wanderQN].chasing;
+                f.wanderQN++;
+            }
+            if (f.wanderCD <= 0.0f) {                 // commit to the next precomputed target
+                WanderMove m = f.wanderQ[0];
+                for (uint8_t q = 1; q < f.wanderQN; q++) f.wanderQ[q - 1] = f.wanderQ[q];
+                f.wanderQN--;
+                f.tx = m.tx; f.ty = m.ty; f.tz = m.tz; f.chasing = m.chasing; f.wanderCD = m.wcd;
             }
 
             float seekStr = (f.type == FISH_PAIR && f.chasing) ? 0.018f
@@ -1953,8 +2005,109 @@ void drawCartButton() {
 #define SP_W     780
 #define SP_H     (SCREEN_H - TANK_TOP - 4)
 #define SP_MID   (SP_X + SP_W / 2)
-#define SP_ROW_H 40
-#define SP_ROWS  9   // visible fish rows per page
+#define SP_LEFT_W ((SP_MID - SP_X) - 8)
+#define SP_ROW_H 56
+#define SP_ROWS  6   // rich fish cards (preview + stats) per page
+
+static void formatFishAgeStr(const Fish& f, char* buf, size_t n) {
+    if (gameMode != MODE_CAREER) { snprintf(buf, n, "Adult"); return; }
+    int s = (int)(f.age / 20.0f + 0.5f);   // device frames @20fps → seconds
+    if (s < 60)       snprintf(buf, n, "%ds", s);
+    else if (s < 3600) snprintf(buf, n, "%dm", s / 60);
+    else               snprintf(buf, n, "%dh%02dm", s / 3600, (s / 60) % 60);
+}
+
+// Miniature fish glyph for the sell list — same ASCII art as drawFish(), centred in a box.
+static void drawFishSellPreview(int idx, int boxX, int boxY, int boxW, int boxH) {
+    if (!isFishActive(idx)) return;
+    const Fish& f = fish[idx];
+    canvas.fillRect(boxX, boxY, boxW, boxH, 0x0A1220UL);
+    canvas.drawRect(boxX, boxY, boxW, boxH, 0x224466UL);
+    int cx = boxX + boxW / 2;
+    int cy = boxY + boxH / 2 + 2;
+    uint32_t col = fishColor(idx);
+    int ts = fishTS(f);
+    if (ts > 2) ts = 2;
+    canvas.setTextSize(ts);
+    canvas.setTextColor(col);
+    int chars = (f.type == FISH_PAIR) ? 5 : 3;
+    int hw = (chars * canvas.charW * ts) / 2;
+    if (f.type == FISH_PAIR) {
+        canvas.setCursor(cx - hw, cy - 4 * ts);
+        canvas.print("><(o>");
+    } else if (f.type == FISH_ANGEL) {
+        canvas.setTextSize(1);
+        canvas.setCursor(cx - 3, cy - 4 * ts - 6);
+        canvas.print("\\");
+        canvas.setTextSize(ts);
+        canvas.setCursor(cx - hw, cy - 4 * ts);
+        canvas.print("><>");
+        canvas.setTextSize(1);
+        canvas.setCursor(cx - 3, cy + 4 * ts);
+        canvas.print("/");
+    } else {
+        canvas.setCursor(cx - hw, cy - 4 * ts);
+        canvas.print("><>");
+    }
+    if (fishIsShiny((uint32_t)idx)) {
+        canvas.setTextSize(1);
+        canvas.setTextColor(0xFFFFAAUL);
+        canvas.setCursor(boxX + 2, boxY + 2);
+        canvas.print("*");
+    }
+}
+
+static void drawSellFishRow(int idx, int ry) {
+    const Fish& f = fish[idx];
+    static const char* tNames[5] = { "Clownfish", "Guppy", "Piranha", "Angel", "Salmon" };
+    int t = (int)f.type < 5 ? (int)f.type : 0;
+    int sv = fishSellValue(idx);
+    int btnY = ry + (SP_ROW_H - 28) / 2;
+
+    canvas.fillRect(SP_X + 4, ry, SP_LEFT_W, SP_ROW_H - 2, 0x0C1528UL);
+    canvas.drawFastHLine(SP_X + 4, ry + SP_ROW_H - 2, SP_LEFT_W, 0x1A2844UL);
+
+    drawFishSellPreview(idx, SP_X + 8, ry + 5, 50, SP_ROW_H - 12);
+
+    char name[TELEMETRY_NAME_LEN];
+    telemetryGetFishName(idx, name, sizeof(name));
+    char title[TELEMETRY_NAME_LEN + 12];
+    if (name[0]) snprintf(title, sizeof(title), "%s", name);
+    else         snprintf(title, sizeof(title), "%s #%d", tNames[t], idx);
+
+    canvas.setTextSize(1);
+    canvas.setTextColor(0xE8F4FFUL);
+    canvas.setCursor(SP_X + 64, ry + 6);
+    canvas.print(title);
+
+    char ageBuf[12];
+    formatFishAgeStr(f, ageBuf, sizeof(ageBuf));
+    int sizePct = (int)(fishScale(f) * 100.0f + 0.5f);
+    int qualPct = (int)(f.fishLuck * 100.0f + 0.5f);
+    char meta[56];
+    snprintf(meta, sizeof(meta), "%s  %s  %d%%", tNames[t], ageBuf, sizePct);
+    canvas.setTextColor(0x88AACCUL);
+    canvas.setCursor(SP_X + 64, ry + 18);
+    canvas.print(meta);
+
+    char detail[32];
+    snprintf(detail, sizeof(detail), "Q %d%%  XP %d", qualPct, (int)f.xp);
+    canvas.setTextColor(0x667788UL);
+    canvas.setCursor(SP_X + 64, ry + 30);
+    canvas.print(detail);
+
+    char valBuf[12];
+    snprintf(valBuf, sizeof(valBuf), "%dc", sv);
+    canvas.setTextColor(0xFFD23FUL);
+    canvas.setCursor(SP_X + 248, ry + 8);
+    canvas.print(valBuf);
+
+    canvas.fillRect(SP_X + 270, btnY, 52, 28, 0x3A1800UL);
+    canvas.drawRect(SP_X + 270, btnY, 52, 28, 0xD9A441UL);
+    canvas.setTextColor(0xFFD23FUL);
+    canvas.setCursor(SP_X + 279, btnY + 10);
+    canvas.print("SELL");
+}
 
 void drawShopPanel() {
     if (!shopOpen) return;
@@ -1978,21 +2131,10 @@ void drawShopPanel() {
     int pages = (nActive + SP_ROWS - 1) / SP_ROWS;
     if (shopSellPage >= pages) shopSellPage = pages > 0 ? pages - 1 : 0;
     int start = shopSellPage * SP_ROWS;
-    static const char* tNames[5] = { "CLOWN","GUPPY","PIRANHA","ANGEL","SALMON" };
     for (int r = 0; r < SP_ROWS && (start + r) < nActive; r++) {
         int idx = activeFish[start + r];
-        const Fish& f = fish[idx];
         int ry = SP_Y + 28 + r * SP_ROW_H;
-        int sv = fishSellValue(idx);
-        char line[40];
-        snprintf(line, sizeof(line), "#%-2d %s  %dc", idx, tNames[(int)f.type < 5 ? (int)f.type : 0], sv);
-        canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
-        canvas.setCursor(SP_X + 8, ry + 4); canvas.print(line);
-        // SELL button
-        canvas.fillRect(SP_X + 270, ry, 52, 28, 0x3A1800UL);
-        canvas.drawRect(SP_X + 270, ry, 52, 28, 0xD9A441UL);
-        canvas.setTextColor(0xFFD23FUL);
-        canvas.setCursor(SP_X + 279, ry + 10); canvas.print("SELL");
+        drawSellFishRow(idx, ry);
     }
     // Page navigation (prev/next) if needed
     if (pages > 1) {
@@ -2260,6 +2402,67 @@ void drawTelemetryStatus() {
     canvas.setCursor(x, y + 18); canvas.print(line);
 }
 
+// Geometry for the prompt dialog — shared between the renderer and the click hit-test
+// (promptDialogHitTest uses the same layout). Centered on an 800×480 screen.
+#define PD_W      560
+#define PD_H      200
+#define PD_X      ((SCREEN_W - PD_W) / 2)
+#define PD_Y      ((SCREEN_H - PD_H) / 2)
+#define PD_BTN_W  150
+#define PD_BTN_H  44
+#define PD_BTN_Y  (PD_Y + PD_H - PD_BTN_H - 20)
+#define PD_BTN_GAP 12
+#define PD_BTN_X0 (PD_X + 20)
+
+// Resolve a tap/click to a prompt option index (or -1). Uses the same PD_* layout as
+// the renderer, so the buttons drawn are exactly the buttons that respond.
+static int promptDialogHitTest(int mx, int my) {
+    int n = promptServerOptionCount();
+    if (n <= 0) return -1;
+    if (my < PD_BTN_Y || my >= PD_BTN_Y + PD_BTN_H) return -1;
+    for (int i = 0; i < n; i++) {
+        int btnX = PD_BTN_X0 + i * (PD_BTN_W + PD_BTN_GAP);
+        if (mx >= btnX && mx < btnX + PD_BTN_W) return i;
+    }
+    return -1;
+}
+
+// Render the prompt dialog if active. Mirrors the drawProfileModal style (opaque box,
+// single-arg setTextColor — the Pi canvas has no text background colour).
+static void drawPromptDialog() {
+    if (!promptServerIsActive()) return;
+
+    // Snapshot the shared state under lock, then render from the copy.
+    PromptState state;
+    {
+        std::lock_guard<std::mutex> lock(gPromptMutex);
+        state = gPromptState;
+    }
+
+    // Dim the tank behind the dialog by tiling a dark band over the dialog region
+    // (fillRect is opaque, so this is a solid panel rather than a translucent scrim).
+    canvas.fillRect(PD_X,     PD_Y,     PD_W,     PD_H,     0x141821UL);
+    canvas.drawRect(PD_X,     PD_Y,     PD_W,     PD_H,     0x5FB0FFUL);
+    canvas.drawRect(PD_X + 1, PD_Y + 1, PD_W - 2, PD_H - 2, 0x21304AUL);
+
+    // Title + question
+    canvas.setTextSize(2); canvas.setTextColor(0x9FD0FFUL);
+    canvas.setCursor(PD_X + 20, PD_Y + 14); canvas.print("CLAUDE CODE");
+    canvas.setTextSize(1); canvas.setTextColor(0xE8F0FFUL);
+    canvas.setCursor(PD_X + 20, PD_Y + 50); canvas.print(state.question.c_str());
+
+    // Option buttons (laid out left-to-right; selected one highlighted green)
+    for (size_t i = 0; i < state.options.size(); i++) {
+        int btnX = PD_BTN_X0 + (int)i * (PD_BTN_W + PD_BTN_GAP);
+        bool sel = ((int)i == state.selectedIdx);
+        canvas.fillRect(btnX, PD_BTN_Y, PD_BTN_W, PD_BTN_H, sel ? 0x115522UL : 0x2A2F3AUL);
+        canvas.drawRect(btnX, PD_BTN_Y, PD_BTN_W, PD_BTN_H, sel ? 0x33CC66UL : 0x556070UL);
+        canvas.setTextColor(sel ? 0xCCFFDDUL : 0xC8D2E0UL);
+        canvas.setCursor(btnX + 12, PD_BTN_Y + 15);
+        canvas.print(state.options[i].c_str());
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  loop  (called each iteration from main)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2298,8 +2501,9 @@ void loop() {
                 int start = shopSellPage * SP_ROWS;
                 for (int r = 0; r < SP_ROWS && (start + r) < nActive; r++) {
                     int ry = SP_Y + 28 + r * SP_ROW_H;
+                    int btnY = ry + (SP_ROW_H - 28) / 2;
                     if (tx >= (uint16_t)(SP_X + 270) && tx < (uint16_t)(SP_X + 322) &&
-                        ty >= (uint16_t)ry            && ty < (uint16_t)(ry + 28)) {
+                        ty >= (uint16_t)btnY          && ty < (uint16_t)(btnY + 28)) {
                         sellFishSlot(activeFish[start + r]);
                         break;
                     }
@@ -2482,6 +2686,7 @@ void loop() {
     drawMenu();
     drawShopPanel();
     drawProfileModal();
+    drawPromptDialog();  // Render prompt dialog if active (drawn on top, supports click + keyboard)
     canvas.pushSprite(0, 0);
 }
 
@@ -2509,6 +2714,12 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         display._touched = true;
                         display._touchX  = ev.button.x;
                         display._touchY  = ev.button.y;
+                        // A click on the prompt dialog commits that option (and swallows
+                        // the tap so it doesn't also drop food / hit tank controls).
+                        if (promptServerIsActive()) {
+                            int opt = promptDialogHitTest(ev.button.x, ev.button.y);
+                            if (opt >= 0) promptServerCommit(opt);
+                        }
                     }
                     break;
                 case SDL_MOUSEBUTTONUP:
@@ -2522,11 +2733,16 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     }
                     break;
                 // Native Pi touchscreen events
-                case SDL_FINGERDOWN:
+                case SDL_FINGERDOWN: {
                     display._touched = true;
                     display._touchX  = (int)(ev.tfinger.x * SCREEN_W);
                     display._touchY  = (int)(ev.tfinger.y * SCREEN_H);
+                    if (promptServerIsActive()) {
+                        int opt = promptDialogHitTest(display._touchX, display._touchY);
+                        if (opt >= 0) promptServerCommit(opt);
+                    }
                     break;
+                }
                 case SDL_FINGERMOTION:
                     display._touchX = (int)(ev.tfinger.x * SCREEN_W);
                     display._touchY = (int)(ev.tfinger.y * SCREEN_H);
@@ -2535,6 +2751,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     display._touched = false;
                     break;
                 case SDL_KEYDOWN:
+                    promptServerHandleKey(ev.key.keysym.sym);  // arrow keys / enter for prompts
                     if (ev.key.keysym.sym == SDLK_ESCAPE)
                         _appRunning = 0;
                     else if (ev.key.keysym.sym == SDLK_SPACE)
