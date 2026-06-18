@@ -281,14 +281,14 @@ static int _buildTelemetryJson() {
         o = _tAppend(o,
             "%s{\"id\":%d,\"x\":%.1f,\"y\":%.1f,\"z\":%.3f,"
             "\"vx\":%.2f,\"vy\":%.2f,\"vz\":%.4f,"
-            "\"tx\":%.1f,\"ty\":%.1f,\"tz\":%.3f,\"wander_cd\":%.2f,"
+            "\"tx\":%.1f,\"ty\":%.1f,\"tz\":%.3f,\"wander_cd\":%.2f,\"idle_cd\":%.2f,"
             "\"type\":%d,\"facing_right\":%s,"
             "\"color\":%u,\"going_for_food\":%s,\"chasing\":%s,"
             "\"age\":%d,\"scale\":%.3f,\"xp\":%d,\"fish_luck\":%.3f,\"wander_q\":[",
             first ? "" : ",", i,
             f.x, f.y, f.z,
             f.vx, f.vy, f.vz,
-            f.tx, f.ty, f.tz, f.wanderCD,
+            f.tx, f.ty, f.tz, f.wanderCD, f.idleCD,
             (int)f.type,
             f.facingRight ? "true" : "false",
             (unsigned)fishColor(i),
@@ -318,14 +318,16 @@ static int _buildTelemetryJson() {
     }
     o = _tAppend(o, "],");
 
-    // Snail / starfish / boat
+    // Snail / starfish / boat — include signed vx so the web can extrapolate smoothly.
     o = _tAppend(o,
-        "\"snail\":{\"x\":%d,\"facing_right\":%s},"
-        "\"starfish\":{\"x\":%d,\"facing_right\":%s},"
-        "\"boat\":{\"active\":%s,\"x\":%d},",
-        (int)snail.x, snail.facingRight ? "true" : "false",
-        (int)starfish.x, starfish.facingRight ? "true" : "false",
-        boat.active ? "true" : "false", (int)boat.x);
+        "\"snail\":{\"x\":%d,\"spd\":%.3f,\"vx\":%.3f,\"facing_right\":%s},"
+        "\"starfish\":{\"x\":%d,\"spd\":%.3f,\"vx\":%.3f,\"facing_right\":%s},"
+        "\"boat\":{\"active\":%s,\"x\":%d,\"vx\":%.3f},",
+        (int)snail.x, snail.spd, snail.facingRight ? snail.spd : -snail.spd,
+        snail.facingRight ? "true" : "false",
+        (int)starfish.x, starfish.spd, starfish.facingRight ? starfish.spd : -starfish.spd,
+        starfish.facingRight ? "true" : "false",
+        boat.active ? "true" : "false", (int)boat.x, boat.active ? -0.5f : 0.0f);
 
     // Plant layout (near-static decor)
     o = _tAppend(o, "\"plants\":{\"bg\":[");
@@ -385,11 +387,11 @@ static int _buildTelemetryJson() {
         // "id" is the slot index (active snails are contiguous) — the web echoes it back
         // in !SELLSNAIL, matching the fish convention.
         o = _tAppend(o,
-            "%s{\"id\":%d,\"type\":%d,\"x\":%.1f,\"spd\":%.3f,\"facing_right\":%s,"
+            "%s{\"id\":%d,\"type\":%d,\"x\":%.1f,\"spd\":%.3f,\"vx\":%.3f,\"facing_right\":%s,"
             "\"age\":%d,\"scale\":%.3f,\"stage\":%d,\"xp\":%d,\"snail_luck\":%.3f,"
             "\"stamina\":%d,\"asleep\":%s}",
             firstS ? "" : ",", i, coinSnails[i].type,
-            coinSnails[i].x, coinSnails[i].spd, coinSnails[i].facingRight ? "true" : "false",
+            coinSnails[i].x, coinSnails[i].spd, coinSnails[i].lastVx, coinSnails[i].facingRight ? "true" : "false",
             (int)coinSnails[i].age, snailScaleOf(coinSnails[i].age), snailStage(coinSnails[i].age),
             coinSnails[i].xp, coinSnails[i].snailLuck,
             (int)coinSnails[i].stamina, coinSnails[i].asleep ? "true" : "false");
@@ -590,6 +592,7 @@ static void _applyServerProfileDoc(DynamicJsonDocument& doc) {
         f.tx       = jf["tx"]        | f.x;
         f.ty       = jf["ty"]        | f.y;
         f.wanderCD = jf["wander_cd"] | f.wanderCD;
+        f.idleCD   = jf["idle_cd"]   | 0.0f;
         f.chasing  = jf["chasing"]   | false;
         f.age      = jf["age"]       | f.age;
         f.xp       = jf["xp"]        | f.xp;

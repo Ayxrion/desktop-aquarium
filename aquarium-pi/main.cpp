@@ -155,7 +155,7 @@ struct WanderMove {
 };
 
 struct Fish {
-    float   x, y, z, vx, vy, vz, tx, ty, tz, wanderCD;
+    float   x, y, z, vx, vy, vz, tx, ty, tz, wanderCD, idleCD;
     bool    facingRight;
     FishType type;
     int8_t  partner;
@@ -258,6 +258,7 @@ struct CoinSnail {
   float   snailLuck;     // career: 0..1 quality (feeds tank luck + sell value)
   float   stamina;       // sprint budget; capacity scales with quality
   bool    asleep;        // night-time rest
+  float   lastVx;        // signed px/frame this frame (telemetry + web prediction)
 };
 CoinSnail coinSnails[MAX_SNAILS] = {};
 int numSnails = 0;
@@ -337,7 +338,7 @@ static Canvas  canvas(&display);
 // Transient expanding rings drawn over the tank: a "glass tap" ripple wherever
 // the screen is touched, plus a celebratory burst when a collectible is obtained.
 #define MAX_PULSES 6
-struct Pulse { float x, y; int age, life; uint32_t col; uint8_t kind; bool active; }; // kind 0 tap, 1 collect
+struct Pulse { float x, y; int age, life; uint32_t col; uint8_t kind; bool active; }; // 0 tap, 1 collect, 2 shine
 static Pulse pulses[MAX_PULSES] = {};
 
 void spawnPulse(float x, float y, uint8_t kind, uint32_t col) {
@@ -348,7 +349,7 @@ void spawnPulse(float x, float y, uint8_t kind, uint32_t col) {
     }
     if (slot < 0) slot = oldest;
     pulses[slot].x = x; pulses[slot].y = y; pulses[slot].age = 0;
-    pulses[slot].life = (kind == 0) ? 12 : 16;   // ~0.6s / ~0.8s at 20fps
+    pulses[slot].life = (kind == 0) ? 12 : (kind == 2) ? 22 : 16;
     pulses[slot].col = col; pulses[slot].kind = kind; pulses[slot].active = true;
 }
 
@@ -375,6 +376,19 @@ void drawPulses() {
         if (p.kind == 0) {                            // glass tap: a single soft ring
             int r = (int)(3 + t * 16);
             canvas.drawCircle(cx, cy, r, pulseFade(0x6FAAD0UL, t));
+        } else if (p.kind == 2) {                     // snail coin shine: golden burst + twinkle
+            int r0 = (int)(4 + t * 14), r1 = (int)(8 + t * 26);
+            uint32_t gold = pulseFade(p.col ? p.col : 0xFFE566UL, t);
+            uint32_t pale = pulseFade(0xFFF8CCUL, t);
+            canvas.drawCircle(cx, cy, r1, gold);
+            canvas.drawCircle(cx, cy, r0, pale);
+            for (int k = 0; k < 8; k++) {
+                float ang = (float)k * 0.785398f + t * 1.2f;
+                int sx = (int)(cosf(ang) * (6 + t * 20));
+                int sy = (int)(sinf(ang) * (6 + t * 20));
+                canvas.drawLine(cx, cy, cx + sx, cy + sy, gold);
+                canvas.fillCircle(cx + sx, cy + sy, 2, pale);
+            }
         } else {                                       // collect: ring + four sparks
             int r = (int)(6 + t * 22), s = (int)(3 + t * 16);
             uint32_t col = pulseFade(p.col, t);
@@ -545,6 +559,47 @@ float boundAccel(float val, float lo, float hi, float k = 0.30f) {
     return 0.0f;
 }
 
+struct FishTypeProfile { float seekMul, maxVMul, idleChance; int idleMin, idleMax, wcdMin, wcdMax; };
+static const FishTypeProfile FISH_PROFILE[5] = {
+    { 0.82f, 0.72f, 0.14f, 25, 55, 35, 95 },
+    { 0.68f, 0.60f, 0.28f, 45, 130, 28, 75 },
+    { 0.92f, 0.85f, 0.10f, 20, 50, 14, 48 },
+    { 0.78f, 0.75f, 0.18f, 30, 85, 12, 38 },
+    { 0.72f, 0.68f, 0.22f, 35, 95, 32, 85 },
+};
+static int fishSubSchool(int idx, FishType type) {
+    if (type == FISH_SCHOOL)  return (idx - MAX_PAIR) / FISH_SCHOOL_SIZE[type];
+    if (type == FISH_SCHOOL2) return (idx - MAX_PAIR - MAX_SCHOOL) / FISH_SCHOOL_SIZE[type];
+    if (type == FISH_ANGEL)   return (idx - MAX_PAIR - MAX_SCHOOL - MAX_SCHOOL2) / FISH_SCHOOL_SIZE[type];
+    return 0;
+}
+static float fishSpeedMul(int idx, FishType type) {
+    const FishTypeProfile& p = FISH_PROFILE[(int)type < 5 ? (int)type : 1];
+    if (type == FISH_SCHOOL || type == FISH_SCHOOL2 || type == FISH_ANGEL) {
+        int sub = fishSubSchool(idx, type);
+        float school = 0.93f + (float)(hash32u((uint32_t)type * 7919u + (uint32_t)sub * 104729u) % 15) / 100.0f;
+        float personal = 0.96f + (float)(hash32u((uint32_t)idx) % 9) / 100.0f;
+        return p.maxVMul * school * personal;
+    }
+    return p.maxVMul * (0.88f + (float)(hash32u((uint32_t)idx ^ 0x55u) % 24) / 100.0f);
+}
+static float wanderCadenceMul(int idx, FishType type) {
+    if (type == FISH_SCHOOL || type == FISH_SCHOOL2 || type == FISH_ANGEL) {
+        int sub = fishSubSchool(idx, type);
+        float school = 0.93f + (float)(hash32u((uint32_t)type * 7919u + (uint32_t)sub * 104729u) % 15) / 100.0f;
+        float personal = 0.96f + (float)(hash32u((uint32_t)idx) % 9) / 100.0f;
+        return school * personal;
+    }
+    return 0.88f + (float)(hash32u((uint32_t)idx ^ 0xABu) % 24) / 100.0f;
+}
+static float snailBodyHalfW(const CoinSnail& sn) {
+    return 14.0f * SNAIL_STAGE_SCALE[snailStage(sn.age)] + 6.0f;
+}
+static bool snailCanCollectCoin(const CoinSnail& sn, float coinX) {
+    float reach = fmaxf((float)SNAIL_REACH, snailBodyHalfW(sn) + 8.0f);
+    return fabsf(coinX - sn.x) < reach;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Init helpers
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -576,6 +631,7 @@ void initFishEntry(int idx, float x, float y, float z, float vx,
     f.x = f.tx = x; f.y = f.ty = y; f.z = f.tz = z;
     f.vx = vx; f.vy = 0; f.vz = 0;
     f.wanderCD     = frandr(40, 130);
+    f.idleCD       = 0;
     f.wanderQN     = 0;                       // queue fills lazily on first updateFish()
     f.facingRight  = (vx >= 0);
     f.type         = type;
@@ -1227,6 +1283,7 @@ void updateCareer() {
         CoinSnail& sn = coinSnails[s];
         if (gameMode == MODE_CAREER) sn.age += 1.0f;     // career growth (one frame)
         sn.asleep = snailsAsleep;
+        sn.lastVx = 0;
         if (snailsAsleep) continue;                      // sleeping snails sit still
         float baseStep = sn.spd * SNAIL_STAGE_SPDMUL[snailStage(sn.age)];
         float staMax   = snailStaminaMax(sn.snailLuck);
@@ -1249,19 +1306,28 @@ void updateCareer() {
             if (dist <= step) {
                 sn.x = loot[tgt].x;              // arrived — stop exactly, no direction jitter
                 sn.facingRight = (dx >= 0);
+                sn.lastVx = 0;
             } else {
                 sn.facingRight = (dx > 0);
-                sn.x += sn.facingRight ? step : -step;
+                sn.lastVx = sn.facingRight ? step : -step;
+                sn.x += sn.lastVx;
             }
         } else {
             sn.stamina += 1.0f; if (sn.stamina > staMax) sn.stamina = staMax;        // rest regen
-            sn.x += (sn.facingRight ? 1 : -1) * baseStep;
-            if (sn.x > SCREEN_W - 55) { sn.x = SCREEN_W - 55; sn.facingRight = false; }
-            if (sn.x < 55)            { sn.x = 55;            sn.facingRight = true; }
+            sn.lastVx = (sn.facingRight ? 1.0f : -1.0f) * baseStep;
+            sn.x += sn.lastVx;
+            if (sn.x > SCREEN_W - 55) { sn.x = SCREEN_W - 55; sn.facingRight = false; sn.lastVx = 0; }
+            if (sn.x < 55)            { sn.x = 55;            sn.facingRight = true;  sn.lastVx = 0; }
         }
-        for (int i = 0; i < MAX_LOOT; i++)
-            if (loot[i].active && loot[i].kind == 0 && loot[i].landed &&
-                fabsf(loot[i].x - sn.x) < SNAIL_REACH) { gameCoins++; loot[i].active = false; }
+        for (int i = 0; i < MAX_LOOT; i++) {
+            if (!loot[i].active || loot[i].kind != 0 || !loot[i].landed) continue;
+            if (!snailCanCollectCoin(sn, loot[i].x)) continue;
+            float cx = loot[i].x;
+            gameCoins++;
+            loot[i].active = false;
+            spawnPulse(cx, (float)SAND_Y - 8, 2, 0xFFE566UL);
+            spawnFloatText(cx, (float)SAND_Y - 18, 0xFFD23FUL, "+1 coin");
+        }
     }
 }
 
@@ -1480,15 +1546,17 @@ int nearestFlake(const Fish& f) {
 // (a fully-resolved absolute target + its countdown) is queued and shipped in telemetry,
 // so the web replication seeks identical targets rather than rolling its own. Mirrors the
 // retarget block in updateFish() exactly.
-WanderMove computeWanderMove(Fish& f, bool chasingIn,
+WanderMove computeWanderMove(int fishIdx, Fish& f, bool chasingIn,
                              float scx, float scy, float scz,
                              float sc2x, float sc2y, float sc2z,
                              float sacx, float sacy, float sacz) {
     WanderMove m;
+    const FishTypeProfile& prof = FISH_PROFILE[(int)f.type < 5 ? (int)f.type : 1];
     m.chasing = chasingIn;
-    if (f.type == FISH_PAIR)  { m.chasing = !chasingIn; m.wcd = m.chasing ? frandr(30, 70) : frandr(40, 90); }
-    else if (f.type == FISH_ANGEL) { m.wcd = frandr(8, 28); }
-    else                           { m.wcd = frandr(15, 50); }
+    if (f.type == FISH_PAIR) {
+        m.chasing = !chasingIn;
+    }
+    m.wcd = frandr((float)prof.wcdMin, (float)prof.wcdMax) * wanderCadenceMul(fishIdx, f.type);
 
     if (f.type == FISH_PAIR && f.partner >= 0 && isFishActive(f.partner)) {
         Fish& partner = fish[f.partner];
@@ -1565,31 +1633,38 @@ void updateFish() {
                 }
             }
         } else {
-            f.wanderCD -= 1.0f;
-            // Keep the lookahead queue full, computed against the current centroids/partner.
-            // New entries are pushed here (the only wander RNG draw); the web drains this
-            // queue verbatim from telemetry, so it never has to guess a target.
+            const FishTypeProfile& prof = FISH_PROFILE[(int)f.type < 5 ? (int)f.type : 1];
+            if (f.idleCD > 0) {
+                f.idleCD -= 1.0f;
+                f.wanderCD -= 0.25f;
+            } else {
+                f.wanderCD -= 1.0f;
+            }
             bool tailChasing = (f.wanderQN > 0) ? f.wanderQ[f.wanderQN - 1].chasing : f.chasing;
             while (f.wanderQN < WANDER_LOOKAHEAD) {
-                f.wanderQ[f.wanderQN] = computeWanderMove(f, tailChasing,
+                f.wanderQ[f.wanderQN] = computeWanderMove(i, f, tailChasing,
                                                           scx, scy, scz, sc2x, sc2y, sc2z,
                                                           sacx, sacy, sacz);
                 tailChasing = f.wanderQ[f.wanderQN].chasing;
                 f.wanderQN++;
             }
-            if (f.wanderCD <= 0.0f) {                 // commit to the next precomputed target
+            if (f.wanderCD <= 0.0f) {
                 WanderMove m = f.wanderQ[0];
                 for (uint8_t q = 1; q < f.wanderQN; q++) f.wanderQ[q - 1] = f.wanderQ[q];
                 f.wanderQN--;
                 f.tx = m.tx; f.ty = m.ty; f.tz = m.tz; f.chasing = m.chasing; f.wanderCD = m.wcd;
+                if (random(0, 1000) < (int)(prof.idleChance * 1000.0f))
+                    f.idleCD = frandr((float)prof.idleMin, (float)prof.idleMax) * wanderCadenceMul(i, f.type);
             }
 
-            float seekStr = (f.type == FISH_PAIR && f.chasing) ? 0.018f
-                          : (f.type == FISH_ANGEL)             ? 0.020f
-                          :                                      0.012f;
-            ax += (f.tx - f.x) * seekStr;
-            ay += (f.ty - f.y) * seekStr;
-            az += (f.tz - f.z) * 0.010f;
+            if (f.idleCD <= 0) {
+                float seekStr = (f.type == FISH_PAIR && f.chasing) ? 0.018f
+                              : (f.type == FISH_ANGEL)             ? 0.020f
+                              :                                      0.012f;
+                seekStr *= prof.seekMul;
+                ax += (f.tx - f.x) * seekStr;
+                ay += (f.ty - f.y) * seekStr;
+                az += (f.tz - f.z) * 0.010f;
 
             if (typeSchools(f.type)) {                 // cohere to this fish's sub-school only
                 // Partition the type's slots into schools of FISH_SCHOOL_SIZE; a fish coheres to
@@ -1622,6 +1697,9 @@ void updateFish() {
                     if (d2 < 60.0f * 60.0f && d2 > 0.01f) { float inv = 7.0f / d2; ax += dx * inv; ay += dy * inv; }
                 }
             }
+            } else {
+                f.vx *= 0.90f; f.vy *= 0.90f;
+            }
         }
 
         ax += boundAccel(f.x,  30,             SCREEN_W - 30);
@@ -1629,6 +1707,7 @@ void updateFish() {
         az += boundAccel(f.z,  0.0f,     0.75f, 0.08f);
 
         float maxV  = f.goingForFood ? 8.0f : (f.type == FISH_PAIR && f.chasing) ? 7.0f : (f.type == FISH_ANGEL) ? 7.0f : 5.5f;
+        if (!f.goingForFood) maxV *= fishSpeedMul(i, f.type);
         float maxVz = 0.015f;
         f.vx = constrain(f.vx + ax, -maxV,       maxV);
         f.vy = constrain(f.vy + ay, -maxV * 0.5f, maxV * 0.5f);

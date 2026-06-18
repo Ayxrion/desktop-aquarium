@@ -14,6 +14,30 @@
 const W = 800, H = 480, TOP = 72;
 const FISH_MAX = [8, 16, 20, 12, 16];       // clownfish, guppy, piranha, angel, salmon
 const FISH_SCHOOL_SIZE = [2, 6, 4, 0, 0];   // max school size before splitting; 0 = solitary
+const FISH_PROFILE = [
+  { seek: 0.82, maxV: 0.72, idleChance: 0.14, idleMin: 25, idleMax: 55, wcdMin: 35, wcdMax: 95 },
+  { seek: 0.68, maxV: 0.60, idleChance: 0.28, idleMin: 45, idleMax: 130, wcdMin: 28, wcdMax: 75 },
+  { seek: 0.92, maxV: 0.85, idleChance: 0.10, idleMin: 20, idleMax: 50, wcdMin: 14, wcdMax: 48 },
+  { seek: 0.78, maxV: 0.75, idleChance: 0.18, idleMin: 30, idleMax: 85, wcdMin: 12, wcdMax: 38 },
+  { seek: 0.72, maxV: 0.68, idleChance: 0.22, idleMin: 35, idleMax: 95, wcdMin: 32, wcdMax: 85 },
+];
+function fishSpeedMul(id, type, sub) {
+  const p = FISH_PROFILE[type] || FISH_PROFILE[1];
+  if (type === 1 || type === 2 || type === 3) {
+    const school = 0.93 + (hash32(type * 7919 + sub * 104729) % 15) / 100;
+    const personal = 0.96 + (hash32(id) % 9) / 100;
+    return p.maxV * school * personal;
+  }
+  return p.maxV * (0.88 + (hash32(id ^ 0x55) % 24) / 100);
+}
+function wanderCadenceMul(id, type, sub) {
+  if (type === 1 || type === 2 || type === 3) {
+    const school = 0.93 + (hash32(type * 7919 + sub * 104729) % 15) / 100;
+    const personal = 0.96 + (hash32(id) % 9) / 100;
+    return school * personal;
+  }
+  return 0.88 + (hash32(id ^ 0xab) % 24) / 100;
+}
 
 // Canonical fish colouring — byte-for-byte identical to the device (aquarium-pi
 // main.cpp syncedFishColor / app.js fishColorInt): each type has a primary hue, a
@@ -111,12 +135,10 @@ const rnd = (a, b) => a + Math.random() * (b - a);
 // Mirrors stepPhysics's retarget block exactly. (sim has no z motion, so tz tracks z.)
 function computeWanderMove(f, cent, chasingIn) {
   const t = f.type;
+  const prof = FISH_PROFILE[t] || FISH_PROFILE[1];
   let wcd, chasing = chasingIn;
-  if (t === 0) {
-    chasing = !chasingIn;
-    wcd = chasing ? 30 + Math.random() * 40 : 40 + Math.random() * 50;
-  } else if (t === 3) { wcd = 8 + Math.random() * 20; }
-  else { wcd = 15 + Math.random() * 35; }
+  if (t === 0) chasing = !chasingIn;
+  wcd = (prof.wcdMin + Math.random() * (prof.wcdMax - prof.wcdMin)) * wanderCadenceMul(f.id, t, f._sub);
   let tx, ty;
   if (t === 4) {                       // salmon: solitary — roam the tank independently
     tx = rnd(30, W - 30);
@@ -140,6 +162,11 @@ function snailScaleOf(age)    { return SNAIL_STAGE_SCALE[snailStage(age)]; }
 function snailStaminaMax(luck){ return SNAIL_STAMINA_MIN + (SNAIL_STAMINA_MAX - SNAIL_STAMINA_MIN) * clamp(luck || 0, 0, 1); }
 // Night window centred on midnight (dayProgress wraps 0..1): 20% total → first/last 10%.
 function snailSleeping(dp)    { return dp < SNAIL_SLEEP_FRAC / 2 || dp >= 1 - SNAIL_SLEEP_FRAC / 2; }
+function snailBodyHalfW(age)  { return 14 * SNAIL_STAGE_SCALE[snailStage(age)] + 6; }
+function snailCanCollectCoin(sn, coinX) {
+  const reach = Math.max(SNAIL_REACH, snailBodyHalfW(sn.age) + 8);
+  return Math.abs(coinX - sn.x) < reach;
+}
 
 // ── Factory ─────────────────────────────────────────────────────────────────────
 function createSim(opts) {
@@ -175,6 +202,7 @@ function createSim(opts) {
       vx: 0, vy: 0,
       tx: rnd(40, W - 40), ty: rnd(TOP + 30, H - 90),
       wanderCD: Math.floor(rnd(10, 50)),
+      idleCD: 0,
       wanderQ: [],                 // upcoming wander targets, filled lazily in stepPhysics
       facing_right: Math.random() > 0.5,
       going_for_food: false, chasing: false,
@@ -188,7 +216,7 @@ function createSim(opts) {
       spd: SNAIL_BASE_SPD * rnd(0.85, 1.15),
       age: mode === 'career' ? 0 : GROW_FRAMES,   // career: hatch small; creative: full size
       xp: 0, snailLuck: parseFloat(rnd(0, 0.85).toFixed(3)),
-      stamina: SNAIL_STAMINA_MAX, asleep: false,
+      stamina: SNAIL_STAMINA_MAX, asleep: false, lastVx: 0,
     };
   }
   function addSnail() {
@@ -286,24 +314,37 @@ function createSim(opts) {
       for (const k in cent) { const c = cent[k]; c.x /= c.n; c.y /= c.n; }
       for (const f of fish) {
         const t = f.type;
+        const prof = FISH_PROFILE[t] || FISH_PROFILE[1];
         f.age += 1;
-        // Keep the lookahead queue full, computed against the current centroids. New
-        // entries are pushed here (the only wander RNG draw); the web drains this queue
-        // verbatim from telemetry, so it never has to guess a target.
-        let tailChasing = f.wanderQ.length ? f.wanderQ[f.wanderQ.length - 1].chasing : f.chasing;
-        while (f.wanderQ.length < WANDER_LOOKAHEAD) {
-          const mv = computeWanderMove(f, cent, tailChasing);
-          f.wanderQ.push(mv);
-          tailChasing = mv.chasing;
+        if (f.idleCD > 0) {
+          f.idleCD -= 1;
+          f.wanderCD -= 0.25;
+        } else {
+          let tailChasing = f.wanderQ.length ? f.wanderQ[f.wanderQ.length - 1].chasing : f.chasing;
+          while (f.wanderQ.length < WANDER_LOOKAHEAD) {
+            const mv = computeWanderMove(f, cent, tailChasing);
+            f.wanderQ.push(mv);
+            tailChasing = mv.chasing;
+          }
+          f.wanderCD -= 1;
+          if (f.wanderCD <= 0) {
+            const mv = f.wanderQ.shift();
+            f.tx = mv.tx; f.ty = mv.ty; f.chasing = mv.chasing; f.wanderCD = mv.wcd;
+            if (Math.random() < prof.idleChance)
+              f.idleCD = (prof.idleMin + Math.random() * (prof.idleMax - prof.idleMin)) * wanderCadenceMul(f.id, t, f._sub);
+          }
         }
-        f.wanderCD--;
-        if (f.wanderCD <= 0) {               // commit to the next precomputed target
-          const mv = f.wanderQ.shift();
-          f.tx = mv.tx; f.ty = mv.ty; f.chasing = mv.chasing; f.wanderCD = mv.wcd;
+        if (f.idleCD > 0) {
+          f.vx *= 0.90; f.vy *= 0.90;
+          f.vx = Math.max(-1.2, Math.min(1.2, f.vx)) * DAMP;
+          f.vy = Math.max(-0.6, Math.min(0.6, f.vy)) * DAMP;
+          f.x = Math.max(5, Math.min(W - 5, f.x + f.vx));
+          f.y = Math.max(TOP + 5, Math.min(H - 60, f.y + f.vy));
+          continue;
         }
         const chasing = t === 0 && f.chasing;
-        const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
-        const maxV = chasing || t === 3 ? 7.0 : 5.5;
+        const seekStr = (chasing ? 0.018 : (t === 3 ? 0.020 : 0.012)) * prof.seek;
+        const maxV = (chasing || t === 3 ? 7.0 : 5.5) * fishSpeedMul(f.id, t, f._sub);
         let ax = (f.tx - f.x) * seekStr;
         let ay = (f.ty - f.y) * seekStr;
         const grp = cent[t + ':' + f._sub];
@@ -395,35 +436,50 @@ function createSim(opts) {
       }
       const snailsAsleep = snailSleeping(((frameTick) / DAY_FRAMES) % 1);
       for (const sn of snails) {
-        if (mode === 'career') sn.age += 1;            // career growth (one frame)
+        if (mode === 'career') sn.age += 1;
         sn.asleep = snailsAsleep;
-        if (snailsAsleep) continue;                    // sleeping snails sit still
+        sn.lastVx = 0;
+        if (snailsAsleep) continue;
         const baseStep = sn.spd * SNAIL_STAGE_SPDMUL[snailStage(sn.age)];
         const staMax = snailStaminaMax(sn.snailLuck);
         let target = null, td = Infinity, targetLanded = false;
         for (const it of loot) {
           if (it.kind !== 'coin') continue;
+          if (!it.landed && it.y < SAND_Y * 0.5) continue;
           const d = Math.abs(it.x - sn.x);
           if (it.landed) {
             if (!targetLanded || d < td) { td = d; target = it; targetLanded = true; }
           } else if (!targetLanded && d < td) { td = d; target = it; }
         }
         if (target) {
-          sn.facing_right = target.x > sn.x;
-          let mult = targetLanded ? 4.0 : 2.0;         // sprint to landed, fast-walk to falling
-          if (sn.stamina <= 0) mult = 1.0;             // exhausted → plod at base speed
-          sn.stamina = clamp(sn.stamina - (mult - 1), 0, staMax);  // sprinting burns stamina
-          sn.x += (sn.facing_right ? 1 : -1) * baseStep * mult;
-        } else {
-          sn.stamina = clamp(sn.stamina + 1, 0, staMax);           // resting recovers stamina
-          sn.x += (sn.facing_right ? 1 : -1) * baseStep;
-          if (sn.x > W - 55) { sn.x = W - 55; sn.facing_right = false; }
-          if (sn.x < 55)     { sn.x = 55;     sn.facing_right = true; }
-        }
-        for (const it of loot)
-          if (it.kind === 'coin' && it.landed && Math.abs(it.x - sn.x) < SNAIL_REACH) {
-            coins += 1; it.ttl = -1;
+          const dx = target.x - sn.x;
+          const dist = Math.abs(dx);
+          let mult = targetLanded ? 4.0 : 2.0;
+          if (sn.stamina <= 0) mult = 1.0;
+          sn.stamina = clamp(sn.stamina - (mult - 1), 0, staMax);
+          const step = baseStep * mult;
+          if (dist <= step) {
+            sn.x = target.x;
+            sn.facing_right = dx >= 0;
+            sn.lastVx = 0;
+          } else {
+            sn.facing_right = dx > 0;
+            sn.lastVx = sn.facing_right ? step : -step;
+            sn.x += sn.lastVx;
           }
+        } else {
+          sn.stamina = clamp(sn.stamina + 1, 0, staMax);
+          sn.lastVx = (sn.facing_right ? 1 : -1) * baseStep;
+          sn.x += sn.lastVx;
+          if (sn.x > W - 55) { sn.x = W - 55; sn.facing_right = false; sn.lastVx = 0; }
+          if (sn.x < 55)     { sn.x = 55;     sn.facing_right = true;  sn.lastVx = 0; }
+        }
+        for (const it of loot) {
+          if (it.kind !== 'coin' || !it.landed) continue;
+          if (!snailCanCollectCoin(sn, it.x)) continue;
+          coins += 1;
+          it.ttl = -1;
+        }
       }
       loot = loot.filter((it) => it.ttl > 0);
     }
@@ -530,6 +586,7 @@ function createSim(opts) {
         vx: parseFloat(f.vx.toFixed(2)), vy: parseFloat(f.vy.toFixed(2)), vz: 0,
         tx: parseFloat(f.tx.toFixed(1)), ty: parseFloat(f.ty.toFixed(1)), tz: f.z,
         wander_cd: parseFloat(f.wanderCD.toFixed(2)),
+        idle_cd: parseFloat((f.idleCD || 0).toFixed(2)),
         // Upcoming wander targets the web should seek next: [wcd, tx, ty, tz, chasing].
         wander_q: f.wanderQ.map((m) => [
           parseFloat(m.wcd.toFixed(2)), parseFloat(m.tx.toFixed(1)),
@@ -552,15 +609,16 @@ function createSim(opts) {
       })),
       snails: snails.map((s) => ({
         id: s.id, type: s.type || 0,
-        x: parseFloat(s.x.toFixed(1)), spd: parseFloat(s.spd.toFixed(3)), facing_right: s.facing_right,
+        x: parseFloat(s.x.toFixed(1)), spd: parseFloat(s.spd.toFixed(3)),
+        vx: parseFloat((s.lastVx || 0).toFixed(3)), facing_right: s.facing_right,
         age: Math.round(s.age), scale: parseFloat(snailScaleOf(s.age).toFixed(3)), stage: snailStage(s.age),
         xp: s.xp, snail_luck: parseFloat((s.snailLuck || 0).toFixed(3)),
         stamina: Math.round(s.stamina), asleep: !!s.asleep,
       })),
       flakes: [],
-      snail: { x: Math.round((tick * 0.5) % W), facing_right: true },
-      starfish: { x: 80, facing_right: false },
-      boat: { active: tick % 400 < 80, x: W - ((tick * 3) % (W + 80)) },
+      snail: { x: Math.round((tick * 0.5) % W), spd: 0.18, vx: 0.18, facing_right: true },
+      starfish: { x: 80, spd: 0.15, vx: -0.15, facing_right: false },
+      boat: { active: tick % 400 < 80, x: W - ((tick * 3) % (W + 80)), vx: -0.5 },
       plants,
     };
   }
@@ -583,6 +641,7 @@ function createSim(opts) {
       x: f.x, y: f.y, z: f.z || 0, vx: f.vx || 0, vy: f.vy || 0,
       tx: f.tx ?? f.x, ty: f.ty ?? f.y,
       wanderCD: typeof f.wander_cd === 'number' ? f.wander_cd : Math.floor(rnd(10, 50)),
+      idleCD: typeof f.idle_cd === 'number' ? f.idle_cd : 0,
       wanderQ: Array.isArray(f.wander_q)
         ? f.wander_q.map((a) => ({ wcd: a[0], tx: a[1], ty: a[2], tz: a[3], chasing: !!a[4] }))
         : [],

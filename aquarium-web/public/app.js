@@ -14,6 +14,44 @@ const FISH_COUNT_KEYS = ['pair', 'school', 'school2', 'angel', 'salmon'];
 // realize their size-2 schooling via mate-pairing; Guppy/Piranha use centroid sub-schools;
 // Angel keeps its own loose grouping; Salmon are solitary.
 const FISH_SCHOOL_SIZE = [2, 6, 4, 0, 0];
+// Per-species movement temperament (mirrors device FISH_PROFILE).
+const FISH_PROFILE = [
+  { seek: 0.82, maxV: 0.72, idleChance: 0.14, idleMin: 25, idleMax: 55, wcdMin: 35, wcdMax: 95 },
+  { seek: 0.68, maxV: 0.60, idleChance: 0.28, idleMin: 45, idleMax: 130, wcdMin: 28, wcdMax: 75 },
+  { seek: 0.92, maxV: 0.85, idleChance: 0.10, idleMin: 20, idleMax: 50, wcdMin: 14, wcdMax: 48 },
+  { seek: 0.78, maxV: 0.75, idleChance: 0.18, idleMin: 30, idleMax: 85, wcdMin: 12, wcdMax: 38 },
+  { seek: 0.72, maxV: 0.68, idleChance: 0.22, idleMin: 35, idleMax: 95, wcdMin: 32, wcdMax: 85 },
+];
+function fishSubSchool(id, type, subOrder) {
+  const sz = FISH_SCHOOL_SIZE[type] || 0;
+  return sz >= 2 ? Math.floor((subOrder[type] || 0) / sz) : 0;
+}
+function fishSpeedMul(id, type, sub) {
+  const p = FISH_PROFILE[type] || FISH_PROFILE[1];
+  if (type === 1 || type === 2 || type === 3) {
+    const school = 0.93 + (hash32(type * 7919 + sub * 104729) % 15) / 100;
+    const personal = 0.96 + (hash32(id) % 9) / 100;
+    return p.maxV * school * personal;
+  }
+  return p.maxV * (0.88 + (hash32(id ^ 0x55) % 24) / 100);
+}
+function wanderCadenceMul(id, type, sub) {
+  if (type === 1 || type === 2 || type === 3) {
+    const school = 0.93 + (hash32(type * 7919 + sub * 104729) % 15) / 100;
+    const personal = 0.96 + (hash32(id) % 9) / 100;
+    return school * personal;
+  }
+  return 0.88 + (hash32(id ^ 0xab) % 24) / 100;
+}
+function extrapolatePatrolMover(m, vx, ahead, lo, hi) {
+  let x = m.x, v = vx;
+  for (let i = 0; i < ahead; i++) {
+    x += v;
+    if (x > hi) { x = hi; v = -Math.abs(v); }
+    if (x < lo) { x = lo; v = Math.abs(v); }
+  }
+  return { ...m, x, facing_right: v >= 0 };
+}
 const TANK_TOP = 72;
 const SCREEN_W = 800;
 const SCREEN_H = 480;
@@ -181,24 +219,24 @@ function stepFishOnce(fish) {
   for (const k in cent) { const c = cent[k]; c.x /= c.n; c.y /= c.n; c.z /= c.n; }
   for (const f of fish) {
     const t = f.type;
-    // Wander countdown: when it expires, pick a fresh target exactly the way the device
-    // does (clownfish toggle chase; salmon roam solo; schoolers/angel aim near centroid).
-    if (f.wcd > 0) {
+    const prof = FISH_PROFILE[t] || FISH_PROFILE[1];
+    if (f.icd > 0) {
+      f.icd--;
+      if (f.wcd > 0) f.wcd -= 0.25;
+    } else if (f.wcd > 0) {
       f.wcd--;
     } else if (f.wq && f.wq.length) {
-      // Seek the exact next target the device committed to (drained from telemetry's
-      // wander_q), so prediction matches the device instead of diverging on a fresh roll.
       const mv = f.wq.shift();
       f.tx = mv.tx; f.ty = mv.ty; f.tz = mv.tz; f.chasing = mv.chasing; f.wcd = mv.wcd;
+      if (Math.random() < prof.idleChance)
+        f.icd = (prof.idleMin + Math.random() * (prof.idleMax - prof.idleMin)) * wanderCadenceMul(f.id, t, f._sub);
     } else {
-      // Queue exhausted (predicted further than the device precomputed): fall back to a
-      // local roll — no worse than before; the next snapshot reconciles any drift.
       if (t === 0) {
         f.chasing = !f.chasing;
-        f.wcd = f.chasing ? 30 + Math.random() * 40 : 40 + Math.random() * 50;
-      } else if (t === 3) { f.wcd = 8 + Math.random() * 20; }
-      else { f.wcd = 15 + Math.random() * 35; }
-      if (t === 4) {                          // salmon: solitary, roam the whole tank
+        f.wcd = (prof.wcdMin + Math.random() * (prof.wcdMax - prof.wcdMin)) * wanderCadenceMul(f.id, t, f._sub);
+      } else if (t === 3) { f.wcd = (prof.wcdMin + Math.random() * (prof.wcdMax - prof.wcdMin)) * wanderCadenceMul(f.id, t, f._sub); }
+      else { f.wcd = (prof.wcdMin + Math.random() * (prof.wcdMax - prof.wcdMin)) * wanderCadenceMul(f.id, t, f._sub); }
+      if (t === 4) {
         f.tx = 30 + Math.random() * (SCREEN_W - 60);
         f.ty = (TANK_TOP + 20) + Math.random() * (SCREEN_H - 80 - (TANK_TOP + 20));
       } else {
@@ -208,9 +246,22 @@ function stepFishOnce(fish) {
         f.ty = clamp(cg.y + (Math.random() * 2 - 1) * (t === 3 ? 110 : 90), TANK_TOP + 20, SCREEN_H - 80);
       }
     }
+    if (f.icd > 0) {
+      f.vx *= 0.90; f.vy *= 0.90; f.vz *= 0.92;
+      let iax = boundA(f.x, 30, SCREEN_W - 30, 0.30);
+      let iay = boundA(f.y, TANK_TOP + 20, SCREEN_H - 80, 0.30);
+      let iaz = boundA(f.z, 0.0, 0.75, 0.08);
+      f.vx = Math.max(-1.2, Math.min(1.2, f.vx)) * 0.88;
+      f.vy = Math.max(-0.6, Math.min(0.6, f.vy)) * 0.88;
+      f.vz = Math.max(-0.008, Math.min(0.008, f.vz + iaz)) * 0.90;
+      f.x = Math.max(5, Math.min(SCREEN_W - 5, f.x + f.vx + iax * 0.1));
+      f.y = Math.max(TANK_TOP + 5, Math.min(SCREEN_H - 60, f.y + f.vy + iay * 0.1));
+      f.z = Math.max(0, Math.min(0.78, f.z + f.vz));
+      continue;
+    }
     const chasing = f.chasing && t === 0;
-    const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
-    const maxV = f.going_for_food ? 8.0 : (chasing || t === 3) ? 7.0 : 5.5;
+    const seekStr = (chasing ? 0.018 : (t === 3 ? 0.020 : 0.012)) * prof.seek;
+    const maxV = (f.going_for_food ? 8.0 : (chasing || t === 3) ? 7.0 : 5.5) * fishSpeedMul(f.id, t, f._sub);
     let ax = (f.tx - f.x) * seekStr;
     let ay = (f.ty - f.y) * seekStr;
     let az = (f.tz - f.z) * 0.010;
@@ -248,6 +299,7 @@ function makePredFish(snap) {
     tx: f.tx != null ? f.tx : f.x, ty: f.ty != null ? f.ty : f.y,
     tz: typeof f.tz === 'number' ? f.tz : (f.z || 0),
     wcd: typeof f.wander_cd === 'number' ? f.wander_cd : 30,
+    icd: typeof f.idle_cd === 'number' ? f.idle_cd : 0,
     // Upcoming wander targets the device precomputed: [wcd, tx, ty, tz, chasing]. We pop
     // these instead of rolling our own random target, so we seek exactly what the device
     // will — eliminating the only prediction divergence between snapshots.
@@ -354,12 +406,28 @@ function buildRenderSnap(devNow) {
     });
   }
 
-  if (base.boat && typeof base.boat.x === 'number')
-    out.boat = { ...base.boat, x: base.boat.x + _moverVel.boat * ahead };
-  if (base.snail && typeof base.snail.x === 'number')
-    out.snail = { ...base.snail, x: base.snail.x + _moverVel.snail * ahead };
-  if (base.starfish && typeof base.starfish.x === 'number')
-    out.starfish = { ...base.starfish, x: base.starfish.x + _moverVel.starfish * ahead };
+  if (base.boat && typeof base.boat.x === 'number') {
+    const vx = base.boat.active ? (typeof base.boat.vx === 'number' ? base.boat.vx : -0.5) : 0;
+    out.boat = { ...base.boat, x: base.boat.x + vx * ahead };
+  }
+  if (base.snail && typeof base.snail.x === 'number') {
+    const vx = typeof base.snail.vx === 'number' ? base.snail.vx
+      : (base.snail.facing_right ? (base.snail.spd || 0.18) : -(base.snail.spd || 0.18));
+    out.snail = extrapolatePatrolMover(base.snail, vx, ahead, 55, SCREEN_W - 55);
+  }
+  if (base.starfish && typeof base.starfish.x === 'number') {
+    const vx = typeof base.starfish.vx === 'number' ? base.starfish.vx
+      : (base.starfish.facing_right ? (base.starfish.spd || 0.15) : -(base.starfish.spd || 0.15));
+    out.starfish = extrapolatePatrolMover(base.starfish, vx, ahead, 40, SCREEN_W - 40);
+  }
+  if (Array.isArray(base.snails)) {
+    out.snails = base.snails.map((sn) => {
+      if (sn.asleep) return { ...sn };
+      const vx = typeof sn.vx === 'number' ? sn.vx
+        : (sn.facing_right ? (sn.spd || 0.28) : -(sn.spd || 0.28));
+      return extrapolatePatrolMover(sn, vx, ahead, 55, SCREEN_W - 55);
+    });
+  }
   if (Array.isArray(base.wanderers))
     out.wanderers = base.wanderers.map((w) => ({ ...w, x: w.x + (w.vx || 0) * ahead }));
   if (Array.isArray(base.loot))
@@ -1022,7 +1090,7 @@ function drawPulses() {
   ctx.save();
   for (let i = pulses.length - 1; i >= 0; i--) {
     const p = pulses[i];
-    const life = p.kind === 'tap' ? 420 : 620;
+    const life = p.kind === 'tap' ? 420 : p.kind === 'shine' ? 880 : 620;
     const t = (now - p.t0) / life;
     if (t >= 1) { pulses.splice(i, 1); continue; }
     const ease = 1 - (1 - t) * (1 - t);   // ease-out expansion
@@ -1033,6 +1101,25 @@ function drawPulses() {
       ctx.lineWidth = 1.5;
       ctx.strokeStyle = rgbaFromHex('#bfe6ff', a * 0.38);
       ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.stroke();
+    } else if (p.kind === 'shine') {
+      const col = p.color || '#ffe566';
+      const r0 = 6 + ease * 16, r1 = 10 + ease * 28;
+      ctx.lineWidth = 2.5;
+      ctx.strokeStyle = rgbaFromHex(col, a);
+      ctx.beginPath(); ctx.arc(p.x, p.y, r1, 0, Math.PI * 2); ctx.stroke();
+      ctx.strokeStyle = rgbaFromHex('#fff8cc', a * 0.85);
+      ctx.beginPath(); ctx.arc(p.x, p.y, r0, 0, Math.PI * 2); ctx.stroke();
+      const spark = 8 + ease * 24;
+      ctx.lineWidth = 2;
+      for (let k = 0; k < 8; k++) {
+        const ang = (k / 8) * Math.PI * 2 + t * 1.2;
+        const c = Math.cos(ang), s = Math.sin(ang);
+        ctx.strokeStyle = rgbaFromHex(col, a * 0.95);
+        ctx.beginPath();
+        ctx.moveTo(p.x + c * spark, p.y + s * spark);
+        ctx.lineTo(p.x + c * (spark + 8), p.y + s * (spark + 8));
+        ctx.stroke();
+      }
     } else {
       const col = p.color || '#ffd23f';
       const r = 8 + ease * 26;

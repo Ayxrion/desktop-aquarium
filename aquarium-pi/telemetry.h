@@ -292,14 +292,14 @@ static std::string _buildTelemetryJson() {
         snprintf(tmp, sizeof(tmp),
             "%s{\"id\":%d,\"x\":%.1f,\"y\":%.1f,\"z\":%.3f,"
             "\"vx\":%.2f,\"vy\":%.2f,\"vz\":%.4f,"
-            "\"tx\":%.1f,\"ty\":%.1f,\"tz\":%.3f,\"wander_cd\":%.2f,"
+            "\"tx\":%.1f,\"ty\":%.1f,\"tz\":%.3f,\"wander_cd\":%.2f,\"idle_cd\":%.2f,"
             "\"type\":%d,\"facing_right\":%s,"
             "\"color\":%u,\"going_for_food\":%s,\"chasing\":%s,"
             "\"age\":%d,\"scale\":%.3f,\"xp\":%d,\"fish_luck\":%.3f,\"wander_q\":[",
             first ? "" : ",", i,
             f.x, f.y, f.z,
             f.vx, f.vy, f.vz,
-            f.tx, f.ty, f.tz, f.wanderCD,
+            f.tx, f.ty, f.tz, f.wanderCD, f.idleCD,
             (int)f.type,
             f.facingRight ? "true" : "false",
             (unsigned)fishColor(i),
@@ -334,12 +334,14 @@ static std::string _buildTelemetryJson() {
 
     // Snail / starfish / boat
     snprintf(tmp, sizeof(tmp),
-        "\"snail\":{\"x\":%d,\"facing_right\":%s},"
-        "\"starfish\":{\"x\":%d,\"facing_right\":%s},"
-        "\"boat\":{\"active\":%s,\"x\":%d},",
-        (int)snail.x, snail.facingRight ? "true" : "false",
-        (int)starfish.x, starfish.facingRight ? "true" : "false",
-        boat.active ? "true" : "false", (int)boat.x);
+        "\"snail\":{\"x\":%d,\"spd\":%.3f,\"vx\":%.3f,\"facing_right\":%s},"
+        "\"starfish\":{\"x\":%d,\"spd\":%.3f,\"vx\":%.3f,\"facing_right\":%s},"
+        "\"boat\":{\"active\":%s,\"x\":%d,\"vx\":%.3f},",
+        (int)snail.x, snail.spd, snail.facingRight ? snail.spd : -snail.spd,
+        snail.facingRight ? "true" : "false",
+        (int)starfish.x, starfish.spd, starfish.facingRight ? starfish.spd : -starfish.spd,
+        starfish.facingRight ? "true" : "false",
+        boat.active ? "true" : "false", (int)boat.x, boat.active ? -0.5f : 0.0f);
     j += tmp;
 
     // Plant layout (near-static decor)
@@ -410,11 +412,11 @@ static std::string _buildTelemetryJson() {
         // "id" is the slot index (active snails are contiguous) — the web echoes it back
         // in !SELLSNAIL, matching the fish convention.
         snprintf(tmp, sizeof(tmp),
-            "%s{\"id\":%d,\"type\":%d,\"x\":%.1f,\"spd\":%.3f,\"facing_right\":%s,"
+            "%s{\"id\":%d,\"type\":%d,\"x\":%.1f,\"spd\":%.3f,\"vx\":%.3f,\"facing_right\":%s,"
             "\"age\":%d,\"scale\":%.3f,\"stage\":%d,\"xp\":%d,\"snail_luck\":%.3f,"
             "\"stamina\":%d,\"asleep\":%s}",
             first ? "" : ",", i, coinSnails[i].type,
-            coinSnails[i].x, coinSnails[i].spd, coinSnails[i].facingRight ? "true" : "false",
+            coinSnails[i].x, coinSnails[i].spd, coinSnails[i].lastVx, coinSnails[i].facingRight ? "true" : "false",
             (int)coinSnails[i].age, snailScaleOf(coinSnails[i].age), snailStage(coinSnails[i].age),
             coinSnails[i].xp, coinSnails[i].snailLuck,
             (int)coinSnails[i].stamina, coinSnails[i].asleep ? "true" : "false");
@@ -653,7 +655,8 @@ static void _applyBootstrap(const char* json) {
         if (_jGetFloat(obj, "vy",      &fv)) f.vy       = fv;
         if (_jGetInt(obj, "tx",        &iv)) f.tx       = (float)iv;
         if (_jGetInt(obj, "ty",        &iv)) f.ty       = (float)iv;
-        if (_jGetFloat(obj, "wander_cd", &fv)) f.wanderCD = fv;  // queue (wander_q) refills lazily
+        if (_jGetFloat(obj, "wander_cd", &fv)) f.wanderCD = fv;
+        if (_jGetFloat(obj, "idle_cd", &fv)) f.idleCD = fv;
         if (_jGetBool(obj, "chasing",  &bv)) f.chasing  = bv;
         if (_jGetInt(obj, "age",       &iv)) f.age      = (float)iv;
         if (_jGetInt(obj, "xp",        &iv)) f.xp       = iv;

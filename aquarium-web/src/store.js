@@ -182,19 +182,44 @@ function _extrapolateSnapshot(snapshot, elapsedMs) {
     }).filter((w) => w.x > -40 && w.x < SCREEN_W + 40);
   }
   if (Array.isArray(snapshot.snails)) {
-    const SNAIL_STAGE_SPDMUL = [0.6, 0.8, 1.0];   // mirror sim.js: speed grows with stage
     out.snails = snapshot.snails.map((s) => {
-      if (s.asleep) return { ...s };              // sleeping snails sit still
-      let x = s.x, dir = s.facing_right ? 1 : -1;
-      const mul = SNAIL_STAGE_SPDMUL[s.stage] != null ? SNAIL_STAGE_SPDMUL[s.stage] : 1;
-      const spd = (s.spd || 0) * mul;             // patrol speed (coin sprints aren't extrapolated)
+      if (s.asleep) return { ...s };
+      const vx = typeof s.vx === 'number' ? s.vx
+        : (s.facing_right ? (s.spd || 0.28) : -(s.spd || 0.28));
+      let x = s.x;
       for (let f = 0; f < n; f++) {
-        x += dir * spd;
-        if (x > SCREEN_W - 55) { x = SCREEN_W - 55; dir = -1; }
-        if (x < 55)            { x = 55;            dir = 1; }
+        x += vx;
+        if (x > SCREEN_W - 55) x = SCREEN_W - 55;
+        if (x < 55) x = 55;
       }
-      return { ...s, x, facing_right: dir > 0 };
+      return { ...s, x, facing_right: vx >= 0 };
     });
+  }
+  if (snapshot.boat && typeof snapshot.boat.x === 'number') {
+    const vx = snapshot.boat.active ? (typeof snapshot.boat.vx === 'number' ? snapshot.boat.vx : -0.5) : 0;
+    out.boat = { ...snapshot.boat, x: snapshot.boat.x + vx * n };
+  }
+  if (snapshot.snail && typeof snapshot.snail.x === 'number') {
+    const vx = typeof snapshot.snail.vx === 'number' ? snapshot.snail.vx
+      : (snapshot.snail.facing_right ? (snapshot.snail.spd || 0.18) : -(snapshot.snail.spd || 0.18));
+    let x = snapshot.snail.x;
+    for (let f = 0; f < n; f++) {
+      x += vx;
+      if (x > SCREEN_W - 55) x = SCREEN_W - 55;
+      if (x < 55) x = 55;
+    }
+    out.snail = { ...snapshot.snail, x, facing_right: vx >= 0 };
+  }
+  if (snapshot.starfish && typeof snapshot.starfish.x === 'number') {
+    const vx = typeof snapshot.starfish.vx === 'number' ? snapshot.starfish.vx
+      : (snapshot.starfish.facing_right ? (snapshot.starfish.spd || 0.15) : -(snapshot.starfish.spd || 0.15));
+    let x = snapshot.starfish.x;
+    for (let f = 0; f < n; f++) {
+      x += vx;
+      if (x > SCREEN_W - 40) x = SCREEN_W - 40;
+      if (x < 40) x = 40;
+    }
+    out.starfish = { ...snapshot.starfish, x, facing_right: vx >= 0 };
   }
   return out;
 }
