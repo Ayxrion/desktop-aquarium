@@ -402,6 +402,15 @@ function fishSellValue(f) {
     + (isShiny(f) ? 12 : 0);
 }
 
+// Snail sand-bed species — quality/size/value mirror the device (sim.js snailSellValue).
+const SNAIL_BASE_SELL = 8;
+function snailLuck(s) { return clamp(typeof s.snail_luck === 'number' ? s.snail_luck : 0, 0, 1); }
+function snailGrowth(s) { return typeof s.scale === 'number' ? clamp(s.scale, 0.3, 1) : 1; }
+function snailSellValue(s) {
+  return SNAIL_BASE_SELL + Math.round(SNAIL_BASE_SELL * snailGrowth(s))
+    + Math.round(snailLuck(s) * 15) + Math.min(Math.floor((s.xp || 0) / 100), 8);
+}
+
 // Fish text size / half-width (device units) — drives shadow + glyph scale.
 function fishTS(f)    { return (f.type || 0) === 0 ? (f.z < 0.5 ? 3 : 2) : (f.z < 0.6 ? 2 : 1); }
 function fishChars(f) { return (f.type || 0) === 0 ? 5 : 3; }
@@ -836,11 +845,16 @@ function drawFlake(f) {
 function drawSnail(sn, collector = false) {
   const bx = Math.round(sn.x), by = terrainY[clamp(bx, 0, SCREEN_W - 1)];
   const d = sn.facing_right ? 1 : -1;
-  // Coin-collector snails wear an emerald "helper" shell so they read as a
-  // different, useful critter; pond snails keep the earthy brown shell.
+  // Snail SPECIES (the `snails` array) wear an emerald shell so they read as a distinct,
+  // useful critter; the decorative pond snail keeps the earthy brown shell.
   const BODY  = collector ? 0x8FD89A : 0xDDB060;
   const SHELL = collector ? 0x1F6B47 : 0x7A2E0A;
   const SWIRL = collector ? 0x5FE0A0 : 0xB05020;
+  // Growth: snails hatch small and grow through 3 stages — scale the whole shape about
+  // its footprint (bx,by). Decorative pond snail has no scale field → full size.
+  const s = typeof sn.scale === 'number' ? clamp(sn.scale, 0.3, 1) : 1;
+  ctx.save();
+  ctx.translate(bx, by); ctx.scale(s, s); ctx.translate(-bx, -by);
   fcirc(bx - d * 4, by - 8, 8, SHELL);             // shell
   scirc(bx - d * 3, by - 8, 5, SWIRL);             // swirl
   scirc(bx - d * 2, by - 8, 2, SWIRL);
@@ -851,6 +865,17 @@ function drawSnail(sn, collector = false) {
   seg(bx + d * 12, by - 9, bx + d * 14, by - 15);
   fcirc(bx + d * 6, by - 15, 2, BODY); fcirc(bx + d * 14, by - 15, 2, BODY);
   fcirc(bx + d * 6, by - 15, 1, 0x111111); fcirc(bx + d * 14, by - 15, 1, 0x111111);
+  ctx.restore();
+  // Sleeping snails tuck in and show drifting "z"s above the shell.
+  if (sn.asleep) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(200,220,255,0.85)';
+    ctx.font = '9px monospace';
+    const zx = bx - d * 4, zy = by - 8 - 12 * s;
+    ctx.fillText('z', zx + 2, zy - 2);
+    ctx.fillText('z', zx + 7, zy - 8);
+    ctx.restore();
+  }
 }
 
 function drawStarfish(st) {
@@ -1069,7 +1094,6 @@ const els = {
   hudCoins: document.getElementById('hud-coins'),
   hudShells: document.getElementById('hud-shells'),
   hudFood: document.getElementById('hud-food'),
-  hudSnails: document.getElementById('hud-snails'),
   hudLuck: document.getElementById('hud-luck'),
   hudMeals: document.getElementById('hud-meals'),
   modeSeg: document.getElementById('mode-seg'),
@@ -1935,7 +1959,6 @@ function renderGame(snap) {
   els.hudCoins.innerHTML = '<span class="ci"></span> ' + (g.coins || 0);
   els.hudShells.textContent = '🐚 ' + (g.shells || 0);
   els.hudFood.textContent = '🍤 ' + (g.food || 0);
-  els.hudSnails.textContent = '🐌 ' + ((snap.snails && snap.snails.length) || 0);
   els.hudLuck.textContent = '🍀 ' + Math.round((g.luck || 0) * 100) + '%';
   // Meals fed today (target 3). Turns into a pulsing warning while the fish are hungry.
   const meals = g.meals || 3, fed = g.fed || 0, hungry = g.hungry === 1 || g.hungry === true;
@@ -1944,7 +1967,7 @@ function renderGame(snap) {
   els.hudMeals.title = hungry
     ? 'Fish are hungry — feed them! (3 meals/day keeps them healthy)'
     : 'Meals fed today' + (g.overfed ? ` · overfed ${g.overfed}× (hurts quality)` : '');
-  for (const el of [els.hudCoins, els.hudShells, els.hudFood, els.hudSnails, els.hudLuck, els.hudMeals])
+  for (const el of [els.hudCoins, els.hudShells, els.hudFood, els.hudLuck, els.hudMeals])
     el.style.display = career ? '' : 'none';
 
   for (const b of els.modeSeg.querySelectorAll('button'))
@@ -2148,9 +2171,22 @@ function fishTooltipHTML(f) {
 }
 function snailTooltipHTML(t) {
   const collector = t.role === 'collector';
-  return ttTitle(collector ? 'Collector Snail' : 'Pond Snail',
-                 collector ? '#5fd75f' : '#b9c6d4', false) +
-    `<div class="tt-sub">${collector ? 'Gathers coins from the sand' : 'A peaceful tank cleaner'}</div>` +
+  if (!collector) {
+    return ttTitle('Pond Snail', '#b9c6d4', false) +
+      `<div class="tt-sub">A peaceful tank cleaner</div>` +
+      `<div class="tt-action">Click to view profile</div>`;
+  }
+  const s = t.ref || {};
+  const q = Math.round(snailLuck(s) * 100), size = Math.round(snailGrowth(s) * 100);
+  const stage = (typeof s.stage === 'number' ? s.stage : 2) + 1;
+  return ttTitle(s.asleep ? 'Snail 💤' : 'Snail', '#5fd75f', false) +
+    `<div class="tt-sub" style="color:#5fd75f">Sand-bed species · stage ${stage}/3${s.asleep ? ' · asleep' : ''}</div>` +
+    `<div class="tt-bar"><div class="tt-bar-fill" style="width:${q}%;background:#5fd75f"></div></div>` +
+    `<div class="tt-stats">` +
+      ttStat('🍀', 'Quality', q + '%') +
+      ttStat('📐', 'Size', size + '%') +
+      (typeof s.xp === 'number' ? ttStat('⭐', 'XP', s.xp) : '') +
+    `</div>` +
     `<div class="tt-action">Click to view profile</div>`;
 }
 function lootTooltipHTML(it) {
@@ -2230,6 +2266,15 @@ async function sellFish(fishId) {
   closeProfile();
   await sendControl({ type: 'sell', fishId }, `Sold ${fishName(f)} for ${val} coins`, { label: 'Sell fish' });
 }
+async function sellSnail(snailId) {
+  const snap = latestSnapshot;
+  const s = snap && snap.snails && snap.snails.find((x) => x.id === snailId);
+  if (!s) return;
+  const val = snailSellValue(s);
+  if (!(await confirmDialog('Sell snail?', `Sell this snail for ${val} coins?`, { okLabel: 'Sell' }))) return;
+  closeProfile();
+  await sendControl({ type: 'sell', snailId }, `Sold a snail for ${val} coins`, { label: 'Sell snail' });
+}
 function pfStat(label, val) {
   return `<div class="pf-stat"><div class="pf-stat-l">${label}</div>` +
          `<div class="pf-stat-v">${escapeHtml(String(val))}</div></div>`;
@@ -2290,17 +2335,50 @@ function _wireProfileRename(input, fishId) {
 }
 function snailProfileHTML(ent) {
   const collector = ent.role === 'collector';
-  return `
+  const s = ent.ref;
+  // The decorative pond snail (role 'wild') stays a simple critter card. The snail SPECIES
+  // (collector) gets the full fish-style stat grid + a sell button in career.
+  if (!collector) {
+    return `
     <div class="pf-head">
       <div class="pf-chip" style="--chip:#ddb060"></div>
       <div class="pf-head-text">
-        <div class="pf-name-static">${collector ? 'Collector Snail' : 'Pond Snail'}</div>
-        <div class="pf-rarity" style="color:${collector ? '#5fd75f' : '#b9c6d4'}">${collector ? 'Uncommon · Helper' : 'Common · Critter'}</div>
+        <div class="pf-name-static">Pond Snail</div>
+        <div class="pf-rarity" style="color:#b9c6d4">Common · Critter</div>
       </div>
     </div>
-    <div class="pf-desc">${collector
-      ? 'Patrols the sea floor and automatically scoops up coins that fall near it, banking them straight to your tank.'
-      : 'A gentle bottom-dweller that ambles along the substrate, grazing as it goes.'}</div>`;
+    <div class="pf-desc">A gentle bottom-dweller that ambles along the substrate, grazing as it goes.</div>`;
+  }
+  const q = Math.round(snailLuck(s) * 100);
+  const size = Math.round(snailGrowth(s) * 100);
+  const stage = (typeof s.stage === 'number' ? s.stage : 2) + 1;   // 1..3 for display
+  const staMax = 40 + 180 * snailLuck(s);
+  const stamina = Math.round(((s.stamina != null ? s.stamina : staMax) / staMax) * 100);
+  const inCareer = latestSnapshot && latestSnapshot.game && latestSnapshot.game.mode === 'career';
+  const sellVal = inCareer ? snailSellValue(s) : 0;
+  return `
+    <div class="pf-head">
+      <div class="pf-chip" style="--chip:#5fe0a0"></div>
+      <div class="pf-head-text">
+        <div class="pf-name-static">Snail${s.asleep ? ' 💤' : ''}</div>
+        <div class="pf-rarity" style="color:#5fd75f">Sand-bed species · stage ${stage}/3</div>
+      </div>
+    </div>
+    <div class="pf-bar"><div class="pf-bar-fill" style="width:${q}%;background:#5fd75f"></div></div>
+    <div class="pf-grid">
+      ${pfStat('Quality', q + '%')}
+      ${pfStat('Size', size + '%')}
+      ${pfStat('Stage', stage + '/3')}
+      ${pfStat('XP', s.xp != null ? s.xp : '—')}
+      ${pfStat('Stamina', stamina + '%')}
+      ${pfStat('State', s.asleep ? 'Asleep 💤' : 'Foraging')}
+    </div>
+    <div class="pf-desc">Patrols the sea floor and scoops up coins that fall near it. Grows through three stages, sleeps at night, and sprints after coins while it has stamina.</div>
+    ${inCareer ? `<div class="pf-sell-row">
+      <button type="button" class="pf-sell-btn" data-snail-id="${s.id}">
+        Sell for ${sellVal} <span class="ci"></span>
+      </button>
+    </div>` : ''}`;
 }
 function renderProfile() {
   if (!profileKey) return;
@@ -2315,6 +2393,9 @@ function renderProfile() {
     if (input) _wireProfileRename(input, ent.ref.id);
     const sellBtn = els.profileBody.querySelector('.pf-sell-btn');
     if (sellBtn) sellBtn.addEventListener('click', () => sellFish(ent.ref.id));
+  } else if (ent.kind === 'snail') {
+    const sellBtn = els.profileBody.querySelector('.pf-sell-btn');
+    if (sellBtn) sellBtn.addEventListener('click', () => sellSnail(ent.ref.id));
   }
 }
 els.profileClose.addEventListener('click', closeProfile);

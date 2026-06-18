@@ -33,6 +33,7 @@ function freshPending() {
     buyFood: 0,                // !BUYFOOD:<count>
     buySnail: 0,               // !BUYSNAIL:<count>  coin-collector snail
     sellFish: [],              // !SELLFISH:<id,id,…>  sell fish by slot id (device removes + credits coins)
+    sellSnail: [],             // !SELLSNAIL:<id,id,…>  sell snail by id (device removes + credits coins)
     switchAq: null,            // !SWITCHAQ:<id>  tell a physical device to load a different aquarium
   };
 }
@@ -181,8 +182,12 @@ function _extrapolateSnapshot(snapshot, elapsedMs) {
     }).filter((w) => w.x > -40 && w.x < SCREEN_W + 40);
   }
   if (Array.isArray(snapshot.snails)) {
+    const SNAIL_STAGE_SPDMUL = [0.6, 0.8, 1.0];   // mirror sim.js: speed grows with stage
     out.snails = snapshot.snails.map((s) => {
-      let x = s.x, dir = s.facing_right ? 1 : -1; const spd = s.spd || 0;
+      if (s.asleep) return { ...s };              // sleeping snails sit still
+      let x = s.x, dir = s.facing_right ? 1 : -1;
+      const mul = SNAIL_STAGE_SPDMUL[s.stage] != null ? SNAIL_STAGE_SPDMUL[s.stage] : 1;
+      const spd = (s.spd || 0) * mul;             // patrol speed (coin sprints aren't extrapolated)
       for (let f = 0; f < n; f++) {
         x += dir * spd;
         if (x > SCREEN_W - 55) { x = SCREEN_W - 55; dir = -1; }
@@ -554,6 +559,7 @@ function getNamesText(id) {
   if (p.buyFood > 0) { lines.push(`!BUYFOOD:${p.buyFood}`); p.buyFood = 0; }
   if (p.buySnail > 0) { lines.push(`!BUYSNAIL:${p.buySnail}`); p.buySnail = 0; }
   if (p.sellFish && p.sellFish.length > 0) { lines.push(`!SELLFISH:${p.sellFish.join(',')}`); p.sellFish = []; }
+  if (p.sellSnail && p.sellSnail.length > 0) { lines.push(`!SELLSNAIL:${p.sellSnail.join(',')}`); p.sellSnail = []; }
   // Only nudge the device's on-screen conflict prompt when we're not already
   // telling it to restore (restore resolves the conflict on its own).
   if (!restoreEmitted && entry.conflict) lines.push('!CONFLICT');
@@ -625,6 +631,16 @@ function queueControl(id, cmd) {
       break;
     }
     case 'sell': {
+      // Sells a fish (cmd.fishId) or a snail (cmd.snailId). Both queue an id the device
+      // removes + credits on its next poll; the census changes, so re-adopt afterward.
+      if (cmd.snailId != null) {
+        const snailId = Number(cmd.snailId);
+        if (!Number.isInteger(snailId) || snailId < 0 || snailId > 100000)
+          return { ok: false, error: 'bad_snail_id' };
+        if (!(p.sellSnail || (p.sellSnail = [])).includes(snailId)) p.sellSnail.push(snailId);
+        entry.adoptNext = true;
+        break;
+      }
       const fishId = Number(cmd.fishId);
       if (!Number.isInteger(fishId) || fishId < 0 || fishId > 200)
         return { ok: false, error: 'bad_fish_id' };

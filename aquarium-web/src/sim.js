@@ -75,6 +75,18 @@ const FOOD_PRICE = 5;
 const SNAIL_PRICE = 50;
 const MAX_SNAILS = 6;
 const SNAIL_REACH = 36;
+// Snails are now a full sand-bed SPECIES (career economy like fish): they grow, gain
+// quality, contribute to tank luck, and can be sold. `type` (0 = snail) leaves room for
+// more sand-bed species later. They start small + slow and grow through 3 discrete stages
+// (stage index 2 = today's full-size look). They sleep through the night and sprint after
+// coins only while they have stamina, which scales with quality.
+const SNAIL_BASE_SELL  = 8;
+const SNAIL_BASE_SPD   = 0.28;                 // slowed right down from the old 1.5–2.5 patrol
+const SNAIL_STAGES     = 3;                     // discrete growth stages
+const SNAIL_STAGE_SCALE  = [0.45, 0.72, 1.0];   // render scale per stage (stage 2 = full)
+const SNAIL_STAGE_SPDMUL = [0.6, 0.8, 1.0];     // speed multiplier per stage (start slow)
+const SNAIL_SLEEP_FRAC = 0.20;                  // asleep for 20% of the day (night window)
+const SNAIL_STAMINA_MIN = 40, SNAIL_STAMINA_MAX = 220;  // sprint frames; capacity scales w/ luck
 const SHELL_VALUE = [2, 5, 12];
 
 const MEALS_PER_DAY = 3;
@@ -122,6 +134,13 @@ function scaleOf(age) {
   return clamp(0.22 + 0.78 * Math.min(1, (age || 0) / GROW_FRAMES), 0.22, 1.0);
 }
 
+// ── Snail (sand-bed species) growth/sleep/stamina helpers ─────────────────────────
+function snailStage(age)      { return clamp(Math.floor((age || 0) / GROW_FRAMES * SNAIL_STAGES), 0, SNAIL_STAGES - 1); }
+function snailScaleOf(age)    { return SNAIL_STAGE_SCALE[snailStage(age)]; }
+function snailStaminaMax(luck){ return SNAIL_STAMINA_MIN + (SNAIL_STAMINA_MAX - SNAIL_STAMINA_MIN) * clamp(luck || 0, 0, 1); }
+// Night window centred on midnight (dayProgress wraps 0..1): 20% total → first/last 10%.
+function snailSleeping(dp)    { return dp < SNAIL_SLEEP_FRAC / 2 || dp >= 1 - SNAIL_SLEEP_FRAC / 2; }
+
 // ── Factory ─────────────────────────────────────────────────────────────────────
 function createSim(opts) {
   opts = opts || {};
@@ -162,9 +181,19 @@ function createSim(opts) {
       age: 0, xp: 0, fishLuck: parseFloat(rnd(0, 0.85).toFixed(3)),
     };
   }
+  function makeSnail() {
+    return {
+      id: nextId++, type: 0,                 // type 0 = snail (sand-bed species)
+      x: rnd(80, W - 80), facing_right: Math.random() > 0.5,
+      spd: SNAIL_BASE_SPD * rnd(0.85, 1.15),
+      age: mode === 'career' ? 0 : GROW_FRAMES,   // career: hatch small; creative: full size
+      xp: 0, snailLuck: parseFloat(rnd(0, 0.85).toFixed(3)),
+      stamina: SNAIL_STAMINA_MAX, asleep: false,
+    };
+  }
   function addSnail() {
     if (snails.length >= MAX_SNAILS) return false;
-    snails.push({ x: rnd(80, W - 80), spd: rnd(1.5, 2.5), facing_right: Math.random() > 0.5 });
+    snails.push(makeSnail());
     return true;
   }
   function resetCareer() {
@@ -186,6 +215,7 @@ function createSim(opts) {
       : -(FEED_MISS_PENALTY * missed) - (FEED_OVERFEED_PENALTY * overfeedToday);
     delta = clamp(delta, FEED_DELTA_MIN, FEED_DELTA_MAX);
     for (const f of fish) f.fishLuck = clamp((f.fishLuck || 0) + delta, 0, 1);
+    for (const s of snails) s.snailLuck = clamp((s.snailLuck || 0) + delta, 0, 1);
   }
   function resetFeedingDay() { mealFed = [false, false, false]; mealsToday = 0; overfeedToday = 0; }
   function registerFeeding() {
@@ -204,9 +234,16 @@ function createSim(opts) {
     tankHungry = !mealFed[s] && frac > HUNGER_GRACE;
   }
 
+  // Tank quality is the average quality of EVERY resident — fish and snails alike.
   function tankLuck() {
-    if (!fish.length) return 0;
-    return fish.reduce((s, f) => s + (f.fishLuck || 0), 0) / fish.length;
+    let s = 0, n = 0;
+    for (const f of fish)  { s += f.fishLuck  || 0; n++; }
+    for (const sn of snails) { s += sn.snailLuck || 0; n++; }
+    return n ? s / n : 0;
+  }
+  function snailSellValue(s) {
+    return SNAIL_BASE_SELL + Math.round(SNAIL_BASE_SELL * snailScaleOf(s.age))
+         + Math.round((s.snailLuck || 0) * 15) + Math.min(Math.floor((s.xp || 0) / 100), 8);
   }
   function counts() {
     const c = { pair: 0, school: 0, school2: 0, angel: 0, salmon: 0 };
@@ -356,7 +393,13 @@ function createSim(opts) {
           if (it.y >= SAND_Y) { it.y = SAND_Y; it.landed = true; it.ttl = COIN_REST; }
         } else { it.ttl -= 1; }
       }
+      const snailsAsleep = snailSleeping(((frameTick) / DAY_FRAMES) % 1);
       for (const sn of snails) {
+        if (mode === 'career') sn.age += 1;            // career growth (one frame)
+        sn.asleep = snailsAsleep;
+        if (snailsAsleep) continue;                    // sleeping snails sit still
+        const baseStep = sn.spd * SNAIL_STAGE_SPDMUL[snailStage(sn.age)];
+        const staMax = snailStaminaMax(sn.snailLuck);
         let target = null, td = Infinity, targetLanded = false;
         for (const it of loot) {
           if (it.kind !== 'coin') continue;
@@ -367,10 +410,13 @@ function createSim(opts) {
         }
         if (target) {
           sn.facing_right = target.x > sn.x;
-          const mult = targetLanded ? 4.0 : 2.0;
-          sn.x += (sn.facing_right ? 1 : -1) * sn.spd * mult;
+          let mult = targetLanded ? 4.0 : 2.0;         // sprint to landed, fast-walk to falling
+          if (sn.stamina <= 0) mult = 1.0;             // exhausted → plod at base speed
+          sn.stamina = clamp(sn.stamina - (mult - 1), 0, staMax);  // sprinting burns stamina
+          sn.x += (sn.facing_right ? 1 : -1) * baseStep * mult;
         } else {
-          sn.x += (sn.facing_right ? 1 : -1) * sn.spd;
+          sn.stamina = clamp(sn.stamina + 1, 0, staMax);           // resting recovers stamina
+          sn.x += (sn.facing_right ? 1 : -1) * baseStep;
           if (sn.x > W - 55) { sn.x = W - 55; sn.facing_right = false; }
           if (sn.x < 55)     { sn.x = 55;     sn.facing_right = true; }
         }
@@ -424,12 +470,23 @@ function createSim(opts) {
           if (mode === 'career') registerFeeding();
           const f = fish[Math.floor(Math.random() * fish.length)];
           if (f) { f.xp += 10; f.fishLuck = clamp(f.fishLuck + 0.06, 0, 1); f.age += 40; }
+          // Snails graze the same food — grow them too so they're worth keeping.
+          if (snails.length) {
+            const sn = snails[Math.floor(Math.random() * snails.length)];
+            sn.xp += 10; sn.snailLuck = clamp(sn.snailLuck + 0.06, 0, 1); sn.age += 40;
+          }
         }
       } else if (line.startsWith('!SELLFISH:')) {
         for (const idStr of line.slice(10).split(',')) {
           const id = parseInt(idStr, 10);
           const fi = fish.findIndex((f) => f.id === id);
           if (fi >= 0) { coins += fishSellValue(fish[fi]); fish.splice(fi, 1); }
+        }
+      } else if (line.startsWith('!SELLSNAIL:')) {
+        for (const idStr of line.slice(11).split(',')) {
+          const id = parseInt(idStr, 10);
+          const si = snails.findIndex((s) => s.id === id);
+          if (si >= 0) { coins += snailSellValue(snails[si]); snails.splice(si, 1); }
         }
       } else if (line.startsWith('!FISHADD:')) {
         const [, t, n] = line.split(':');
@@ -494,7 +551,11 @@ function createSim(opts) {
         vy: parseFloat((it.vy || 0).toFixed(2)), landed: !!it.landed, ttl: it.ttl, tier: it.tier,
       })),
       snails: snails.map((s) => ({
+        id: s.id, type: s.type || 0,
         x: parseFloat(s.x.toFixed(1)), spd: parseFloat(s.spd.toFixed(3)), facing_right: s.facing_right,
+        age: Math.round(s.age), scale: parseFloat(snailScaleOf(s.age).toFixed(3)), stage: snailStage(s.age),
+        xp: s.xp, snail_luck: parseFloat((s.snailLuck || 0).toFixed(3)),
+        stamina: Math.round(s.stamina), asleep: !!s.asleep,
       })),
       flakes: [],
       snail: { x: Math.round((tick * 0.5) % W), facing_right: true },
@@ -531,8 +592,14 @@ function createSim(opts) {
     }));
     nextId = fish.reduce((m, f) => Math.max(m, f.id + 1), 0);
     snails = (Array.isArray(snap.snails) ? snap.snails : []).map((s) => ({
-      x: s.x, spd: s.spd || 2, facing_right: !!s.facing_right,
+      id: s.id != null ? (s.id | 0) : nextId++, type: s.type | 0,
+      x: s.x, spd: s.spd || SNAIL_BASE_SPD, facing_right: !!s.facing_right,
+      age: s.age || 0, xp: s.xp || 0,
+      snailLuck: typeof s.snail_luck === 'number' ? s.snail_luck : 0,
+      stamina: typeof s.stamina === 'number' ? s.stamina : SNAIL_STAMINA_MAX,
+      asleep: !!s.asleep,
     }));
+    nextId = snails.reduce((m, s) => Math.max(m, (s.id || 0) + 1), nextId);
     wanderers = []; loot = []; coinTimers.clear();
     if (!fish.length) resetCareer();
   }

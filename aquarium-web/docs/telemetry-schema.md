@@ -66,7 +66,21 @@ history) and pushes it to browsers over SSE. Unknown fields are ignored; only
 
   "flakes": [ { "x": 400, "y": 300, "color": 16711680 } ],
 
-  "snail":    { "x": 540, "facing_right": true },
+  // Snail SPECIES (sand-bed) — a full career species like fish: grows through 3 stages,
+  // sleeps at night, sprints after coins while stamina lasts, feeds tank luck, sellable.
+  // "id" is the device slot index (echoed back in !SELLSNAIL). Decorative "snail" below
+  // is unrelated ambient decor.
+  "snails": [
+    {
+      "id": 0, "type": 0,              // type 0 = snail (room for more sand-bed species)
+      "x": 300, "spd": 0.28, "facing_right": true,
+      "age": 3600, "scale": 1.0, "stage": 2,   // stage 0..2 (2 = full size); scale per stage
+      "xp": 40, "snail_luck": 0.59,    // quality 0..1 → tank luck + sell value
+      "stamina": 147, "asleep": false  // sprint budget (capacity scales w/ quality); night rest
+    }
+  ],
+
+  "snail":    { "x": 540, "facing_right": true },   // decorative ambient pond snail (not the species)
   "starfish": { "x": 80,  "facing_right": false },
   "boat":     { "active": false, "x": 876 },
 

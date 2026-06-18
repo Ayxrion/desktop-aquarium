@@ -113,6 +113,8 @@ static std::atomic<int> _ctrlCatchCount{0};
 #define CTRL_SELL_MAX 16
 static std::atomic<int> _ctrlSellFishIds[CTRL_SELL_MAX];    // fish slot indices to sell
 static std::atomic<int> _ctrlSellFishCount{0};
+static std::atomic<int> _ctrlSellSnailIds[CTRL_SELL_MAX];   // snail slot indices to sell
+static std::atomic<int> _ctrlSellSnailCount{0};
 
 // Parse the control directives out of a POST response body into the atomics above.
 // Each command type appears at most once per response (the server collapses them),
@@ -163,6 +165,20 @@ static void _telemetryParseControls(const char* body) {
             if (cnt >= CTRL_SELL_MAX) break;
             _ctrlSellFishIds[cnt].store(atoi(p));
             _ctrlSellFishCount.store(cnt + 1);
+            const char* c = strchr(p, ',');
+            if (!c || (nl && c > nl)) break;
+            p = c + 1;
+        }
+    }
+    // !SELLSNAIL:<slot,slot,…> — append snail slot indices to sell (drained on main thread).
+    if ((d = strstr(body, "!SELLSNAIL:")) != nullptr) {
+        const char* p = d + 11;
+        const char* nl = strchr(p, '\n');
+        while (*p && p != nl) {
+            int cnt = _ctrlSellSnailCount.load();
+            if (cnt >= CTRL_SELL_MAX) break;
+            _ctrlSellSnailIds[cnt].store(atoi(p));
+            _ctrlSellSnailCount.store(cnt + 1);
             const char* c = strchr(p, ',');
             if (!c || (nl && c > nl)) break;
             p = c + 1;
@@ -366,9 +382,17 @@ static int _buildTelemetryJson() {
     bool firstS = true;
     for (int i = 0; i < numSnails; i++) {
         if (!coinSnails[i].active) continue;
-        o = _tAppend(o, "%s{\"x\":%.1f,\"spd\":%.3f,\"facing_right\":%s}",
-            firstS ? "" : ",", coinSnails[i].x, coinSnails[i].spd,
-            coinSnails[i].facingRight ? "true" : "false");
+        // "id" is the slot index (active snails are contiguous) — the web echoes it back
+        // in !SELLSNAIL, matching the fish convention.
+        o = _tAppend(o,
+            "%s{\"id\":%d,\"type\":%d,\"x\":%.1f,\"spd\":%.3f,\"facing_right\":%s,"
+            "\"age\":%d,\"scale\":%.3f,\"stage\":%d,\"xp\":%d,\"snail_luck\":%.3f,"
+            "\"stamina\":%d,\"asleep\":%s}",
+            firstS ? "" : ",", i, coinSnails[i].type,
+            coinSnails[i].x, coinSnails[i].spd, coinSnails[i].facingRight ? "true" : "false",
+            (int)coinSnails[i].age, snailScaleOf(coinSnails[i].age), snailStage(coinSnails[i].age),
+            coinSnails[i].xp, coinSnails[i].snailLuck,
+            (int)coinSnails[i].stamina, coinSnails[i].asleep ? "true" : "false");
         firstS = false;
     }
     o = _tAppend(o, "]}");
@@ -542,9 +566,15 @@ static void _applyServerProfileDoc(DynamicJsonDocument& doc) {
     for (JsonObject s : doc["snails"].as<JsonArray>()) {
         if (numSnails >= MAX_SNAILS) break;
         CoinSnail& cs = coinSnails[numSnails];
+        cs.type        = 0;
         cs.x           = s["x"]            | (float)(SCREEN_W / 2);
-        cs.spd         = s["spd"]          | 2.0f;
+        cs.spd         = s["spd"]          | SNAIL_BASE_SPD;
         cs.facingRight = s["facing_right"] | true;
+        cs.age         = (float)(int)(s["age"]  | 0);
+        cs.xp          = s["xp"]           | 0;
+        cs.snailLuck   = s["snail_luck"]   | 0.0f;
+        cs.stamina     = s["stamina"]      | SNAIL_STAMINA_MAX;
+        cs.asleep      = false;
         cs.active      = true;
         numSnails++;
     }

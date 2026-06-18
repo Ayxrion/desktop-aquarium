@@ -128,6 +128,8 @@ static std::atomic<int> _ctrlCatchCount{0};
 #define CTRL_SELL_MAX 16
 static std::atomic<int> _ctrlSellFishIds[CTRL_SELL_MAX];    // fish slot indices to sell
 static std::atomic<int> _ctrlSellFishCount{0};
+static std::atomic<int> _ctrlSellSnailIds[CTRL_SELL_MAX];   // snail slot indices to sell
+static std::atomic<int> _ctrlSellSnailCount{0};
 
 // Parse the control directives out of a POST response body into the atomics above.
 // Each command type appears at most once per response (the server collapses them),
@@ -180,6 +182,20 @@ static void _telemetryParseControls(const char* body) {
             if (cnt >= CTRL_SELL_MAX) break;
             _ctrlSellFishIds[cnt].store(atoi(p));
             _ctrlSellFishCount.store(cnt + 1);
+            const char* c = strchr(p, ',');
+            if (!c || (nl && c > nl)) break;
+            p = c + 1;
+        }
+    }
+    // !SELLSNAIL:<slot,slot,…> — append snail slot indices to sell (drained on main thread).
+    if ((d = strstr(body, "!SELLSNAIL:")) != nullptr) {
+        const char* p = d + 11;
+        const char* nl = strchr(p, '\n');
+        while (*p && p != nl) {
+            int cnt = _ctrlSellSnailCount.load();
+            if (cnt >= CTRL_SELL_MAX) break;
+            _ctrlSellSnailIds[cnt].store(atoi(p));
+            _ctrlSellSnailCount.store(cnt + 1);
             const char* c = strchr(p, ',');
             if (!c || (nl && c > nl)) break;
             p = c + 1;
@@ -391,9 +407,17 @@ static std::string _buildTelemetryJson() {
     first = true;
     for (int i = 0; i < numSnails; i++) {
         if (!coinSnails[i].active) continue;
-        snprintf(tmp, sizeof(tmp), "%s{\"x\":%.1f,\"spd\":%.3f,\"facing_right\":%s}",
-            first ? "" : ",", coinSnails[i].x, coinSnails[i].spd,
-            coinSnails[i].facingRight ? "true" : "false");
+        // "id" is the slot index (active snails are contiguous) — the web echoes it back
+        // in !SELLSNAIL, matching the fish convention.
+        snprintf(tmp, sizeof(tmp),
+            "%s{\"id\":%d,\"type\":%d,\"x\":%.1f,\"spd\":%.3f,\"facing_right\":%s,"
+            "\"age\":%d,\"scale\":%.3f,\"stage\":%d,\"xp\":%d,\"snail_luck\":%.3f,"
+            "\"stamina\":%d,\"asleep\":%s}",
+            first ? "" : ",", i, coinSnails[i].type,
+            coinSnails[i].x, coinSnails[i].spd, coinSnails[i].facingRight ? "true" : "false",
+            (int)coinSnails[i].age, snailScaleOf(coinSnails[i].age), snailStage(coinSnails[i].age),
+            coinSnails[i].xp, coinSnails[i].snailLuck,
+            (int)coinSnails[i].stamina, coinSnails[i].asleep ? "true" : "false");
         j += tmp; first = false;
     }
     j += "]}";
@@ -744,11 +768,17 @@ static void _applyServerProfile(const char* json) {
         char sobjs[MAX_SNAILS][256];
         int nc = _parseObjArray(snp, sobjs, MAX_SNAILS);
         for (int i = 0; i < nc && numSnails < MAX_SNAILS; i++) {
-            int x; float spd; bool fr;
+            int x, iv; float fv; bool fr;
             CoinSnail& s = coinSnails[numSnails];
+            s.type        = 0;
             s.x           = _jGetInt(sobjs[i], "x", &x)              ? (float)x : frandr(80, SCREEN_W - 80);
-            s.spd         = _jGetFloat(sobjs[i], "spd", &spd)        ? spd      : frandr(1.5f, 2.5f);
+            s.spd         = _jGetFloat(sobjs[i], "spd", &fv)         ? fv       : SNAIL_BASE_SPD;
             s.facingRight = _jGetBool(sobjs[i], "facing_right", &fr) ? fr       : true;
+            s.age         = _jGetInt(sobjs[i], "age", &iv)           ? (float)iv : 0.0f;
+            s.xp          = _jGetInt(sobjs[i], "xp", &iv)            ? iv        : 0;
+            s.snailLuck   = _jGetFloat(sobjs[i], "snail_luck", &fv)  ? fv        : 0.0f;
+            s.stamina     = _jGetFloat(sobjs[i], "stamina", &fv)     ? fv        : SNAIL_STAMINA_MAX;
+            s.asleep      = false;
             s.active      = true;
             numSnails++;
         }

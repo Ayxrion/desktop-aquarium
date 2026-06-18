@@ -210,6 +210,18 @@ static const int FISH_BASE_SELL[5] = {  6,  3, 22, 30,  4 }; // school/salmon ch
 #define SNAIL_PRICE   50                // coins per coin-collector snail
 #define MAX_SNAILS    6
 #define SNAIL_REACH   36                // px a snail can grab a coin from
+// Snails are a full sand-bed SPECIES (career economy like fish): they grow through 3
+// discrete stages (stage 2 = today's full-size look), start small + slow, sleep through
+// the night, sprint after coins only while stamina lasts, contribute to tank luck, and
+// can be sold. `type` leaves room for more sand-bed species later.
+#define SNAIL_BASE_SELL   8
+#define SNAIL_BASE_SPD    0.28f         // slowed right down from the old 1.5–2.5 patrol
+#define SNAIL_STAGES      3
+#define SNAIL_SLEEP_FRAC  0.20f         // asleep for 20% of the day (night window)
+#define SNAIL_STAMINA_MIN 40.0f
+#define SNAIL_STAMINA_MAX 220.0f
+static const float SNAIL_STAGE_SCALE[3]  = { 0.45f, 0.72f, 1.0f };
+static const float SNAIL_STAGE_SPDMUL[3] = { 0.6f, 0.8f, 1.0f };
 static const int SHELL_VALUE[3] = { 2, 5, 12 };
 
 // Feeding schedule: fish expect one feeding per third-of-day → 3 meals/day. A clean
@@ -237,8 +249,16 @@ Wanderer wanderers[MAX_WANDER] = {};
 struct Loot { float x, y, vy; uint8_t kind; uint8_t tier; bool active, landed; uint32_t id; int ttl; }; // kind 0 coin, 1 shell
 Loot loot[MAX_LOOT] = {};
 
-// Purchased coin-collector snails — patrol the floor and grab coins nearing it.
-struct CoinSnail { float x, spd; bool facingRight, active; };
+// Snail sand-bed species — patrol the floor, grab coins, grow, sleep, and are sellable.
+struct CoinSnail {
+  float x, spd; bool facingRight, active;
+  uint8_t type;          // 0 = snail (room for more sand-bed species later)
+  float   age;           // career: frames alive → growth stage/scale
+  int     xp;            // career: feeding XP
+  float   snailLuck;     // career: 0..1 quality (feeds tank luck + sell value)
+  float   stamina;       // sprint budget; capacity scales with quality
+  bool    asleep;        // night-time rest
+};
 CoinSnail coinSnails[MAX_SNAILS] = {};
 int numSnails = 0;
 
@@ -451,10 +471,28 @@ float fishScale(const Fish& f) {
     float g = f.age / (float)GROW_FRAMES; if (g > 1) g = 1; if (g < 0) g = 0;
     return 0.22f + 0.78f * g;   // hatch tiny (0.22) and grow to full size
 }
+// Tank quality is the average quality of every resident — fish AND snails.
 float tankLuck() {
     int n = 0; float s = 0;
     for (int i = 0; i < MAX_FISH; i++) if (isFishActive(i)) { s += fish[i].fishLuck; n++; }
+    for (int i = 0; i < numSnails; i++) if (coinSnails[i].active) { s += coinSnails[i].snailLuck; n++; }
     return n ? s / n : 0.0f;
+}
+
+// ── Snail (sand-bed species) growth/sleep/stamina/value helpers ────────────────────
+static inline int   snailStage(float age)       { int v = (int)(age / GROW_FRAMES * SNAIL_STAGES);
+                                                  return v < 0 ? 0 : (v >= SNAIL_STAGES ? SNAIL_STAGES - 1 : v); }
+static inline float snailScaleOf(float age)     { return SNAIL_STAGE_SCALE[snailStage(age)]; }
+static inline float snailStaminaMax(float luck) { float l = luck < 0 ? 0 : (luck > 1 ? 1 : luck);
+                                                  return SNAIL_STAMINA_MIN + (SNAIL_STAMINA_MAX - SNAIL_STAMINA_MIN) * l; }
+// Night window centred on midnight (getDayProgress wraps 0..1): 20% total → first/last 10%.
+static inline bool  snailSleeping()             { float dp = getDayProgress();
+                                                  return dp < SNAIL_SLEEP_FRAC / 2 || dp >= 1.0f - SNAIL_SLEEP_FRAC / 2; }
+int snailSellValue(int idx) {
+    if (idx < 0 || idx >= numSnails || !coinSnails[idx].active) return 0;
+    const CoinSnail& s = coinSnails[idx];
+    return SNAIL_BASE_SELL + (int)(SNAIL_BASE_SELL * snailScaleOf(s.age) + 0.5f)
+         + (int)(s.snailLuck * 15.0f + 0.5f) + (s.xp / 100 < 8 ? s.xp / 100 : 8);
 }
 
 // ── Fish appearance: luck-driven colouring + shiny rarity ──────────────────────
@@ -968,6 +1006,10 @@ void evaluateFeedingDay() {
         float l = fish[i].fishLuck + delta;
         fish[i].fishLuck = l < 0 ? 0.0f : (l > 1 ? 1.0f : l);
     }
+    for (int i = 0; i < numSnails; i++) if (coinSnails[i].active) {
+        float l = coinSnails[i].snailLuck + delta;
+        coinSnails[i].snailLuck = l < 0 ? 0.0f : (l > 1 ? 1.0f : l);
+    }
 }
 // One feeding event (career): satisfies the current slot, or counts as overfeeding.
 void registerFeeding() {
@@ -1037,8 +1079,15 @@ void spawnLoot(uint8_t kind, float x, float y, uint8_t tier) {
 void addSnail() {
     if (numSnails >= MAX_SNAILS) return;
     CoinSnail& s = coinSnails[numSnails];
-    s.active = true; s.x = frandr(80, SCREEN_W - 80); s.spd = frandr(1.5f, 2.5f);
+    s.active = true; s.type = 0;
+    s.x = frandr(80, SCREEN_W - 80);
+    s.spd = SNAIL_BASE_SPD * frandr(0.85f, 1.15f);   // slow base crawl
     s.facingRight = (random(0, 2) == 0);
+    s.age = (gameMode == MODE_CAREER) ? 0.0f : (float)GROW_FRAMES;  // career: hatch small
+    s.xp = 0;
+    s.snailLuck = frandr(0.0f, 0.85f);
+    s.stamina = SNAIL_STAMINA_MAX;
+    s.asleep = false;
     numSnails++;
 }
 void spawnWanderer(float luck) {
@@ -1168,12 +1217,19 @@ void updateCareer() {
         } else if (--it.ttl <= 0) { it.active = false; }
     }
 
-    // Coin-collector snails: only react to a falling coin once it is halfway to the sand
-    // (y >= SAND_Y/2); sprint 4× for landed coins, fast-walk 2× for falling.
-    // Use moveToward so the snail stops exactly at the target x without direction jitter.
+    // Snail species: grow + sleep + forage. Asleep through the night (no movement). Awake,
+    // they sprint 4× for landed coins / 2× for falling — but only while stamina lasts; an
+    // exhausted snail plods at its (slow, stage-scaled) base speed. Stamina recovers while
+    // patrolling. Only react to a falling coin once it is halfway to the sand (y >= SAND_Y/2).
+    bool snailsAsleep = snailSleeping();
     for (int s = 0; s < numSnails; s++) {
         if (!coinSnails[s].active) continue;
         CoinSnail& sn = coinSnails[s];
+        if (gameMode == MODE_CAREER) sn.age += 1.0f;     // career growth (one frame)
+        sn.asleep = snailsAsleep;
+        if (snailsAsleep) continue;                      // sleeping snails sit still
+        float baseStep = sn.spd * SNAIL_STAGE_SPDMUL[snailStage(sn.age)];
+        float staMax   = snailStaminaMax(sn.snailLuck);
         int tgt = -1; float td = 1e9f; bool tgtLanded = false;
         for (int i = 0; i < MAX_LOOT; i++) {
             if (!loot[i].active || loot[i].kind != 0) continue;
@@ -1186,7 +1242,10 @@ void updateCareer() {
         if (tgt >= 0) {
             float dx   = loot[tgt].x - sn.x;
             float dist = fabsf(dx);
-            float step = sn.spd * (tgtLanded ? 4.0f : 2.0f);
+            float mult = tgtLanded ? 4.0f : 2.0f;
+            if (sn.stamina <= 0.0f) mult = 1.0f;         // exhausted → plod
+            sn.stamina -= (mult - 1.0f); if (sn.stamina < 0.0f) sn.stamina = 0.0f;  // sprint cost
+            float step = baseStep * mult;
             if (dist <= step) {
                 sn.x = loot[tgt].x;              // arrived — stop exactly, no direction jitter
                 sn.facingRight = (dx >= 0);
@@ -1195,7 +1254,8 @@ void updateCareer() {
                 sn.x += sn.facingRight ? step : -step;
             }
         } else {
-            sn.x += (sn.facingRight ? 1 : -1) * sn.spd;
+            sn.stamina += 1.0f; if (sn.stamina > staMax) sn.stamina = staMax;        // rest regen
+            sn.x += (sn.facingRight ? 1 : -1) * baseStep;
             if (sn.x > SCREEN_W - 55) { sn.x = SCREEN_W - 55; sn.facingRight = false; }
             if (sn.x < 55)            { sn.x = 55;            sn.facingRight = true; }
         }
@@ -1253,6 +1313,19 @@ void sellFishSlot(int idx) {
     gameCoins += fishSellValue(idx);
     removeFishSlot(idx);
 }
+// Remove a snail by slot (swap-and-pop to keep coinSnails[0..numSnails) contiguous).
+void removeSnailSlot(int idx) {
+    if (idx < 0 || idx >= numSnails || !coinSnails[idx].active) return;
+    int last = numSnails - 1;
+    if (idx != last) coinSnails[idx] = coinSnails[last];
+    coinSnails[last].active = false;
+    numSnails--;
+}
+void sellSnailSlot(int idx) {
+    if (idx < 0 || idx >= numSnails || !coinSnails[idx].active) return;
+    gameCoins += snailSellValue(idx);
+    removeSnailSlot(idx);
+}
 
 void telemetryApplyControls() {
     int w = _ctrlWeatherReq.exchange(-2);
@@ -1297,6 +1370,11 @@ void telemetryApplyControls() {
             fish[k].xp += 10; fish[k].age += 40;
             fish[k].fishLuck = fish[k].fishLuck + 0.05f > 1 ? 1.0f : fish[k].fishLuck + 0.05f;
         }
+        // Snails graze the same food — grow them too so they're worth keeping.
+        for (int k = 0; k < numSnails; k++) if (coinSnails[k].active && random(0, 3) == 0) {
+            coinSnails[k].xp += 10; coinSnails[k].age += 40;
+            coinSnails[k].snailLuck = coinSnails[k].snailLuck + 0.05f > 1 ? 1.0f : coinSnails[k].snailLuck + 0.05f;
+        }
     }
 
     // Sell fish (from web dashboard fish-profile sell button or local shop panel).
@@ -1304,6 +1382,12 @@ void telemetryApplyControls() {
         int sc = _ctrlSellFishCount.exchange(0);
         for (int i = 0; i < sc && i < CTRL_SELL_MAX; i++)
             sellFishSlot(_ctrlSellFishIds[i].load());
+    }
+    // Sell snails (web snail-profile sell button).
+    {
+        int sc = _ctrlSellSnailCount.exchange(0);
+        for (int i = 0; i < sc && i < CTRL_SELL_MAX; i++)
+            sellSnailSlot(_ctrlSellSnailIds[i].load());
     }
 }
 
