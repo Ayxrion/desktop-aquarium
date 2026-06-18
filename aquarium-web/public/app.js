@@ -151,9 +151,11 @@ function boundA(v, lo, hi, k) {
 
 // One whole device-frame of the joint fish physics — a faithful port of the device
 // (sim.js stepPhysics / firmware updateFish): sub-school centroids, cohesion, pairwise
-// separation, target seeking, boundary springs, damping. The ONLY deviation: once a
-// fish's wander countdown expires we HOLD its last known target (the device picks a
-// new random one we can't reproduce); the next snapshot corrects it.
+// separation, target seeking, boundary springs, damping, AND wander retargeting — so
+// the fish keep roaming during long gaps between telemetry instead of gliding to a
+// stale target and stopping. The device's retarget RNG differs from ours, so positions
+// diverge slightly between snapshots; the error-decay reconciliation (errById) then
+// eases them onto the authoritative truth on the next snapshot (no snap, no freeze).
 function stepFishOnce(fish) {
   const cent = {}; const order = [0, 0, 0, 0, 0];
   for (const f of fish) {
@@ -167,7 +169,26 @@ function stepFishOnce(fish) {
   for (const k in cent) { const c = cent[k]; c.x /= c.n; c.y /= c.n; c.z /= c.n; }
   for (const f of fish) {
     const t = f.type;
-    if (f.wcd > 0) f.wcd--;
+    // Wander countdown: when it expires, pick a fresh target exactly the way the device
+    // does (clownfish toggle chase; salmon roam solo; schoolers/angel aim near centroid).
+    if (f.wcd > 0) {
+      f.wcd--;
+    } else {
+      if (t === 0) {
+        f.chasing = !f.chasing;
+        f.wcd = f.chasing ? 30 + Math.random() * 40 : 40 + Math.random() * 50;
+      } else if (t === 3) { f.wcd = 8 + Math.random() * 20; }
+      else { f.wcd = 15 + Math.random() * 35; }
+      if (t === 4) {                          // salmon: solitary, roam the whole tank
+        f.tx = 30 + Math.random() * (SCREEN_W - 60);
+        f.ty = (TANK_TOP + 20) + Math.random() * (SCREEN_H - 80 - (TANK_TOP + 20));
+      } else {
+        const cg = cent[t + ':' + f._sub];
+        const spread = t === 3 ? 120 : t === 0 ? 0 : 160;
+        f.tx = clamp(cg.x + (Math.random() * 2 - 1) * spread, 30, SCREEN_W - 30);
+        f.ty = clamp(cg.y + (Math.random() * 2 - 1) * (t === 3 ? 110 : 90), TANK_TOP + 20, SCREEN_H - 80);
+      }
+    }
     const chasing = f.chasing && t === 0;
     const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
     const maxV = f.going_for_food ? 8.0 : (chasing || t === 3) ? 7.0 : 5.5;

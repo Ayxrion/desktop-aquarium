@@ -63,7 +63,10 @@ function _bound(v, lo, hi, k) {
 function _extrapolateSnapshot(snapshot, elapsedMs) {
   if (!snapshot) return snapshot;
   const fm = snapshot.frame_ms || 50;
-  const n  = Math.round(Math.min(Math.max(elapsedMs, 0), 3000) / fm);
+  // Predict forward up to 30s (was 3s). The old 3s cap froze the tank between sparse
+  // device posts; fish should keep swimming via wander retargeting (below) until fresh
+  // telemetry — or the tank goes stale — arrives.
+  const n  = Math.round(Math.min(Math.max(elapsedMs, 0), 30000) / fm);
   if (n === 0) return snapshot;
 
   const fish = Array.isArray(snapshot.fish) ? snapshot.fish : [];
@@ -74,6 +77,7 @@ function _extrapolateSnapshot(snapshot, elapsedMs) {
       x: f.x, y: f.y, z: f.z || 0,
       vx: f.vx || 0, vy: f.vy || 0, vz: f.vz || 0,
       tx: f.tx ?? f.x, ty: f.ty ?? f.y, tz: typeof f.tz === 'number' ? f.tz : (f.z || 0),
+      wcd: typeof f.wander_cd === 'number' ? f.wander_cd : 30,
       chasing: !!f.chasing, going_for_food: !!f.going_for_food,
     }));
 
@@ -92,11 +96,31 @@ function _extrapolateSnapshot(snapshot, elapsedMs) {
       }
       for (const k in cent) { const c = cent[k]; c.x /= c.n; c.y /= c.n; c.z /= c.n; }
       for (const f of st) {
-        const t = f.type, chasing = f.chasing && t === 0;
+        const t = f.type;
+        // Wander retargeting (mirrors the device + client predictor): when the countdown
+        // expires, choose a fresh target so the fish keep roaming instead of settling on
+        // a stale one. Keeps the REST/poll view alive between sparse device posts.
+        if (f.wcd > 0) {
+          f.wcd--;
+        } else {
+          if (t === 0) {
+            f.chasing = !f.chasing;
+            f.wcd = f.chasing ? 30 + Math.random() * 40 : 40 + Math.random() * 50;
+          } else if (t === 3) { f.wcd = 8 + Math.random() * 20; }
+          else { f.wcd = 15 + Math.random() * 35; }
+          if (t === 4) {
+            f.tx = 30 + Math.random() * (SCREEN_W - 60);
+            f.ty = (TANK_TOP + 20) + Math.random() * (SCREEN_H - 80 - (TANK_TOP + 20));
+          } else {
+            const cg = cent[t + ':' + f._sub];
+            const spread = t === 3 ? 120 : t === 0 ? 0 : 160;
+            f.tx = Math.max(30, Math.min(SCREEN_W - 30, cg.x + (Math.random() * 2 - 1) * spread));
+            f.ty = Math.max(TANK_TOP + 20, Math.min(SCREEN_H - 80, cg.y + (Math.random() * 2 - 1) * (t === 3 ? 110 : 90)));
+          }
+        }
+        const chasing = f.chasing && t === 0;
         const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
         const maxV    = f.going_for_food ? 8.0 : (chasing || t === 3) ? 7.0 : 5.5;
-        // Always seek the last-known target (device keeps seeking; only the
-        // unpredictable random retarget on wander_cd expiry is skipped).
         let ax = (f.tx - f.x) * seekStr;
         let ay = (f.ty - f.y) * seekStr;
         let az = (f.tz - f.z) * 0.010;
