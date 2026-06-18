@@ -114,6 +114,7 @@ static int telemetrySrvPair = 0, telemetrySrvSchool = 0,
 // weather + time globals are all in scope).
 static std::atomic<int> _ctrlWeatherReq{-2};      // -2 none, -1 auto, 0..6 condition
 static std::atomic<int> _ctrlTimeReq{-1};         // -1 none, 0 REAL, 1 FAST
+static std::atomic<int> _ctrlBrightnessReq{-1};   // -1 none, 0..255 backlight level
 static std::atomic<int> _ctrlFeedReq{0};          // pending food drops
 static std::atomic<int> _ctrlFishAddReq[5];       // pending adds per fish type 0..4
 static std::atomic<int> _ctrlFishDelReq[5];       // pending removes per fish type 0..4
@@ -146,6 +147,7 @@ static void _telemetryParseControls(const char* body) {
     }
     if ((d = strstr(body, "!WEATHER:")) != nullptr) _ctrlWeatherReq.store(atoi(d + 9));
     if ((d = strstr(body, "!TIME:"))    != nullptr) _ctrlTimeReq.store(atoi(d + 6));
+    if ((d = strstr(body, "!BRIGHTNESS:")) != nullptr) _ctrlBrightnessReq.store(atoi(d + 12));
     if ((d = strstr(body, "!FEED:"))    != nullptr) _ctrlFeedReq.fetch_add(atoi(d + 6));
     if ((d = strstr(body, "!MODE:"))     != nullptr) _ctrlModeReq.store(atoi(d + 6));
     if ((d = strstr(body, "!BUYFOOD:"))  != nullptr) _ctrlBuyFoodReq.fetch_add(atoi(d + 9));
@@ -271,13 +273,13 @@ static std::string _buildTelemetryJson() {
     snprintf(tmp, sizeof(tmp),
         "{\"aquarium_id\":\"%s\",\"device_id\":\"%s\",\"platform\":\"pi\",\"fw_version\":\"%s\","
         "\"uptime_ms\":%u,\"tick\":%d,\"frame_ms\":%d,"
-        "\"screen\":{\"w\":%d,\"h\":%d,\"tank_top\":%d},"
+        "\"screen\":{\"w\":%d,\"h\":%d,\"tank_top\":%d,\"brightness\":%d},"
         "\"weather\":{\"condition\":%d,\"name\":\"%s\",\"override\":%s},"
         "\"time\":{\"day_progress\":%.4f,\"mode\":\"%s\"},"
         "\"counts\":{\"pair\":%d,\"school\":%d,\"school2\":%d,\"angel\":%d,\"salmon\":%d},",
         activeAquariumId, TELEMETRY_DEVICE_ID, FIRMWARE_VERSION,
         (unsigned)millis(), (int)tick, FRAME_MS,
-        SCREEN_W, SCREEN_H, TANK_TOP,
+        SCREEN_W, SCREEN_H, TANK_TOP, (int)displayBrightness,
         wc, _weatherName(wc), (weatherOverrideIdx >= 0) ? "true" : "false",
         getDayProgress(), (currentTimeMode == TIME_FAST) ? "FAST" : "REAL",
         numPair, numSchool, numSchool2, numAngel, numSalmon);
@@ -804,6 +806,56 @@ static void telemetryBootstrap() {
         printf("Telemetry: no saved profile on server (keeping local tank)\n");
 }
 
+// ── Local state persistence (offline-safe restore) ───────────────────────────
+// The server is the source of truth when reachable, but the Pi also mirrors its
+// tank to a local file every LOCAL_SAVE_INTERVAL_MS. On boot, if the server has
+// no profile to restore (offline, telemetry off, or never synced), the tank is
+// rebuilt from this file so a power cycle can't wipe career progress.
+#ifndef LOCAL_STATE_PATH
+#define LOCAL_STATE_PATH "aquarium-state.json"
+#endif
+#ifndef LOCAL_SAVE_INTERVAL_MS
+#define LOCAL_SAVE_INTERVAL_MS 30000   // 30 s
+#endif
+static uint32_t _lastLocalSaveMs = 0;
+
+// Restore the tank from the last local snapshot. Returns true if applied.
+static bool localStateLoad() {
+    FILE* f = fopen(LOCAL_STATE_PATH, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz >= (long)sizeof(_bootstrapJson)) { fclose(f); return false; }
+    size_t n = fread(_bootstrapJson, 1, (size_t)sz, f);
+    fclose(f);
+    _bootstrapJson[n] = '\0';
+    if (!strstr(_bootstrapJson, "\"exists\":true")) return false;
+    _applyServerProfile(_bootstrapJson);   // sets telemetryProfileLoaded
+    printf("LocalState: tank restored from local save (%s)\n", LOCAL_STATE_PATH);
+    return true;
+}
+
+// Mirror the current tank to disk, rate-limited. Safe to call every loop().
+// Writes a temp file then renames it over the live save (atomic on POSIX), so a
+// crash/power loss mid-write can't corrupt the restorable copy. Reuses the
+// telemetry snapshot, injecting the "exists":true flag the restore path keys on.
+static void localStatePersist() {
+    uint32_t now = millis();
+    if (now - _lastLocalSaveMs < (uint32_t)LOCAL_SAVE_INTERVAL_MS) return;
+    _lastLocalSaveMs = now;
+    std::string json = _buildTelemetryJson();          // "{...}"
+    if (json.size() < 2 || json[0] != '{') return;
+    std::string out = "{\"exists\":true," + json.substr(1);
+    std::string tmp = std::string(LOCAL_STATE_PATH) + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) return;
+    fwrite(out.data(), 1, out.size(), f);
+    fflush(f);
+    fclose(f);
+    rename(tmp.c_str(), LOCAL_STATE_PATH);             // atomic replace
+}
+
 // Apply a pending !SWITCHAQ: point this device at a new aquarium and load its state.
 // Call from the render thread (it rebuilds fish[] via the bootstrap restore).
 static void telemetryApplyAquariumSwitch() {
@@ -894,8 +946,10 @@ static void telemetryInit() {
     if (telemetryEnabled && TELEMETRY_HOST[0] != '\0')
         printf("Telemetry: enabled → %s/api/telemetry as '%s' every %d ms\n",
                TELEMETRY_HOST, TELEMETRY_AQUARIUM_ID, TELEMETRY_INTERVAL_MS);
-    // Restore last-known state from the server before the render loop starts.
+    // Server is the source of truth when reachable; otherwise fall back to the
+    // last local snapshot so an offline reboot keeps the player's tank.
     telemetryBootstrap();
+    if (!telemetryProfileLoaded) localStateLoad();
 }
 
 // Call once per loop(); rate-limited internally by TELEMETRY_INTERVAL_MS.

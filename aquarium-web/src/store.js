@@ -264,9 +264,9 @@ const aquariums = new Map();
 })();
 
 // ── Devices ────────────────────────────────────────────────────────────────────
-// A device is a physical Pi/ESP that self-registers via telemetry. (There are no
-// "virtual" devices any more — any aquarium WITHOUT a live device is run by the
-// server's built-in web simulator; see deviceManager.js.) An aquarium is a standalone
+// A device is a physical Pi/ESP that self-registers via telemetry. Dashboard-created
+// aquariums with no assigned device are run by the server's web simulator
+// (deviceManager.js). Assigned devices keep ownership even when offline.
 // saved tank; a device "plays" at most one aquarium at a time (`aquariumId`).
 /** @type {Map<string, {id,name,kind,aquariumId,createdAt,lastSeenMs}>} */
 const devices = new Map();
@@ -294,6 +294,18 @@ function hasLiveDevice(aquariumId) {
   for (const d of devices.values())
     if (d.aquariumId === aquariumId && !isStale(d.lastSeenMs || 0)) return true;
   return false;
+}
+// True when any device (online or offline) is bound to this aquarium. Offline tanks
+// keep their last snapshot — the server web sim must not take over automatically.
+function hasAssignedDevice(aquariumId) {
+  if (!aquariumId) return false;
+  for (const d of devices.values())
+    if (d.aquariumId === aquariumId) return true;
+  return false;
+}
+// Dashboard-created tanks with no assigned hardware run on the server web sim.
+function shouldWebSimulate(aquariumId) {
+  return !hasAssignedDevice(aquariumId);
 }
 // Device summary (if any) currently bound to an aquarium — live one preferred.
 function deviceForAquarium(aquariumId) {
@@ -468,6 +480,10 @@ function enrich(entry) {
 function enrichExtrapolated(entry) {
   const base = enrich(entry);
   if (!base) return null;
+  // Device offline → freeze on the last real frame instead of dead-reckoning a dead
+  // device forward; the simulation resumes when telemetry returns. (Web-simulated
+  // tanks post ~1 Hz so they're never stale and keep extrapolating normally.)
+  if (base._stale) return base;
   const elapsedMs = now() - entry.lastSeenMs;
   return _extrapolateSnapshot(base, elapsedMs);
 }
@@ -726,7 +742,8 @@ function list() {
       weather: s.weather || null,
       conflict: !!entry.conflict,
       device,                          // { id, name, kind, online } | null
-      simulated: !(device && device.online), // server web-sim drives it when no live device
+      simulated: shouldWebSimulate(id),
+      deviceOffline: !!(device && !device.online),
     });
   }
   out.sort((a, b) => a.aquarium_id.localeCompare(b.aquarium_id));
@@ -845,7 +862,7 @@ module.exports = {
   queueControl, remove, FISH_MAX,
   STALE_MS, MAX_AQUARIUMS,
   // Aquarium lifecycle (dashboard-created tanks, simulated server-side)
-  createAquarium, renameAquarium, aquariumIds, hasLiveDevice,
+  createAquarium, renameAquarium, aquariumIds, hasLiveDevice, hasAssignedDevice, shouldWebSimulate,
   // Device registry (physical hardware that self-registers via telemetry)
   listDevices, getDevice, createDevice, updateDevice, removeDevice,
 };

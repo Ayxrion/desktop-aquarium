@@ -548,7 +548,52 @@ static float shellCD = SHELL_BASE_CD, wanderCD = WANDER_BASE_CD;
 #define MENU_X   510
 #define MENU_Y    48
 #define MENU_W   282
-#define MENU_H   410
+#define MENU_H   425
+#define MENU_ROW_BRIGHT_Y (MENU_Y + 45 + 5 * 58 + 30)
+#define MENU_ROW_TELEM_Y  (MENU_Y + 45 + 5 * 58 + 58)
+#define BRIGHT_SL_X (MENU_X + 110)
+#define BRIGHT_SL_W 138
+
+static uint8_t displayBrightness = 255;
+
+static void menuRowYs(bool career, int& yWeather, int& yTime, int& yBright, int& yTelem) {
+  if (career) {
+    yWeather = MENU_Y + 73;
+    yTime    = MENU_Y + 111;
+    yBright  = MENU_Y + 149;
+    yTelem   = MENU_Y + 187;
+  } else {
+    yWeather = MENU_Y + 45 + 4 * 58;
+    yTime    = MENU_Y + 45 + 5 * 58;
+    yBright  = MENU_ROW_BRIGHT_Y;
+    yTelem   = MENU_ROW_TELEM_Y;
+  }
+}
+
+// Display backlight slider (real LovyanGFX hardware brightness on the ESP panel).
+static int brightnessFromTouchX(uint16_t tx) {
+  if (tx <= (uint16_t)BRIGHT_SL_X) return 10;
+  if (tx >= (uint16_t)(BRIGHT_SL_X + BRIGHT_SL_W)) return 255;
+  return 10 + (int)((tx - BRIGHT_SL_X) * (255 - 10) / BRIGHT_SL_W);
+}
+static void setDisplayBrightness(int b) {
+  if (b < 10) b = 10;
+  if (b > 255) b = 255;
+  displayBrightness = (uint8_t)b;
+  display.setBrightness(displayBrightness);
+}
+static void drawBrightnessSlider(int ry) {
+  canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
+  canvas.setCursor(MENU_X + 10, ry + 6); canvas.print("BRIGHT");
+  canvas.fillRect(BRIGHT_SL_X, ry + 8, BRIGHT_SL_W, 20, 0x0C1A2AUL);
+  canvas.drawRect(BRIGHT_SL_X, ry + 8, BRIGHT_SL_W, 20, 0x4488CCUL);
+  int fillW = (displayBrightness - 10) * BRIGHT_SL_W / (255 - 10);
+  if (fillW > 0)
+    canvas.fillRect(BRIGHT_SL_X + 1, ry + 9, fillW, 18, 0xFFD23FUL);
+  int thumbX = BRIGHT_SL_X + fillW - 3;
+  if (thumbX < BRIGHT_SL_X) thumbX = BRIGHT_SL_X;
+  canvas.fillRect(thumbX, ry + 4, 6, 28, 0xFFEE88UL);
+}
 
 // ─── Button / touch state ─────────────────────────────────────────────────────
 bool     lastBtnState  = HIGH;
@@ -736,9 +781,11 @@ static const FishTypeProfile FISH_PROFILE[5] = {
   { 0.72f, 0.68f, 0.22f, 35, 95, 32, 85 },   // salmon — steady
 };
 static int fishSubSchool(int idx, FishType type) {
-  if (type == FISH_SCHOOL)  return (idx - MAX_PAIR) / FISH_SCHOOL_SIZE[type];
-  if (type == FISH_SCHOOL2) return (idx - MAX_PAIR - MAX_SCHOOL) / FISH_SCHOOL_SIZE[type];
-  if (type == FISH_ANGEL)   return (idx - MAX_PAIR - MAX_SCHOOL - MAX_SCHOOL2) / FISH_SCHOOL_SIZE[type];
+  int sz = FISH_SCHOOL_SIZE[type];
+  if (sz <= 0) return 0;   // solitary types (angel/salmon) have no sub-schools — never divide by 0
+  if (type == FISH_SCHOOL)  return (idx - MAX_PAIR) / sz;
+  if (type == FISH_SCHOOL2) return (idx - MAX_PAIR - MAX_SCHOOL) / sz;
+  if (type == FISH_ANGEL)   return (idx - MAX_PAIR - MAX_SCHOOL - MAX_SCHOOL2) / sz;
   return 0;
 }
 static float fishSpeedMul(int idx, FishType type) {
@@ -1642,6 +1689,9 @@ void telemetryApplyControls() {
   int tm = _ctrlTimeReq.exchange(-1);
   if      (tm == 0) currentTimeMode = TIME_REAL;
   else if (tm == 1) currentTimeMode = TIME_FAST;
+
+  int br = _ctrlBrightnessReq.exchange(-1);
+  if (br >= 0) setDisplayBrightness(br);
 
   const FishType T[5] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
   for (int t = 0; t < 5; t++) {
@@ -2845,59 +2895,55 @@ void drawMenu() {
 
   canvas.drawFastHLine(MENU_X + 8, MENU_Y + 34, MENU_W - 16, 0x2244AAUL);
 
-  const char* labels[5] = { "CLOWNFISH", "GUPPY", "PIRANHA", "ANGELFISH", "SALMON" };
-  int counts[5]         = { numPair, numSchool, numSchool2, numAngel, numSalmon };
-  int maxes[5]          = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL, MAX_SALMON };
+  int yWeather, yTime, yBright, yTelem;
+  menuRowYs(career, yWeather, yTime, yBright, yTelem);
 
-  for (int row = 0; row < 5; row++) {
-    int ry = MENU_Y + 45 + row * 58;
-
+  if (career) {
     canvas.setTextSize(1);
-    canvas.setTextColor(0xAADDFFUL);
-    canvas.setCursor(MENU_X + 10, ry + 11);
-    canvas.print(labels[row]);
+    canvas.setTextColor(0x8899AAUL);
+    canvas.setCursor(MENU_X + 10, MENU_Y + 52);
+    canvas.print("FISH: use shop cart");
+  } else {
+    const char* labels[5] = { "CLOWNFISH", "GUPPY", "PIRANHA", "ANGELFISH", "SALMON" };
+    int counts[5]         = { numPair, numSchool, numSchool2, numAngel, numSalmon };
+    int maxes[5]          = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL, MAX_SALMON };
 
-    // [-] remove — creative only (career fish are earned, not freely culled)
-    bool canRm = !career && counts[row] > 0;
-    canvas.fillRect(MENU_X + 148, ry, 30, 30, canRm ? 0x1A3355UL : 0x0C1A2AUL);
-    canvas.drawRect(MENU_X + 148, ry, 30, 30, canRm ? 0x4488CCUL : 0x223344UL);
-    canvas.setTextSize(2);
-    canvas.setTextColor(canRm ? 0xFFFFFFUL : 0x334455UL);
-    canvas.setCursor(MENU_X + 157, ry + 7);
-    canvas.print("-");
+    for (int row = 0; row < 5; row++) {
+      int ry = MENU_Y + 45 + row * 58;
 
-    // Count
-    char buf[4];
-    snprintf(buf, sizeof(buf), "%d", counts[row]);
-    canvas.setTextSize(2);
-    canvas.setTextColor(0xFFEE88UL);
-    canvas.setCursor(MENU_X + 184, ry + 7);
-    canvas.print(buf);
-
-    // [+] add (creative free) / buy with coins (career)
-    bool atCap  = counts[row] >= maxes[row];
-    bool canAdd = career ? (!atCap && gameCoins >= FISH_PRICE[row]) : !atCap;
-    canvas.fillRect(MENU_X + 210, ry, 30, 30, canAdd ? (career ? 0x3A2E0AUL : 0x1A3355UL) : 0x0C1A2AUL);
-    canvas.drawRect(MENU_X + 210, ry, 30, 30, canAdd ? (career ? 0xFFD23FUL : 0x4488CCUL) : 0x223344UL);
-    canvas.setTextSize(2);
-    canvas.setTextColor(canAdd ? 0xFFFFFFUL : 0x334455UL);
-    canvas.setCursor(MENU_X + 217, ry + 7);
-    canvas.print("+");
-
-    // Career: price tag beside the buy button
-    if (career) {
-      char pbuf[6];
-      snprintf(pbuf, sizeof(pbuf), "%d", FISH_PRICE[row]);
       canvas.setTextSize(1);
-      canvas.setTextColor(canAdd ? 0xFFD23FUL : 0x556677UL);
-      canvas.setCursor(MENU_X + 244, ry + 11);
-      canvas.print(pbuf);
+      canvas.setTextColor(0xAADDFFUL);
+      canvas.setCursor(MENU_X + 10, ry + 11);
+      canvas.print(labels[row]);
+
+      bool canRm = counts[row] > 0;
+      canvas.fillRect(MENU_X + 148, ry, 30, 30, canRm ? 0x1A3355UL : 0x0C1A2AUL);
+      canvas.drawRect(MENU_X + 148, ry, 30, 30, canRm ? 0x4488CCUL : 0x223344UL);
+      canvas.setTextSize(2);
+      canvas.setTextColor(canRm ? 0xFFFFFFUL : 0x334455UL);
+      canvas.setCursor(MENU_X + 157, ry + 7);
+      canvas.print("-");
+
+      char buf[4];
+      snprintf(buf, sizeof(buf), "%d", counts[row]);
+      canvas.setTextSize(2);
+      canvas.setTextColor(0xFFEE88UL);
+      canvas.setCursor(MENU_X + 184, ry + 7);
+      canvas.print(buf);
+
+      bool canAdd = counts[row] < maxes[row];
+      canvas.fillRect(MENU_X + 210, ry, 30, 30, canAdd ? 0x1A3355UL : 0x0C1A2AUL);
+      canvas.drawRect(MENU_X + 210, ry, 30, 30, canAdd ? 0x4488CCUL : 0x223344UL);
+      canvas.setTextSize(2);
+      canvas.setTextColor(canAdd ? 0xFFFFFFUL : 0x334455UL);
+      canvas.setCursor(MENU_X + 217, ry + 7);
+      canvas.print("+");
     }
   }
 
   // ── Time mode row ───────────────────────────────────────────────────────────
   {
-    int ry5 = MENU_Y + 45 + 5 * 58;
+    int ry5 = yTime;
 
     canvas.setTextSize(1);
     canvas.setTextColor(0xAADDFFUL);
@@ -2926,7 +2972,7 @@ void drawMenu() {
 
   // ── Weather override row ────────────────────────────────────────────────────
   {
-    int ry4 = MENU_Y + 45 + 4 * 58;  // 5th row, below the four fish rows
+    int ry4 = yWeather;  // below fish rows in creative; compact in career
 
     canvas.setTextSize(1);
     canvas.setTextColor(0xAADDFFUL);
@@ -2967,9 +3013,10 @@ void drawMenu() {
     canvas.print(">");
   }
 
-  // Telemetry publish toggle (compact row beneath the time row).
+  drawBrightnessSlider(yBright);
+  // Telemetry publish toggle (compact row beneath brightness).
   {
-    int ryT = MENU_Y + 45 + 5 * 58 + 38;
+    int ryT = yTelem;
     canvas.setTextSize(1);
     canvas.setTextColor(0xAADDFFUL);
     canvas.setCursor(MENU_X + 10, ryT + 9);
@@ -3166,32 +3213,28 @@ void loop() {
           }
         }
       }
-      // Route to [-]/[+] buttons; block food drop while menu open
-      const FishType rowType[5] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
-      for (int row = 0; row < 5; row++) {
-        int ry = MENU_Y + 45 + row * 58;
-        if (tx >= (uint16_t)(MENU_X + 148) && tx < (uint16_t)(MENU_X + 178) &&
-            ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
-          if (gameMode != MODE_CAREER) removeFish(rowType[row]);  // creative only
-          break;
-        }
-        if (tx >= (uint16_t)(MENU_X + 210) && tx < (uint16_t)(MENU_X + 240) &&
-            ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
-          if (gameMode == MODE_CAREER) {           // buy with coins (guard the cap)
-            int cnt[5] = { numPair, numSchool, numSchool2, numAngel, numSalmon };
-            int mx[5]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL, MAX_SALMON };
-            if (cnt[row] < mx[row] && gameCoins >= FISH_PRICE[row]) {
-              gameCoins -= FISH_PRICE[row]; addFish(rowType[row]);
-            }
-          } else {
-            addFish(rowType[row]);                 // creative: free
+      // Route to [-]/[+] buttons (creative only); block food drop while menu open
+      if (gameMode != MODE_CAREER) {
+        const FishType rowType[5] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
+        for (int row = 0; row < 5; row++) {
+          int ry = MENU_Y + 45 + row * 58;
+          if (tx >= (uint16_t)(MENU_X + 148) && tx < (uint16_t)(MENU_X + 178) &&
+              ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
+            removeFish(rowType[row]);
+            break;
           }
-          break;
+          if (tx >= (uint16_t)(MENU_X + 210) && tx < (uint16_t)(MENU_X + 240) &&
+              ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
+            addFish(rowType[row]);
+            break;
+          }
         }
       }
+      int yWeather, yTime, yBright, yTelem;
+      menuRowYs(gameMode == MODE_CAREER, yWeather, yTime, yBright, yTelem);
       // Time mode row [<] / [>] — toggles REAL ↔ FAST
       {
-        int ry5 = MENU_Y + 45 + 5 * 58;
+        int ry5 = yTime;
         if (tx >= (uint16_t)(MENU_X + 110) && tx < (uint16_t)(MENU_X + 140) &&
             ty >= (uint16_t)ry5             && ty < (uint16_t)(ry5 + 30)) {
           currentTimeMode = (currentTimeMode == TIME_REAL) ? TIME_FAST : TIME_REAL;
@@ -3203,7 +3246,7 @@ void loop() {
       }
       // Weather override row [<] / [>]
       {
-        int ry4 = MENU_Y + 45 + 4 * 58;
+        int ry4 = yWeather;
         if (tx >= (uint16_t)(MENU_X + 110) && tx < (uint16_t)(MENU_X + 140) &&
             ty >= (uint16_t)ry4             && ty < (uint16_t)(ry4 + 30)) {
           // Cycle left: FOGGY(6) → ... → SUNNY(0) → AUTO(-1) → FOGGY(6)
@@ -3231,7 +3274,7 @@ void loop() {
       }
       // Telemetry publish toggle
       {
-        int ryT = MENU_Y + 45 + 5 * 58 + 38;
+        int ryT = yTelem;
         if (tx >= (uint16_t)(MENU_X + 148) && tx < (uint16_t)(MENU_X + 230) &&
             ty >= (uint16_t)ryT             && ty < (uint16_t)(ryT + 28)) {
           telemetryEnabled = !telemetryEnabled;
@@ -3251,6 +3294,14 @@ void loop() {
       }
     }
   }
+  if (menuOpen && touched) {
+    int yWeather, yTime, yBright, yTelem;
+    menuRowYs(gameMode == MODE_CAREER, yWeather, yTime, yBright, yTelem);
+    (void)yWeather; (void)yTime; (void)yTelem;
+    if (ty >= (uint16_t)yBright && ty < (uint16_t)(yBright + 28) &&
+        tx >= (uint16_t)BRIGHT_SL_X && tx < (uint16_t)(BRIGHT_SL_X + BRIGHT_SL_W))
+      setDisplayBrightness(brightnessFromTouchX(tx));
+  }
   lastTouched = touched;
 
   uint32_t now = millis();
@@ -3267,6 +3318,7 @@ void loop() {
   updateWeatherEffects();
   telemetryUpdate();
   telemetryProcessFlags();   // act on server directives (rebuild / re-check)
+  localStatePersist();       // mirror tank to flash for offline restore (rate-limited)
   telemetryApplyControls();  // apply dashboard weather/time/fish/feed directives
   telemetryApplyAquariumSwitch(); // honor a !SWITCHAQ reassignment (re-bootstrap new tank)
 

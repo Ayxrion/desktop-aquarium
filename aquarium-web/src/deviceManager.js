@@ -1,22 +1,23 @@
 'use strict';
 
-// Always-on web simulator for aquariums that have NO live physical device.
+// Always-on web simulator for dashboard-created aquariums with NO assigned device.
 //
-// Every aquarium the store knows about (dashboard-created or persisted) is run by an
-// in-process simulator (src/sim.js) ticked ~1Hz: step() → telemetry snapshot →
+// Tanks bound to a physical Pi/ESP (even when offline) keep their last device
+// snapshot — the sim does not take over when hardware stops reporting.
+//
+// In-process simulator (src/sim.js) ticked ~1Hz: step() → telemetry snapshot →
 // store.upsert() (exactly as a physical device would POST), then the aquarium's queued
 // control directives are drained + applied. The simulated snapshot carries NO device_id,
 // so it never registers as a device — it's purely the server's "visual web simulation".
 //
-// Whenever a real Pi/ESP is live on an aquarium (it self-registers via telemetry and
-// store.hasLiveDevice() is true), the simulator steps aside and lets the hardware drive.
+// Whenever a real Pi/ESP is live on an aquarium (store.hasLiveDevice() is true), the
+// simulator steps aside and lets the hardware drive.
 //
-// State reconciles against the store every tick, so create/rename/delete and a device
-// coming online/offline are all picked up automatically (no tight coupling):
-//   - new aquarium with no live device  → spawn a sim (seeded from its saved snapshot,
-//     so it RESUMES rather than resets — also covers server restart)
-//   - a device comes online for a tank   → drop that tank's sim (hardware takes over)
-//   - aquarium removed                    → drop its sim
+// State reconciles against the store every tick:
+//   - new aquarium with no assigned device  → spawn a sim
+//   - a device comes online for a tank       → drop that tank's sim (hardware takes over)
+//   - assigned device goes offline             → drop sim; hold last snapshot
+//   - aquarium removed                       → drop its sim
 
 const store = require('./store');
 const { createSim } = require('./sim');
@@ -32,8 +33,10 @@ function tickOnce() {
 
   const seen = new Set();
   for (const id of ids) {
-    // A live physical device owns this tank → let the hardware drive it.
+    // Live hardware owns this tank → let the device drive it.
     if (store.hasLiveDevice(id)) { sims.delete(id); continue; }
+    // Assigned but offline → hold the last snapshot; do not web-simulate.
+    if (!store.shouldWebSimulate(id)) { sims.delete(id); continue; }
     seen.add(id);
 
     let inst = sims.get(id);

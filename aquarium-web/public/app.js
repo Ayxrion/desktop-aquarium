@@ -1431,9 +1431,11 @@ function renderList(items) {
     li.className = (a.aquarium_id === selectedId ? 'active' : '') + (a.stale ? ' stale-row' : '');
     const weather = a.weather ? (WEATHER_NAMES[a.weather.condition] || '?') : '—';
     const title = a.name || a.aquarium_id;
-    // Source badge: a live device drives the tank, otherwise the server web-simulates it.
+    // Source badge: live device, offline device (frozen), or server web sim.
     const src = (a.device && a.device.online)
       ? `<span class="aq-src device" title="Driven by ${escapeHtml(a.device.name)}">📟 ${escapeHtml(a.device.name)}</span>`
+      : (a.device && !a.device.online)
+      ? `<span class="aq-src offline" title="Device offline — showing last snapshot">📟 ${escapeHtml(a.device.name)} (offline)</span>`
       : `<span class="aq-src sim" title="Simulated on the server">🖥 web sim</span>`;
     li.innerHTML = `
       <button class="aq-del" title="Remove this aquarium" aria-label="Remove aquarium">×</button>
@@ -1635,6 +1637,15 @@ function _rafDraw() {
   const dtMs = _lastRafMs ? clamp(now - _lastRafMs, 0, 250) : 16;
   _lastRafMs = now;
   if (!lastSnap) return;
+
+  // Device offline → pause the simulation: hold the last frame (freeze fish, movers,
+  // and decor) without advancing the clock or stepping physics, until telemetry
+  // resumes. A fresh snapshot (device back) clears _stale and the loop resumes below.
+  if (latestSnapshot && latestSnapshot._stale) {
+    const held = buildRenderSnap(devClock != null ? devClock : snapTick(lastSnap));
+    if (held) { drawTank(held); drawPausedOverlay(); }
+    return;
+  }
 
   // Advance the live-edge clock; reseed from the freshest snapshot if one just landed.
   if (devClock == null) devClock = snapTick(lastSnap);
@@ -2497,6 +2508,22 @@ function drawTitle(s) {
     .join(' · ');
   const stale = s._stale || Date.now() - snapshotReceivedAt > 8000;
   els.viewDot.className = 'dot ' + (stale ? 'stale' : 'live');
+}
+
+// Dim banner drawn over the held frame while the device is offline, so a frozen
+// tank reads as "paused, waiting to reconnect" rather than broken.
+function drawPausedOverlay() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(8,16,28,0.45)';
+  ctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#cfe8ff';
+  ctx.font = 'bold 22px system-ui, -apple-system, sans-serif';
+  ctx.fillText('Device offline — simulation paused', SCREEN_W / 2, SCREEN_H / 2 - 4);
+  ctx.fillStyle = '#9bb8d6';
+  ctx.font = '14px system-ui, -apple-system, sans-serif';
+  ctx.fillText('Holding last frame until the device reconnects', SCREEN_W / 2, SCREEN_H / 2 + 22);
+  ctx.restore();
 }
 
 function dayTint(progress) {

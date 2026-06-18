@@ -20,6 +20,7 @@
 
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <LittleFS.h>
 #include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
@@ -99,6 +100,7 @@ static int telemetrySrvPair = 0, telemetrySrvSchool = 0,
 // dropFood()/addFish()/the weather + time globals are all in scope).
 static std::atomic<int> _ctrlWeatherReq{-2};      // -2 none, -1 auto, 0..6 condition
 static std::atomic<int> _ctrlTimeReq{-1};         // -1 none, 0 REAL, 1 FAST
+static std::atomic<int> _ctrlBrightnessReq{-1};   // -1 none, 0..255 backlight level
 static std::atomic<int> _ctrlFeedReq{0};          // pending food drops
 static std::atomic<int> _ctrlFishAddReq[5];       // pending adds per fish type 0..4
 static std::atomic<int> _ctrlFishDelReq[5];       // pending removes per fish type 0..4
@@ -131,6 +133,7 @@ static void _telemetryParseControls(const char* body) {
     }
     if ((d = strstr(body, "!WEATHER:")) != nullptr) _ctrlWeatherReq.store(atoi(d + 9));
     if ((d = strstr(body, "!TIME:"))    != nullptr) _ctrlTimeReq.store(atoi(d + 6));
+    if ((d = strstr(body, "!BRIGHTNESS:")) != nullptr) _ctrlBrightnessReq.store(atoi(d + 12));
     if ((d = strstr(body, "!FEED:"))    != nullptr) _ctrlFeedReq.fetch_add(atoi(d + 6));
     if ((d = strstr(body, "!MODE:"))     != nullptr) _ctrlModeReq.store(atoi(d + 6));
     if ((d = strstr(body, "!BUYFOOD:"))  != nullptr) _ctrlBuyFoodReq.fetch_add(atoi(d + 9));
@@ -261,13 +264,13 @@ static int _buildTelemetryJson() {
     o = _tAppend(o,
         "{\"aquarium_id\":\"%s\",\"device_id\":\"%s\",\"platform\":\"esp32\",\"fw_version\":\"%s\","
         "\"uptime_ms\":%lu,\"tick\":%d,\"frame_ms\":%d,"
-        "\"screen\":{\"w\":%d,\"h\":%d,\"tank_top\":%d},"
+        "\"screen\":{\"w\":%d,\"h\":%d,\"tank_top\":%d,\"brightness\":%d},"
         "\"weather\":{\"condition\":%d,\"name\":\"%s\",\"override\":%s},"
         "\"time\":{\"day_progress\":%.4f,\"mode\":\"%s\"},"
         "\"counts\":{\"pair\":%d,\"school\":%d,\"school2\":%d,\"angel\":%d,\"salmon\":%d},",
         activeAquariumId, TELEMETRY_DEVICE_ID, FIRMWARE_VERSION,
         (unsigned long)millis(), (int)tick, FRAME_MS,
-        SCREEN_W, SCREEN_H, TANK_TOP,
+        SCREEN_W, SCREEN_H, TANK_TOP, (int)displayBrightness,
         wc, _telemetryWeatherName(wc), (weatherOverrideIdx >= 0) ? "true" : "false",
         getDayProgress(), (currentTimeMode == TIME_FAST) ? "FAST" : "REAL",
         numPair, numSchool, numSchool2, numAngel, numSalmon);
@@ -627,6 +630,62 @@ static void telemetryBootstrap() {
         Serial.println("Telemetry: no saved profile on server (keeping local tank)");
 }
 
+// ── Local state persistence (offline-safe restore) ───────────────────────────
+// The server is the source of truth when reachable, but the device also mirrors
+// its tank to on-board flash (LittleFS) every LOCAL_SAVE_INTERVAL_MS. On boot, if
+// the server has no profile to restore (offline, telemetry off, or never synced),
+// the tank is rebuilt from this file so a power cycle can't wipe career progress.
+#ifndef LOCAL_STATE_PATH
+#define LOCAL_STATE_PATH "/aqstate.json"
+#endif
+#ifndef LOCAL_SAVE_INTERVAL_MS
+#define LOCAL_SAVE_INTERVAL_MS 120000   // 2 min — bounds progress loss while limiting flash wear
+#endif
+static bool     _localFsReady    = false;
+static uint32_t _lastLocalSaveMs = 0;
+
+// Mount the "spiffs" partition (min_spiffs.csv) as LittleFS; format on first use.
+static void localStateInit() {
+    _localFsReady = LittleFS.begin(true);
+    if (!_localFsReady) Serial.println("LocalState: LittleFS mount failed (no offline save)");
+}
+
+// Restore the tank from the last on-flash snapshot. Returns true if applied.
+static bool localStateLoad() {
+    if (!_localFsReady || !LittleFS.exists(LOCAL_STATE_PATH)) return false;
+    File f = LittleFS.open(LOCAL_STATE_PATH, "r");
+    if (!f) return false;
+    DynamicJsonDocument doc(65536);   // same budget as the server bootstrap parse
+    DeserializationError err = deserializeJson(doc, f);
+    f.close();
+    if (err || !doc["exists"].as<bool>()) return false;
+    _applyServerProfileDoc(doc);
+    telemetryProfileLoaded = true;
+    Serial.println("LocalState: tank restored from on-flash save");
+    return true;
+}
+
+// Mirror the current tank to flash, rate-limited. Safe to call every loop().
+// Writes a temp file then renames it over the live save, so a power loss mid-write
+// can't corrupt the restorable copy. Reuses the telemetry snapshot buffer (the
+// "{...}" it builds), injecting the "exists":true flag the restore path keys on.
+static void localStatePersist() {
+    if (!_localFsReady) return;
+    uint32_t now = millis();
+    if (now - _lastLocalSaveMs < (uint32_t)LOCAL_SAVE_INTERVAL_MS) return;
+    if (_telemetryBusy.load()) return;          // snapshot buffer in flight to the server
+    _lastLocalSaveMs = now;
+    _telemetryBufLen = _buildTelemetryJson();   // fills _telemetryBuf with "{...}"
+    if (_telemetryBufLen < 2) return;
+    File f = LittleFS.open(LOCAL_STATE_PATH ".tmp", "w");
+    if (!f) return;
+    f.print("{\"exists\":true,");                                       // restore-path flag
+    f.write((const uint8_t*)_telemetryBuf + 1, _telemetryBufLen - 1);   // skip the leading '{'
+    f.close();
+    LittleFS.remove(LOCAL_STATE_PATH);
+    LittleFS.rename(LOCAL_STATE_PATH ".tmp", LOCAL_STATE_PATH);
+}
+
 // Apply a pending !SWITCHAQ reassignment: point at the new aquarium + load its state.
 // Call from the render loop (core 1) — it rebuilds fish[] via the bootstrap restore.
 static void telemetryApplyAquariumSwitch() {
@@ -689,6 +748,7 @@ static void telemetryProcessFlags() {
 }
 
 static void telemetryInit() {
+    localStateInit();   // mount flash before any save/restore
     if (!_telemetryTaskHandle) {
         // Core 0; the Arduino loop runs on core 1. 8 KB stack covers plain-HTTP
         // HTTPClient (the 12 KB body lives in the static buffer, not the stack).
@@ -698,8 +758,10 @@ static void telemetryInit() {
     if (telemetryEnabled && TELEMETRY_HOST[0] != '\0')
         Serial.printf("Telemetry: enabled -> %s as '%s' every %d ms\n",
                       TELEMETRY_HOST, TELEMETRY_AQUARIUM_ID, TELEMETRY_INTERVAL_MS);
-    // Restore last-known state from the server before the render loop starts.
+    // Server is the source of truth when reachable; otherwise fall back to the
+    // last on-flash snapshot so an offline reboot keeps the player's tank.
     telemetryBootstrap();
+    if (!telemetryProfileLoaded) localStateLoad();
 }
 
 // Call once per loop(); rate-limited internally by TELEMETRY_INTERVAL_MS.
