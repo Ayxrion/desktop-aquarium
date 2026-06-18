@@ -83,9 +83,14 @@ function rarityOf(f) {
   return r;
 }
 
-// Final display colour for a fish — type primary tinted by luck, inverted if
-// shiny. Overrides the raw telemetry colour so the tank is themed by type+luck.
+// Final display colour for a fish. The DEVICE is authoritative: every source
+// (aquarium-pi, aquarium ESP, sim.js) computes the colour from type+luck+shiny with
+// identical maths and sends the result in telemetry as `color`, so we render that
+// verbatim — recomputing it here only re-derives the same value and risks rounding/
+// input drift that shows up as a colour mismatch against the panel. The type+luck
+// fallback covers anything that arrives without a colour (older payloads, etc.).
 function fishColorInt(f) {
+  if (typeof f.color === 'number' && f.color >= 0) return f.color & 0xffffff;
   const type = f.type || 0;
   const base = FISH_PRIMARY[type] != null ? FISH_PRIMARY[type] : 0x33D17A;
   let c = lerpColorInt(base, LUCK_TINT_COLOR, fishLuck(f) * LUCK_TINT_STRENGTH);
@@ -95,39 +100,34 @@ function fishColorInt(f) {
 function fishColorHex(f) { return hex(fishColorInt(f)); }
 function fishName(f) { return f.name || `${FISH_TYPE_NAMES[f.type] || 'Fish'} #${f.id}`; }
 
-// ─── Entity interpolation in device-tick space ────────────────────────────────
-// The device (sim.js / aquarium-pi / aquarium ESP) stamps every telemetry snapshot
-// with a monotonic `tick` (its frame counter, +1 per simulated frame) and
-// `frame_ms`. Rather than extrapolate positions PAST the newest snapshot — which can
-// never match the device's next unpredictable wander decision, and is what caused
-// the drift + rubber-banding — we keep a short buffer of received snapshots and
-// render a "playhead" that trails the newest tick by ~one publish interval,
-// interpolating between the two snapshots that bracket it.
-//
-// The playhead advances at the device's OWN measured tick-rate (derived from the
-// snapshot stream), so web playback runs at exactly the device's speed and fps and
-// inherits its timescale automatically. Because both endpoints of every interpolated
-// segment are real device states, there is zero positional drift; Hermite
-// (position + velocity) interpolation keeps motion smooth across snapshot seams. The
-// same playhead also phases every decorative animation (sway, water, smoke), so the
-// whole scene shares one clock locked to the device — no part can drift from another.
+// ─── Client-side prediction (real-time, in lockstep with the device) ──────────
+// The device (sim.js / aquarium-pi / aquarium ESP) stamps every snapshot with a
+// monotonic `tick` (its frame counter) and `frame_ms`. To run ALONGSIDE the panel in
+// real time — not a telemetry interval behind — we forward-simulate the device's OWN
+// fish physics from the latest snapshot up to the live edge (its current tick,
+// estimated from the snapshot cadence). That physics is deterministic and matches the
+// device exactly, EXCEPT for the random wander target a fish picks when its countdown
+// expires (unknowable until the next snapshot). That's the only divergence, and it's
+// small over one ~1 s interval. Each snapshot is authoritative: we reseed from it and
+// let the tiny prediction error decay away smoothly (errById) so corrections are
+// invisible — real time, no lag, no rubber-banding. The live clock also phases every
+// decorative animation, so the whole scene stays locked to the device.
 
-const SNAP_BUFFER_MAX = 16;
-// Render this many publish intervals behind the live edge. 1.0 would put the playhead
-// right at the newest sample by each interval's end and underrun on the slightest
-// jitter; 1.5 keeps it comfortably bracketed between two real states at all times
-// (verified: 0 underruns, ~1.5px seam jumps = no visible discontinuity) for a small,
-// fixed latency cost (~0.5 interval).
-const INTERP_LEAD = 1.5;
-let snapBuf = [];            // [{tick, arrival, snap}] strictly ascending by tick
-let playTick = null;        // playback head (device-tick units, fractional)
-let devClock = null;        // free-running estimate of the device's CURRENT tick
 let tickRate = 0.02;        // device ticks per local ms (EMA); 0.02 ≈ timescale 1
-let interpTicks = 20;       // trailing delay = one publish interval in ticks (EMA)
+let devClock = null;        // live-edge estimate of the device's CURRENT tick
+let lastSnap = null;        // most recent authoritative snapshot (display fields, non-fish movers)
+let prevSnap = null;        // the one before it (for non-fish mover velocity)
+let _lastSnapArrival = 0;
+let _needReseed = false;    // a new snapshot arrived → reseed prediction next frame
+let pred = null;            // { tick, fish:[working physics state] }, advanced each frame
+const errById = new Map();  // fish id → {ex,ey,ez} decaying prediction error (visual smoothing)
+let _frameCarry = 0;        // fractional device-frame remainder (smooth 60 fps sub-stepping)
+let _moverVel = { boat: 0, snail: 0, starfish: 0 }; // px per device-frame
+const ERR_DECAY = 0.80;     // error multiplier per device-frame (~150 ms half-life)
+const ERR_MAX = 160;        // clamp pathological corrections (px)
 
 // A snapshot's position on the device timeline. Every current source emits `tick`;
-// the fallback derives a monotonic tick from the best available clock so an older
-// firmware without `tick` still interpolates (just with arrival-time spacing).
+// the fallback derives a monotonic tick from the best available clock.
 function snapTick(s) {
   if (s && typeof s.tick === 'number') return s.tick;
   const fm = (s && s.frame_ms) || 50;
@@ -135,151 +135,193 @@ function snapTick(s) {
   return ms / fm;
 }
 
-// Reset the playback timeline (selection change, or a device reboot/tank switch
-// that rewinds `tick`).
+// Reset prediction (selection change, or a device reboot/tank switch that rewinds tick).
 function resetInterp() {
-  snapBuf = [];
-  playTick = null;
-  devClock = null;
+  lastSnap = prevSnap = pred = null;
+  devClock = null; _needReseed = false; _frameCarry = 0; _lastSnapArrival = 0;
+  errById.clear();
 }
 
-// Ingest a freshly received snapshot. Accepts it only if it advances the timeline;
-// dedupes equal/stale ticks (e.g. a watchdog poll echoing the last SSE frame) and
-// restarts cleanly on a large backwards jump (reboot / aquarium switch).
+// Boundary spring acceleration (device boundAccel / app boundary springs).
+function boundA(v, lo, hi, k) {
+  if (v < lo) return (lo - v) * k;
+  if (v > hi) return (hi - v) * k;
+  return 0;
+}
+
+// One whole device-frame of the joint fish physics — a faithful port of the device
+// (sim.js stepPhysics / firmware updateFish): sub-school centroids, cohesion, pairwise
+// separation, target seeking, boundary springs, damping. The ONLY deviation: once a
+// fish's wander countdown expires we HOLD its last known target (the device picks a
+// new random one we can't reproduce); the next snapshot corrects it.
+function stepFishOnce(fish) {
+  const cent = {}; const order = [0, 0, 0, 0, 0];
+  for (const f of fish) {
+    const sz = FISH_SCHOOL_SIZE[f.type] || 0;
+    f._sub = sz >= 2 ? Math.floor(order[f.type] / sz) : 0;
+    order[f.type]++;
+    const k = f.type + ':' + f._sub;
+    const c = cent[k] || (cent[k] = { x: 0, y: 0, z: 0, n: 0 });
+    c.x += f.x; c.y += f.y; c.z += f.z; c.n++;
+  }
+  for (const k in cent) { const c = cent[k]; c.x /= c.n; c.y /= c.n; c.z /= c.n; }
+  for (const f of fish) {
+    const t = f.type;
+    if (f.wcd > 0) f.wcd--;
+    const chasing = f.chasing && t === 0;
+    const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
+    const maxV = f.going_for_food ? 8.0 : (chasing || t === 3) ? 7.0 : 5.5;
+    let ax = (f.tx - f.x) * seekStr;
+    let ay = (f.ty - f.y) * seekStr;
+    let az = (f.tz - f.z) * 0.010;
+    const grp = cent[t + ':' + f._sub];
+    if (t === 1 || t === 2) { ax += (grp.x - f.x) * 0.010; ay += (grp.y - f.y) * 0.007; az += (grp.z - f.z) * 0.007; }
+    else if (t === 3)       { ax += (grp.x - f.x) * 0.012; ay += (grp.y - f.y) * 0.010; az += (grp.z - f.z) * 0.008; }
+    const sepR2 = t === 3 ? 60 * 60 : 80 * 80, sepK = t === 3 ? 7 : 8;
+    if (t === 1 || t === 2 || t === 3) {
+      for (const o of fish) {
+        if (o === f || o.type !== t || o._sub !== f._sub) continue;
+        const dx = f.x - o.x, dy = f.y - o.y, d2 = dx * dx + dy * dy;
+        if (d2 < sepR2 && d2 > 0.01) { const inv = sepK / d2; ax += dx * inv; ay += dy * inv; }
+      }
+    }
+    ax += boundA(f.x, 30, SCREEN_W - 30, 0.30);
+    ay += boundA(f.y, TANK_TOP + 20, SCREEN_H - 80, 0.30);
+    az += boundA(f.z, 0.0, 0.75, 0.08);
+    f.vx = Math.max(-maxV, Math.min(maxV, f.vx + ax)) * 0.85;
+    f.vy = Math.max(-maxV * 0.5, Math.min(maxV * 0.5, f.vy + ay)) * 0.85;
+    f.vz = Math.max(-0.015, Math.min(0.015, f.vz + az)) * 0.88;
+    f.x = Math.max(5, Math.min(SCREEN_W - 5, f.x + f.vx));
+    f.y = Math.max(TANK_TOP + 5, Math.min(SCREEN_H - 60, f.y + f.vy));
+    f.z = Math.max(0, Math.min(0.78, f.z + f.vz));
+    if (Math.abs(f.vx) > 0.4) f.facing_right = f.vx > 0;
+  }
+}
+function stepFishN(fish, n) { for (let i = 0; i < n; i++) stepFishOnce(fish); }
+
+// Working physics copy of a snapshot's fish (only the fields the stepper mutates).
+function makePredFish(snap) {
+  return (snap.fish || []).map((f) => ({
+    id: f.id, type: f.type || 0,
+    x: f.x, y: f.y, z: f.z || 0,
+    vx: f.vx || 0, vy: f.vy || 0, vz: f.vz || 0,
+    tx: f.tx != null ? f.tx : f.x, ty: f.ty != null ? f.ty : f.y,
+    tz: typeof f.tz === 'number' ? f.tz : (f.z || 0),
+    wcd: typeof f.wander_cd === 'number' ? f.wander_cd : 30,
+    chasing: !!f.chasing, going_for_food: !!f.going_for_food,
+    facing_right: f.facing_right,
+  }));
+}
+
+// Reseed prediction from a freshly arrived authoritative snapshot, aligned to the live
+// edge (devNow). Capture the currently-shown offset as a decaying error so the visual
+// stays put and eases onto the corrected trajectory — no snap.
+function reseedPrediction(snap, devNow) {
+  const auth = makePredFish(snap);
+  stepFishN(auth, Math.max(0, Math.round(devNow - snapTick(snap))));
+  if (pred && pred.fish.length) {
+    stepFishN(pred.fish, Math.max(0, Math.round(devNow - pred.tick)));
+    const oldById = new Map(pred.fish.map((f) => [f.id, f]));
+    for (const a of auth) {
+      const p = oldById.get(a.id);
+      if (!p) { errById.delete(a.id); continue; }
+      const e = errById.get(a.id) || { ex: 0, ey: 0, ez: 0 };
+      errById.set(a.id, {
+        ex: clamp((p.x + e.ex) - a.x, -ERR_MAX, ERR_MAX),
+        ey: clamp((p.y + e.ey) - a.y, -ERR_MAX, ERR_MAX),
+        ez: clamp((p.z + e.ez) - a.z, -1, 1),
+      });
+    }
+  } else {
+    errById.clear();
+  }
+  const ids = new Set(auth.map((a) => a.id));
+  for (const id of [...errById.keys()]) if (!ids.has(id)) errById.delete(id);
+  pred = { tick: devNow, fish: auth };
+}
+
+// Velocity (px/device-frame) of a slow mover between the last two snapshots; 0 for
+// teleports/wraps so it never flings across the tank.
+function moverVel(a, b) {
+  if (!a || !b || typeof a.x !== 'number' || typeof b.x !== 'number') return 0;
+  const dt = snapTick(b) - snapTick(a);
+  if (dt <= 0) return 0;
+  const v = (b.x - a.x) / dt;
+  return Math.abs(v) > 8 ? 0 : v;
+}
+
+// Ingest a freshly received snapshot: calibrate the live clock, stash it (+ the prior
+// one for mover velocity), and flag a reseed for the next frame. Dedupes stale/equal
+// ticks and restarts on a backward jump (reboot / tank switch).
 function acceptSnapshot(snap) {
   const tick = snapTick(snap);
   const arrival = Date.now();
-  const newest = snapBuf.length ? snapBuf[snapBuf.length - 1] : null;
-
-  if (newest) {
-    if (tick <= newest.tick) {
-      if (tick < newest.tick - interpTicks * 3) resetInterp(); // reboot → fresh timeline
-      else return;                                             // duplicate / minor stale
+  if (lastSnap) {
+    const last = snapTick(lastSnap);
+    if (tick <= last) {
+      if (tick < last - 5) resetInterp(); // reboot / switch → fresh
+      else return;                        // duplicate / stale
     } else {
-      // Calibrate playback speed + trailing delay from the real device cadence.
-      const dTick = tick - newest.tick;
-      const dMs = Math.max(1, arrival - newest.arrival);
-      const inst = dTick / dMs;
+      const inst = (tick - last) / Math.max(1, arrival - _lastSnapArrival);
       tickRate = clamp(tickRate * 0.8 + inst * 0.2, 0.002, 0.5);
-      interpTicks = clamp(interpTicks * 0.7 + dTick * 0.3, 8, 600);
     }
   }
-  snapBuf.push({ tick, arrival, snap });
-  if (snapBuf.length > SNAP_BUFFER_MAX) snapBuf.shift();
-
-  // Discipline the free-running device clock toward this real observation. A
-  // well-calibrated clock already sits near `tick` (it advanced ~one interval since
-  // the previous snapshot), so this is a small, infrequent (~1 Hz) nudge that absorbs
-  // arrival jitter and clock skew without ever stepping the playhead. On a big gap
-  // (first snapshot, or a recovered stall) it snaps directly.
-  if (devClock == null || Math.abs(tick - devClock) > interpTicks * 4) devClock = tick;
-  else devClock += (tick - devClock) * 0.15;
-}
-
-const lerp = (a, b, u) => a + (b - a) * u;
-function hermite(p0, m0, p1, m1, u) {
-  const u2 = u * u, u3 = u2 * u;
-  return (2 * u3 - 3 * u2 + 1) * p0 + (u3 - 2 * u2 + u) * m0
-       + (-2 * u3 + 3 * u2) * p1 + (u3 - u2) * m1;
-}
-// Smooth interp of one position axis using the device's reported endpoint velocities
-// (px/frame). Hermite matches both position AND velocity at each snapshot, so motion
-// flows through the seam with no corner. Guarded: if the spline would bow more than
-// 48px past the straight line (opposed high-velocity endpoints), fall back to linear
-// so a fish can never overshoot.
-function smoothAxis(p0, v0, p1, v1, u, frames) {
-  const lin = lerp(p0, p1, u);
-  const h = hermite(p0, (v0 || 0) * frames, p1, (v1 || 0) * frames, u);
-  return Math.abs(h - lin) > 48 ? lin : h;
-}
-
-function interpMoverX(a, b, u) {
-  if (a && typeof a.x === 'number' && typeof b.x === 'number') return { ...b, x: lerp(a.x, b.x, u) };
-  return b;
-}
-// Boat: slide between snapshots normally, but a relaunch from the far edge is a
-// teleport (huge Δx) — snap to the new trajectory rather than sail across the tank.
-function interpBoat(a, b, u) {
-  if (!b) return b;
-  if (a && b.active && a.active && typeof a.x === 'number' && typeof b.x === 'number'
-      && Math.abs(a.x - b.x) < 120) {
-    return { ...b, x: lerp(a.x, b.x, u) };
+  prevSnap = lastSnap;
+  lastSnap = snap;
+  _lastSnapArrival = arrival;
+  if (prevSnap) {
+    _moverVel = {
+      boat: (prevSnap.boat && snap.boat && prevSnap.boat.active && snap.boat.active)
+            ? moverVel(prevSnap.boat, snap.boat) : 0,
+      snail: moverVel(prevSnap.snail, snap.snail),
+      starfish: moverVel(prevSnap.starfish, snap.starfish),
+    };
   }
-  return b;
-}
-function interpById(a, b, u, keys) {
-  const m = new Map();
-  if (Array.isArray(a)) for (const it of a) m.set(it.id, it);
-  return b.map((it) => {
-    const prev = m.get(it.id);
-    if (!prev) return it;
-    const o = { ...it };
-    for (const k of keys)
-      if (typeof prev[k] === 'number' && typeof it[k] === 'number') o[k] = lerp(prev[k], it[k], u);
-    return o;
-  });
-}
-function interpByIndex(a, b, u, keys) {
-  return b.map((it, i) => {
-    const prev = Array.isArray(a) ? a[i] : null;
-    if (!prev) return it;
-    const o = { ...it };
-    for (const k of keys)
-      if (typeof prev[k] === 'number' && typeof it[k] === 'number') o[k] = lerp(prev[k], it[k], u);
-    return o;
-  });
+  // Discipline the live-edge clock toward the new observation (absorbs latency jitter
+  // and clock skew). It ends ~one network-latency behind the device's true tick — the
+  // best achievable, far tighter than an interpolation interval.
+  if (devClock == null || Math.abs(tick - devClock) > 80) devClock = tick;
+  else devClock += (tick - devClock) * 0.2;
+  _needReseed = true;
 }
 
-// Interpolate between two snapshots at fraction u (0..1); `frames` = tick span.
-// The newer snapshot (b) supplies all non-positional state (weather/time/counts/
-// game/plants/colors/flags); only positions are blended back toward a.
-function interpSnap(a, b, u, frames) {
-  const out = { ...b };
+// Build the render snapshot at the live edge: predicted fish (with smoothed error)
+// plus non-fish movers extrapolated forward by their observed velocity.
+function buildRenderSnap(devNow) {
+  const base = lastSnap;
+  if (!base) return null;
+  const ahead = Math.max(0, devNow - snapTick(base));
+  const out = { ...base };
 
-  if (Array.isArray(b.fish)) {
-    const aById = new Map();
-    if (Array.isArray(a.fish)) for (const f of a.fish) aById.set(f.id, f);
-    out.fish = b.fish.map((fb) => {
-      const fa = aById.get(fb.id);
-      if (!fa) return fb; // newly spawned since A → show at its real position (no blend)
+  if (pred) {
+    const dispById = new Map((base.fish || []).map((f) => [f.id, f]));
+    out.fish = pred.fish.map((f) => {
+      const e = errById.get(f.id) || { ex: 0, ey: 0, ez: 0 };
+      const disp = dispById.get(f.id) || {};
       return {
-        ...fb,
-        x: smoothAxis(fa.x, fa.vx, fb.x, fb.vx, u, frames),
-        y: smoothAxis(fa.y, fa.vy, fb.y, fb.vy, u, frames),
-        z: lerp(fa.z || 0, fb.z || 0, u),
+        ...disp, id: f.id, type: f.type,
+        x: f.x + f.vx * _frameCarry + e.ex,
+        y: f.y + f.vy * _frameCarry + e.ey,
+        z: clamp(f.z + e.ez, 0, 0.85),
+        vx: f.vx, vy: f.vy, facing_right: f.facing_right,
       };
     });
   }
 
-  out.boat = interpBoat(a.boat, b.boat, u);
-  if (b.snail) out.snail = interpMoverX(a.snail, b.snail, u);
-  if (b.starfish) out.starfish = interpMoverX(a.starfish, b.starfish, u);
-  if (Array.isArray(b.snails)) out.snails = interpByIndex(a.snails, b.snails, u, ['x']);
-  if (Array.isArray(b.wanderers)) out.wanderers = interpById(a.wanderers, b.wanderers, u, ['x', 'y']);
-  if (Array.isArray(b.loot)) out.loot = interpById(a.loot, b.loot, u, ['x', 'y']);
-  if (Array.isArray(b.flakes)) out.flakes = interpByIndex(a.flakes, b.flakes, u, ['x', 'y']);
+  if (base.boat && typeof base.boat.x === 'number')
+    out.boat = { ...base.boat, x: base.boat.x + _moverVel.boat * ahead };
+  if (base.snail && typeof base.snail.x === 'number')
+    out.snail = { ...base.snail, x: base.snail.x + _moverVel.snail * ahead };
+  if (base.starfish && typeof base.starfish.x === 'number')
+    out.starfish = { ...base.starfish, x: base.starfish.x + _moverVel.starfish * ahead };
+  if (Array.isArray(base.wanderers))
+    out.wanderers = base.wanderers.map((w) => ({ ...w, x: w.x + (w.vx || 0) * ahead }));
+  if (Array.isArray(base.loot))
+    out.loot = base.loot.map((it) => ({ ...it, y: it.y + (it.vy || 0) * ahead }));
+  if (Array.isArray(base.flakes))
+    out.flakes = base.flakes.map((fl) => ({ ...fl, y: Math.min(SCREEN_H - 4, fl.y + 0.7 * ahead) }));
   return out;
 }
-
-// Sample the buffer at playback tick `t`: clamp to the buffer ends (hold, never
-// extrapolate), else interpolate the bracketing pair.
-function sampleAt(t) {
-  const n = snapBuf.length;
-  if (!n) return null;
-  if (n === 1 || t <= snapBuf[0].tick) return snapBuf[0].snap;
-  if (t >= snapBuf[n - 1].tick) return snapBuf[n - 1].snap;
-  let i = n - 1;
-  while (i > 0 && snapBuf[i - 1].tick > t) i--;
-  const A = snapBuf[i - 1], B = snapBuf[i];
-  const span = B.tick - A.tick;
-  const u = span > 0 ? clamp((t - A.tick) / span, 0, 1) : 0;
-  return interpSnap(A.snap, B.snap, u, span);
-}
-
-// (Forward-extrapolation removed.) Positions now come exclusively from sampleAt(),
-// which interpolates between real buffered device states — see the interpolation
-// engine above. Nothing predicts past the newest snapshot, so there is no drift to
-// correct and no blend seam to hide.
 
 // ─── Faithful scene renderer (mirrors device aquarium.ino / main.cpp) ─────────
 // Decorative animations (sway, water, bubbles, smoke) are driven by animTick, which
@@ -1422,53 +1464,54 @@ function drawSilhouetteFish(x, y, size) {
 }
 
 // ─── Rendering ───────────────────────────────────────────────────────────────
-// Single 60fps rAF loop. It advances ONE clock — the playhead, in device-tick
-// units — and everything else follows from it: positions are sampled by
-// interpolating the buffered real device states around the playhead (no
-// prediction, no blend), and the decorative animations (sway/water/smoke via
-// animTick; bubbles/EAC via the per-frame tick delta) phase off the same playhead.
-// So the entire scene stays locked to the device's timeline and can't drift apart.
+// Single 60fps rAF loop driven by ONE live clock (devClock, in device-tick units).
+// Each frame it advances the clock to the live edge, reseeds prediction when a new
+// authoritative snapshot has arrived, steps the device's own fish physics forward to
+// the edge (carrying a sub-frame remainder for smooth 60 fps), decays the small
+// reconciliation error, and draws. The same clock phases the decorative animations
+// (sway/water/smoke via animTick; bubbles/EAC via the per-frame tick delta), so the
+// whole scene runs in lockstep with the panel — real time, no interval of lag.
 // Title/stats/legend update at SSE rate (≤1 Hz) from applySnapshot.
 function _rafDraw() {
   rafId = requestAnimationFrame(_rafDraw);
   const now = Date.now();
   const dtMs = _lastRafMs ? clamp(now - _lastRafMs, 0, 250) : 16;
   _lastRafMs = now;
-  if (!snapBuf.length) return;
+  if (!lastSnap) return;
 
-  const newest = snapBuf[snapBuf.length - 1];
-  const oldest = snapBuf[0];
+  // Advance the live-edge clock; reseed from the freshest snapshot if one just landed.
+  if (devClock == null) devClock = snapTick(lastSnap);
+  devClock += dtMs * tickRate;
+  if (_needReseed) { reseedPrediction(lastSnap, devClock); _needReseed = false; }
 
-  // The device clock (disciplined once per snapshot in acceptSnapshot) free-runs at
-  // the measured tick-rate; advance it by this frame's elapsed time. The playhead
-  // renders one publish interval behind it. Because devClock is continuous — never a
-  // stepped target — within-segment motion is perfectly smooth and snapshot seams have
-  // no lurch: the playhead sweeps across the most-recently-received segment, always
-  // interpolating between two real states (never extrapolating), at the device's true
-  // speed/fps (timescale included). Clamps hold at the buffer ends on a stall.
-  const prevPlay = playTick;
-  if (devClock != null) devClock += dtMs * tickRate;
-  let pt = (devClock != null ? devClock : newest.tick) - interpTicks * INTERP_LEAD;
-  if (pt > newest.tick) pt = newest.tick; // stall/underrun → hold (don't predict)
-  if (pt < oldest.tick) pt = oldest.tick; // never fall off the back of the buffer
-  playTick = pt;
+  const df = Math.max(0, dtMs * tickRate); // device-frames elapsed this rAF
+  if (pred) {
+    // Step the prediction forward to the live edge in whole device-frames; keep the
+    // sub-frame remainder to render smooth 60 fps between physics frames.
+    let whole = Math.floor(devClock - pred.tick);
+    if (whole > 0) { whole = Math.min(whole, 6); stepFishN(pred.fish, whole); pred.tick += whole; }
+    _frameCarry = clamp(devClock - pred.tick, 0, 1.2);
+    // Decay the reconciliation error toward zero (smooths each snapshot's correction).
+    const k = Math.pow(ERR_DECAY, df);
+    for (const [id, e] of errById) {
+      e.ex *= k; e.ey *= k; e.ez *= k;
+      if (Math.abs(e.ex) < 0.05 && Math.abs(e.ey) < 0.05 && Math.abs(e.ez) < 0.001) errById.delete(id);
+    }
+  }
 
-  // Per-frame ticks actually advanced this frame drive the local decorative sims,
-  // so bubbles/EAC move in lockstep with the playhead (and freeze if it stalls).
-  const dTick = prevPlay == null ? 1 : clamp(playTick - prevPlay, 0, interpTicks);
-  animTick = playTick;
-  tickEac(dTick);
-  tickBubbles(dTick);
-  eacBright = dayTint(newest.snap.time && newest.snap.time.day_progress);
+  animTick = devClock;            // decorative phase rides the same live clock
+  tickEac(df);
+  tickBubbles(df);
+  eacBright = dayTint(lastSnap.time && lastSnap.time.day_progress);
 
-  const frame = sampleAt(playTick);
+  const frame = buildRenderSnap(devClock);
   if (frame) drawTank(frame);
 }
 
-// Full re-render (highlight/hover toggles, etc.) — samples at the current playhead.
+// Full re-render (highlight/hover toggles, etc.) — rebuilds at the current live edge.
 function render() {
-  if (!snapBuf.length) return;
-  const frame = sampleAt(playTick != null ? playTick : snapBuf[snapBuf.length - 1].tick);
+  if (!lastSnap) return;
+  const frame = buildRenderSnap(devClock != null ? devClock : snapTick(lastSnap));
   if (!frame) return;
   drawTitle(frame);
   drawTank(frame);

@@ -12,9 +12,36 @@
 // aquarium.ino) — the economy constants, school sizes and directive verbs must match.
 
 const W = 800, H = 480, TOP = 72;
-const PALETTE = [0x00ee66, 0xffdd00, 0xff6600, 0xcc44ff, 0x44ddff, 0xff44aa, 0x00ffff, 0xeeeeee];
 const FISH_MAX = [8, 16, 20, 12, 16];       // clownfish, guppy, piranha, angel, salmon
 const FISH_SCHOOL_SIZE = [2, 6, 4, 0, 0];   // max school size before splitting; 0 = solitary
+
+// Canonical fish colouring — byte-for-byte identical to the device (aquarium-pi
+// main.cpp syncedFishColor / app.js fishColorInt): each type has a primary hue, a
+// fish's luck (0..1) tints it toward warm gold, and a 1-in-1000 id roll inverts it
+// ("shiny"). Computed at snapshot time from current luck and emitted as `color`, so
+// the dashboard renders the device's colour verbatim (no recompute drift).
+const FISH_PRIMARY = [0x2E8BFF, 0x33D17A, 0xFF7A33, 0xB45CFF, 0xFF9E7A];
+const LUCK_TINT_COLOR = 0xFFE14D, LUCK_TINT_STRENGTH = 0.7, SHINY_ODDS = 1000;
+function lerpColor888(a, b, t) {
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  const ar = (a >> 16) & 0xff, ag = (a >> 8) & 0xff, ab = a & 0xff;
+  const br = (b >> 16) & 0xff, bg = (b >> 8) & 0xff, bb = b & 0xff;
+  return ((Math.round(ar + (br - ar) * t) << 16) |
+          (Math.round(ag + (bg - ag) * t) << 8) |
+           Math.round(ab + (bb - ab) * t)) >>> 0;
+}
+function hash32(n) {
+  n = (n | 0) ^ 0x9e3779b9;
+  n = Math.imul(n ^ (n >>> 16), 0x45d9f3b);
+  n = Math.imul(n ^ (n >>> 16), 0x45d9f3b);
+  return (n ^ (n >>> 16)) >>> 0;
+}
+function syncedFishColor(type, luck, id) {
+  if (type < 0 || type > 4) type = 1;
+  let c = lerpColor888(FISH_PRIMARY[type], LUCK_TINT_COLOR, (luck || 0) * LUCK_TINT_STRENGTH);
+  if (hash32((id | 0) ^ 0x5bd1e995) % SHINY_ODDS === 0) c = (~c) & 0xffffff;
+  return c >>> 0;
+}
 
 const FRAME_MS = 50;
 const FRAMES_PER_PUBLISH = 1000 / FRAME_MS; // 20 frames per 1Hz publish
@@ -99,7 +126,6 @@ function createSim(opts) {
       tx: rnd(40, W - 40), ty: rnd(TOP + 30, H - 90),
       wanderCD: Math.floor(rnd(10, 50)),
       facing_right: Math.random() > 0.5,
-      color: PALETTE[(type * 3 + nextId) % PALETTE.length],
       going_for_food: false, chasing: false,
       age: 0, xp: 0, fishLuck: parseFloat(rnd(0, 0.85).toFixed(3)),
     };
@@ -273,11 +299,15 @@ function createSim(opts) {
       const r = Math.random();
       const type = r < 0.1 + 0.3 * luck ? 3 : r < 0.6 ? 4 : r < 0.75 ? 1 : r < 0.92 ? 2 : 0;
       const fromLeft = Math.random() > 0.5;
+      const wid = nextItemId++;
+      // Wild fish carry no stored luck; derive a stable pseudo-luck from the id (the
+      // same fallback app.js uses) so its colour is consistent device↔dashboard.
+      const wluck = (hash32(wid + 1) % 1000) / 1000;
       wanderers.push({
-        id: nextItemId++, type,
+        id: wid, type,
         x: fromLeft ? -20 : W + 20, y: rnd(TOP + 40, H - 120),
         vx: fromLeft ? rnd(1.2, 2.2) : -rnd(1.2, 2.2),
-        color: PALETTE[(type * 3 + nextItemId) % PALETTE.length],
+        color: syncedFishColor(type, wluck, wid),
         facing_right: fromLeft, bob: Math.random() * Math.PI * 2,
       });
       wanderCD = WANDER_BASE_CD * rnd(0.7, 1.3);
@@ -414,7 +444,8 @@ function createSim(opts) {
         vx: parseFloat(f.vx.toFixed(2)), vy: parseFloat(f.vy.toFixed(2)), vz: 0,
         tx: parseFloat(f.tx.toFixed(1)), ty: parseFloat(f.ty.toFixed(1)), tz: f.z,
         wander_cd: f.wanderCD,
-        type: f.type, facing_right: f.facing_right, color: f.color,
+        type: f.type, facing_right: f.facing_right,
+        color: syncedFishColor(f.type, f.fishLuck, f.id), // device-identical, current luck
         going_for_food: f.going_for_food, chasing: f.chasing,
         age: Math.round(f.age), scale: parseFloat(scaleOf(f.age).toFixed(3)),
         xp: f.xp, fish_luck: parseFloat(f.fishLuck.toFixed(3)),
@@ -458,7 +489,6 @@ function createSim(opts) {
       tx: f.tx ?? f.x, ty: f.ty ?? f.y,
       wanderCD: typeof f.wander_cd === 'number' ? f.wander_cd : Math.floor(rnd(10, 50)),
       facing_right: !!f.facing_right,
-      color: f.color || PALETTE[((f.type | 0) * 3) % PALETTE.length],
       going_for_food: false, chasing: !!f.chasing,
       age: f.age || 0, xp: f.xp || 0, fishLuck: typeof f.fish_luck === 'number' ? f.fish_luck : 0,
     }));
