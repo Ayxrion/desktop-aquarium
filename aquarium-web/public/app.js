@@ -125,6 +125,17 @@ let _frameCarry = 0;        // fractional device-frame remainder (smooth 60 fps 
 let _moverVel = { boat: 0, snail: 0, starfish: 0 }; // px per device-frame
 const ERR_DECAY = 0.80;     // error multiplier per device-frame (~150 ms half-life)
 const ERR_MAX = 160;        // clamp pathological corrections (px)
+const ERR_CORR_MAX_V = 3.0; // max px/device-frame a correction may move a fish — large
+                            // gaps glide to the corrected spot at swim speed, never zoom
+
+// Ease one error component toward zero. Exponential decay keeps small corrections
+// snappy, but the per-frame travel is capped (maxStep) so a large error after a long
+// telemetry gap glides smoothly instead of snapping the fish across the tank.
+function reconcileErr(e, k, maxStep) {
+  let next = e * k;
+  if (Math.abs(e - next) > maxStep) next = e - Math.sign(e) * maxStep;
+  return next;
+}
 
 // A snapshot's position on the device timeline. Every current source emits `tick`;
 // the fallback derives a monotonic tick from the best available clock.
@@ -1512,10 +1523,14 @@ function _rafDraw() {
     let whole = Math.floor(devClock - pred.tick);
     if (whole > 0) { whole = Math.min(whole, 6); stepFishN(pred.fish, whole); pred.tick += whole; }
     _frameCarry = clamp(devClock - pred.tick, 0, 1.2);
-    // Decay the reconciliation error toward zero (smooths each snapshot's correction).
+    // Ease the reconciliation error toward zero. Velocity-capped so a big correction
+    // after a long telemetry gap glides at swim speed instead of zooming across.
     const k = Math.pow(ERR_DECAY, df);
+    const maxStep = ERR_CORR_MAX_V * df;
     for (const [id, e] of errById) {
-      e.ex *= k; e.ey *= k; e.ez *= k;
+      e.ex = reconcileErr(e.ex, k, maxStep);
+      e.ey = reconcileErr(e.ey, k, maxStep);
+      e.ez *= k;
       if (Math.abs(e.ex) < 0.05 && Math.abs(e.ey) < 0.05 && Math.abs(e.ez) < 0.001) errById.delete(id);
     }
   }
