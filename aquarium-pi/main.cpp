@@ -15,11 +15,18 @@
 #include <csignal>
 #include <ctime>
 #include <cstdlib>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <mutex>
+#include <thread>
 #include "compat.h"
 #include "canvas.h"
 #include "weather.h"
 #include "daynight.h"
 #include "version.h"
+#include "prompt_server.h"
 
 // ─── Screen ──────────────────────────────────────────────────────────────────
 #define SCREEN_W  800
@@ -134,8 +141,21 @@ Flake flakes[MAX_FLAKES];
 enum FishType : uint8_t { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
 static const int  FISH_SCHOOL_SIZE[5] = { 2, 6, 4, 0, 0 }; // clownfish, guppy, piranha, angel, salmon
 static inline bool typeSchools(FishType t) { return t == FISH_SCHOOL || t == FISH_SCHOOL2; }
+// How many upcoming wander targets each fish precomputes and ships in telemetry so the
+// web replication seeks the EXACT targets this device will use (rather than rolling its
+// own random ones and drifting). 4 covers a full 20-frame publish window even for the
+// snappiest angelfish (wander_cd as low as 8), with margin.
+#define WANDER_LOOKAHEAD 4
+
+// One fully-resolved wander target + how long it stays active. Precomputed and queued so
+// the random draw happens here (device side) and the result rides telemetry to the web.
+struct WanderMove {
+    float wcd, tx, ty, tz;
+    bool  chasing;
+};
+
 struct Fish {
-    float   x, y, z, vx, vy, vz, tx, ty, tz, wanderCD;
+    float   x, y, z, vx, vy, vz, tx, ty, tz, wanderCD, idleCD;
     bool    facingRight;
     FishType type;
     int8_t  partner;
@@ -146,6 +166,8 @@ struct Fish {
     float   age;        // career: frames alive → growth scale (no death)
     int     xp;         // career: feeding XP
     float   fishLuck;   // career: 0..1, raised by feeding/XP
+    WanderMove wanderQ[WANDER_LOOKAHEAD];  // precomputed upcoming targets (FIFO)
+    uint8_t wanderQN;                      // entries currently queued
 };
 
 #define MAX_PAIR    8               // clownfish slots
@@ -188,6 +210,18 @@ static const int FISH_BASE_SELL[5] = {  6,  3, 22, 30,  4 }; // school/salmon ch
 #define SNAIL_PRICE   50                // coins per coin-collector snail
 #define MAX_SNAILS    6
 #define SNAIL_REACH   36                // px a snail can grab a coin from
+// Snails are a full sand-bed SPECIES (career economy like fish): they grow through 3
+// discrete stages (stage 2 = today's full-size look), start small + slow, sleep through
+// the night, sprint after coins only while stamina lasts, contribute to tank luck, and
+// can be sold. `type` leaves room for more sand-bed species later.
+#define SNAIL_BASE_SELL   8
+#define SNAIL_BASE_SPD    0.28f         // slowed right down from the old 1.5–2.5 patrol
+#define SNAIL_STAGES      3
+#define SNAIL_SLEEP_FRAC  0.20f         // asleep for 20% of the day (night window)
+#define SNAIL_STAMINA_MIN 40.0f
+#define SNAIL_STAMINA_MAX 220.0f
+static const float SNAIL_STAGE_SCALE[3]  = { 0.45f, 0.72f, 1.0f };
+static const float SNAIL_STAGE_SPDMUL[3] = { 0.6f, 0.8f, 1.0f };
 static const int SHELL_VALUE[3] = { 2, 5, 12 };
 
 // Feeding schedule: fish expect one feeding per third-of-day → 3 meals/day. A clean
@@ -215,8 +249,17 @@ Wanderer wanderers[MAX_WANDER] = {};
 struct Loot { float x, y, vy; uint8_t kind; uint8_t tier; bool active, landed; uint32_t id; int ttl; }; // kind 0 coin, 1 shell
 Loot loot[MAX_LOOT] = {};
 
-// Purchased coin-collector snails — patrol the floor and grab coins nearing it.
-struct CoinSnail { float x, spd; bool facingRight, active; };
+// Snail sand-bed species — patrol the floor, grab coins, grow, sleep, and are sellable.
+struct CoinSnail {
+  float x, spd; bool facingRight, active;
+  uint8_t type;          // 0 = snail (room for more sand-bed species later)
+  float   age;           // career: frames alive → growth stage/scale
+  int     xp;            // career: feeding XP
+  float   snailLuck;     // career: 0..1 quality (feeds tank luck + sell value)
+  float   stamina;       // sprint budget; capacity scales with quality
+  bool    asleep;        // night-time rest
+  float   lastVx;        // signed px/frame this frame (telemetry + web prediction)
+};
 CoinSnail coinSnails[MAX_SNAILS] = {};
 int numSnails = 0;
 
@@ -242,7 +285,28 @@ static float shellCD = SHELL_BASE_CD, wanderCD = WANDER_BASE_CD;
 #define MENU_X   510
 #define MENU_Y    48
 #define MENU_W   282
-#define MENU_H   410
+#define MENU_H   425
+#define MENU_ROW_BRIGHT_Y (MENU_Y + 45 + 5 * 58 + 30)
+#define MENU_ROW_TELEM_Y  (MENU_Y + 45 + 5 * 58 + 58)
+#define BRIGHT_SL_X (MENU_X + 110)
+#define BRIGHT_SL_W 138
+
+static uint8_t displayBrightness = 255;
+
+// Career mode hides fish +/- rows; settings rows shift up.
+static void menuRowYs(bool career, int& yWeather, int& yTime, int& yBright, int& yTelem) {
+    if (career) {
+        yWeather = MENU_Y + 73;
+        yTime    = MENU_Y + 111;
+        yBright  = MENU_Y + 149;
+        yTelem   = MENU_Y + 187;
+    } else {
+        yWeather = MENU_Y + 45 + 4 * 58;
+        yTime    = MENU_Y + 45 + 5 * 58;
+        yBright  = MENU_ROW_BRIGHT_Y;
+        yTelem   = MENU_ROW_TELEM_Y;
+    }
+}
 
 bool     lastBtnState  = HIGH;
 uint32_t lastBtnMs     = 0;
@@ -291,11 +355,37 @@ static Star skyStars[NUM_STARS];
 static Display display;
 static Canvas  canvas(&display);
 
+static int brightnessFromTouchX(uint16_t tx) {
+    if (tx <= (uint16_t)BRIGHT_SL_X) return 10;
+    if (tx >= (uint16_t)(BRIGHT_SL_X + BRIGHT_SL_W)) return 255;
+    return 10 + (int)((tx - BRIGHT_SL_X) * (255 - 10) / BRIGHT_SL_W);
+}
+
+static void setDisplayBrightness(int b) {
+    if (b < 10) b = 10;
+    if (b > 255) b = 255;
+    displayBrightness = (uint8_t)b;
+    display.setBrightness(displayBrightness);
+}
+
+static void drawBrightnessSlider(int ry) {
+    canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
+    canvas.setCursor(MENU_X + 10, ry + 6); canvas.print("BRIGHT");
+    canvas.fillRect(BRIGHT_SL_X, ry + 8, BRIGHT_SL_W, 20, 0x0C1A2AUL);
+    canvas.drawRect(BRIGHT_SL_X, ry + 8, BRIGHT_SL_W, 20, 0x4488CCUL);
+    int fillW = (displayBrightness - 10) * BRIGHT_SL_W / (255 - 10);
+    if (fillW > 0)
+        canvas.fillRect(BRIGHT_SL_X + 1, ry + 9, fillW, 18, 0xFFD23FUL);
+    int thumbX = BRIGHT_SL_X + fillW - 3;
+    if (thumbX < BRIGHT_SL_X) thumbX = BRIGHT_SL_X;
+    canvas.fillRect(thumbX, ry + 4, 6, 28, 0xFFEE88UL);
+}
+
 // ── Tap / collect feedback pulses ──────────────────────────────────────────────
 // Transient expanding rings drawn over the tank: a "glass tap" ripple wherever
 // the screen is touched, plus a celebratory burst when a collectible is obtained.
 #define MAX_PULSES 6
-struct Pulse { float x, y; int age, life; uint32_t col; uint8_t kind; bool active; }; // kind 0 tap, 1 collect
+struct Pulse { float x, y; int age, life; uint32_t col; uint8_t kind; bool active; }; // 0 tap, 1 collect, 2 shine
 static Pulse pulses[MAX_PULSES] = {};
 
 void spawnPulse(float x, float y, uint8_t kind, uint32_t col) {
@@ -306,7 +396,7 @@ void spawnPulse(float x, float y, uint8_t kind, uint32_t col) {
     }
     if (slot < 0) slot = oldest;
     pulses[slot].x = x; pulses[slot].y = y; pulses[slot].age = 0;
-    pulses[slot].life = (kind == 0) ? 12 : 16;   // ~0.6s / ~0.8s at 20fps
+    pulses[slot].life = (kind == 0) ? 12 : (kind == 2) ? 22 : 16;
     pulses[slot].col = col; pulses[slot].kind = kind; pulses[slot].active = true;
 }
 
@@ -333,6 +423,19 @@ void drawPulses() {
         if (p.kind == 0) {                            // glass tap: a single soft ring
             int r = (int)(3 + t * 16);
             canvas.drawCircle(cx, cy, r, pulseFade(0x6FAAD0UL, t));
+        } else if (p.kind == 2) {                     // snail coin shine: golden burst + twinkle
+            int r0 = (int)(4 + t * 14), r1 = (int)(8 + t * 26);
+            uint32_t gold = pulseFade(p.col ? p.col : 0xFFE566UL, t);
+            uint32_t pale = pulseFade(0xFFF8CCUL, t);
+            canvas.drawCircle(cx, cy, r1, gold);
+            canvas.drawCircle(cx, cy, r0, pale);
+            for (int k = 0; k < 8; k++) {
+                float ang = (float)k * 0.785398f + t * 1.2f;
+                int sx = (int)(cosf(ang) * (6 + t * 20));
+                int sy = (int)(sinf(ang) * (6 + t * 20));
+                canvas.drawLine(cx, cy, cx + sx, cy + sy, gold);
+                canvas.fillCircle(cx + sx, cy + sy, 2, pale);
+            }
         } else {                                       // collect: ring + four sparks
             int r = (int)(6 + t * 22), s = (int)(3 + t * 16);
             uint32_t col = pulseFade(p.col, t);
@@ -429,10 +532,28 @@ float fishScale(const Fish& f) {
     float g = f.age / (float)GROW_FRAMES; if (g > 1) g = 1; if (g < 0) g = 0;
     return 0.22f + 0.78f * g;   // hatch tiny (0.22) and grow to full size
 }
+// Tank quality is the average quality of every resident — fish AND snails.
 float tankLuck() {
     int n = 0; float s = 0;
     for (int i = 0; i < MAX_FISH; i++) if (isFishActive(i)) { s += fish[i].fishLuck; n++; }
+    for (int i = 0; i < numSnails; i++) if (coinSnails[i].active) { s += coinSnails[i].snailLuck; n++; }
     return n ? s / n : 0.0f;
+}
+
+// ── Snail (sand-bed species) growth/sleep/stamina/value helpers ────────────────────
+static inline int   snailStage(float age)       { int v = (int)(age / GROW_FRAMES * SNAIL_STAGES);
+                                                  return v < 0 ? 0 : (v >= SNAIL_STAGES ? SNAIL_STAGES - 1 : v); }
+static inline float snailScaleOf(float age)     { return SNAIL_STAGE_SCALE[snailStage(age)]; }
+static inline float snailStaminaMax(float luck) { float l = luck < 0 ? 0 : (luck > 1 ? 1 : luck);
+                                                  return SNAIL_STAMINA_MIN + (SNAIL_STAMINA_MAX - SNAIL_STAMINA_MIN) * l; }
+// Night window centred on midnight (getDayProgress wraps 0..1): 20% total → first/last 10%.
+static inline bool  snailSleeping()             { float dp = getDayProgress();
+                                                  return dp < SNAIL_SLEEP_FRAC / 2 || dp >= 1.0f - SNAIL_SLEEP_FRAC / 2; }
+int snailSellValue(int idx) {
+    if (idx < 0 || idx >= numSnails || !coinSnails[idx].active) return 0;
+    const CoinSnail& s = coinSnails[idx];
+    return SNAIL_BASE_SELL + (int)(SNAIL_BASE_SELL * snailScaleOf(s.age) + 0.5f)
+         + (int)(s.snailLuck * 15.0f + 0.5f) + (s.xp / 100 < 8 ? s.xp / 100 : 8);
 }
 
 // ── Fish appearance: luck-driven colouring + shiny rarity ──────────────────────
@@ -485,6 +606,49 @@ float boundAccel(float val, float lo, float hi, float k = 0.30f) {
     return 0.0f;
 }
 
+struct FishTypeProfile { float seekMul, maxVMul, idleChance; int idleMin, idleMax, wcdMin, wcdMax; };
+static const FishTypeProfile FISH_PROFILE[5] = {
+    { 0.82f, 0.72f, 0.14f, 25, 55, 35, 95 },
+    { 0.68f, 0.60f, 0.28f, 45, 130, 28, 75 },
+    { 0.92f, 0.85f, 0.10f, 20, 50, 14, 48 },
+    { 0.78f, 0.75f, 0.18f, 30, 85, 12, 38 },
+    { 0.72f, 0.68f, 0.22f, 35, 95, 32, 85 },
+};
+static int fishSubSchool(int idx, FishType type) {
+    int sz = FISH_SCHOOL_SIZE[type];
+    if (sz <= 0) return 0;   // solitary types (angel/salmon) have no sub-schools — never divide by 0
+    if (type == FISH_SCHOOL)  return (idx - MAX_PAIR) / sz;
+    if (type == FISH_SCHOOL2) return (idx - MAX_PAIR - MAX_SCHOOL) / sz;
+    if (type == FISH_ANGEL)   return (idx - MAX_PAIR - MAX_SCHOOL - MAX_SCHOOL2) / sz;
+    return 0;
+}
+static float fishSpeedMul(int idx, FishType type) {
+    const FishTypeProfile& p = FISH_PROFILE[(int)type < 5 ? (int)type : 1];
+    if (type == FISH_SCHOOL || type == FISH_SCHOOL2 || type == FISH_ANGEL) {
+        int sub = fishSubSchool(idx, type);
+        float school = 0.93f + (float)(hash32u((uint32_t)type * 7919u + (uint32_t)sub * 104729u) % 15) / 100.0f;
+        float personal = 0.96f + (float)(hash32u((uint32_t)idx) % 9) / 100.0f;
+        return p.maxVMul * school * personal;
+    }
+    return p.maxVMul * (0.88f + (float)(hash32u((uint32_t)idx ^ 0x55u) % 24) / 100.0f);
+}
+static float wanderCadenceMul(int idx, FishType type) {
+    if (type == FISH_SCHOOL || type == FISH_SCHOOL2 || type == FISH_ANGEL) {
+        int sub = fishSubSchool(idx, type);
+        float school = 0.93f + (float)(hash32u((uint32_t)type * 7919u + (uint32_t)sub * 104729u) % 15) / 100.0f;
+        float personal = 0.96f + (float)(hash32u((uint32_t)idx) % 9) / 100.0f;
+        return school * personal;
+    }
+    return 0.88f + (float)(hash32u((uint32_t)idx ^ 0xABu) % 24) / 100.0f;
+}
+static float snailBodyHalfW(const CoinSnail& sn) {
+    return 14.0f * SNAIL_STAGE_SCALE[snailStage(sn.age)] + 6.0f;
+}
+static bool snailCanCollectCoin(const CoinSnail& sn, float coinX) {
+    float reach = fmaxf((float)SNAIL_REACH, snailBodyHalfW(sn) + 8.0f);
+    return fabsf(coinX - sn.x) < reach;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Init helpers
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -516,6 +680,8 @@ void initFishEntry(int idx, float x, float y, float z, float vx,
     f.x = f.tx = x; f.y = f.ty = y; f.z = f.tz = z;
     f.vx = vx; f.vy = 0; f.vz = 0;
     f.wanderCD     = frandr(40, 130);
+    f.idleCD       = 0;
+    f.wanderQN     = 0;                       // queue fills lazily on first updateFish()
     f.facingRight  = (vx >= 0);
     f.type         = type;
     f.partner      = partner;
@@ -835,13 +1001,15 @@ void setup() {
         exit(1);
     }
     Serial.printf("display W=%d  H=%d\n", display.width(), display.height());
-    display.setBrightness(255);
+    // Leave hardware backlight at the kernel default at boot; displayBrightness
+    // (255) is tracked for telemetry/menu until the user adjusts the slider.
     display.setRotation(0);
     display.fillScreen(0x000000UL);
 
     initWeather();
     initDayNight();
     telemetryInit();
+    promptServerStart(8888);  // HTTP prompt server for Claude Code hooks
 
     for (int x = 0; x < SCREEN_W; x++) {
         float h = sinf(x * 0.018f) * 4.0f
@@ -944,6 +1112,10 @@ void evaluateFeedingDay() {
         float l = fish[i].fishLuck + delta;
         fish[i].fishLuck = l < 0 ? 0.0f : (l > 1 ? 1.0f : l);
     }
+    for (int i = 0; i < numSnails; i++) if (coinSnails[i].active) {
+        float l = coinSnails[i].snailLuck + delta;
+        coinSnails[i].snailLuck = l < 0 ? 0.0f : (l > 1 ? 1.0f : l);
+    }
 }
 // One feeding event (career): satisfies the current slot, or counts as overfeeding.
 void registerFeeding() {
@@ -1013,8 +1185,15 @@ void spawnLoot(uint8_t kind, float x, float y, uint8_t tier) {
 void addSnail() {
     if (numSnails >= MAX_SNAILS) return;
     CoinSnail& s = coinSnails[numSnails];
-    s.active = true; s.x = frandr(80, SCREEN_W - 80); s.spd = frandr(1.5f, 2.5f);
+    s.active = true; s.type = 0;
+    s.x = frandr(80, SCREEN_W - 80);
+    s.spd = SNAIL_BASE_SPD * frandr(0.85f, 1.15f);   // slow base crawl
     s.facingRight = (random(0, 2) == 0);
+    s.age = (gameMode == MODE_CAREER) ? 0.0f : (float)GROW_FRAMES;  // career: hatch small
+    s.xp = 0;
+    s.snailLuck = frandr(0.0f, 0.85f);
+    s.stamina = SNAIL_STAMINA_MAX;
+    s.asleep = false;
     numSnails++;
 }
 void spawnWanderer(float luck) {
@@ -1144,12 +1323,20 @@ void updateCareer() {
         } else if (--it.ttl <= 0) { it.active = false; }
     }
 
-    // Coin-collector snails: only react to a falling coin once it is halfway to the sand
-    // (y >= SAND_Y/2); sprint 4× for landed coins, fast-walk 2× for falling.
-    // Use moveToward so the snail stops exactly at the target x without direction jitter.
+    // Snail species: grow + sleep + forage. Asleep through the night (no movement). Awake,
+    // they sprint 4× for landed coins / 2× for falling — but only while stamina lasts; an
+    // exhausted snail plods at its (slow, stage-scaled) base speed. Stamina recovers while
+    // patrolling. Only react to a falling coin once it is halfway to the sand (y >= SAND_Y/2).
+    bool snailsAsleep = snailSleeping();
     for (int s = 0; s < numSnails; s++) {
         if (!coinSnails[s].active) continue;
         CoinSnail& sn = coinSnails[s];
+        if (gameMode == MODE_CAREER) sn.age += 1.0f;     // career growth (one frame)
+        sn.asleep = snailsAsleep;
+        sn.lastVx = 0;
+        if (snailsAsleep) continue;                      // sleeping snails sit still
+        float baseStep = sn.spd * SNAIL_STAGE_SPDMUL[snailStage(sn.age)];
+        float staMax   = snailStaminaMax(sn.snailLuck);
         int tgt = -1; float td = 1e9f; bool tgtLanded = false;
         for (int i = 0; i < MAX_LOOT; i++) {
             if (!loot[i].active || loot[i].kind != 0) continue;
@@ -1162,22 +1349,35 @@ void updateCareer() {
         if (tgt >= 0) {
             float dx   = loot[tgt].x - sn.x;
             float dist = fabsf(dx);
-            float step = sn.spd * (tgtLanded ? 4.0f : 2.0f);
+            float mult = tgtLanded ? 4.0f : 2.0f;
+            if (sn.stamina <= 0.0f) mult = 1.0f;         // exhausted → plod
+            sn.stamina -= (mult - 1.0f); if (sn.stamina < 0.0f) sn.stamina = 0.0f;  // sprint cost
+            float step = baseStep * mult;
             if (dist <= step) {
                 sn.x = loot[tgt].x;              // arrived — stop exactly, no direction jitter
                 sn.facingRight = (dx >= 0);
+                sn.lastVx = 0;
             } else {
                 sn.facingRight = (dx > 0);
-                sn.x += sn.facingRight ? step : -step;
+                sn.lastVx = sn.facingRight ? step : -step;
+                sn.x += sn.lastVx;
             }
         } else {
-            sn.x += (sn.facingRight ? 1 : -1) * sn.spd;
-            if (sn.x > SCREEN_W - 55) { sn.x = SCREEN_W - 55; sn.facingRight = false; }
-            if (sn.x < 55)            { sn.x = 55;            sn.facingRight = true; }
+            sn.stamina += 1.0f; if (sn.stamina > staMax) sn.stamina = staMax;        // rest regen
+            sn.lastVx = (sn.facingRight ? 1.0f : -1.0f) * baseStep;
+            sn.x += sn.lastVx;
+            if (sn.x > SCREEN_W - 55) { sn.x = SCREEN_W - 55; sn.facingRight = false; sn.lastVx = 0; }
+            if (sn.x < 55)            { sn.x = 55;            sn.facingRight = true;  sn.lastVx = 0; }
         }
-        for (int i = 0; i < MAX_LOOT; i++)
-            if (loot[i].active && loot[i].kind == 0 && loot[i].landed &&
-                fabsf(loot[i].x - sn.x) < SNAIL_REACH) { gameCoins++; loot[i].active = false; }
+        for (int i = 0; i < MAX_LOOT; i++) {
+            if (!loot[i].active || loot[i].kind != 0 || !loot[i].landed) continue;
+            if (!snailCanCollectCoin(sn, loot[i].x)) continue;
+            float cx = loot[i].x;
+            gameCoins++;
+            loot[i].active = false;
+            spawnPulse(cx, (float)SAND_Y - 8, 2, 0xFFE566UL);
+            spawnFloatText(cx, (float)SAND_Y - 18, 0xFFD23FUL, "+1 coin");
+        }
     }
 }
 
@@ -1229,6 +1429,19 @@ void sellFishSlot(int idx) {
     gameCoins += fishSellValue(idx);
     removeFishSlot(idx);
 }
+// Remove a snail by slot (swap-and-pop to keep coinSnails[0..numSnails) contiguous).
+void removeSnailSlot(int idx) {
+    if (idx < 0 || idx >= numSnails || !coinSnails[idx].active) return;
+    int last = numSnails - 1;
+    if (idx != last) coinSnails[idx] = coinSnails[last];
+    coinSnails[last].active = false;
+    numSnails--;
+}
+void sellSnailSlot(int idx) {
+    if (idx < 0 || idx >= numSnails || !coinSnails[idx].active) return;
+    gameCoins += snailSellValue(idx);
+    removeSnailSlot(idx);
+}
 
 void telemetryApplyControls() {
     int w = _ctrlWeatherReq.exchange(-2);
@@ -1239,6 +1452,9 @@ void telemetryApplyControls() {
     int tm = _ctrlTimeReq.exchange(-1);
     if      (tm == 0) currentTimeMode = TIME_REAL;
     else if (tm == 1) currentTimeMode = TIME_FAST;
+
+    int br = _ctrlBrightnessReq.exchange(-1);
+    if (br >= 0) setDisplayBrightness(br);
 
     const FishType T[5] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
     for (int t = 0; t < 5; t++) {
@@ -1273,6 +1489,11 @@ void telemetryApplyControls() {
             fish[k].xp += 10; fish[k].age += 40;
             fish[k].fishLuck = fish[k].fishLuck + 0.05f > 1 ? 1.0f : fish[k].fishLuck + 0.05f;
         }
+        // Snails graze the same food — grow them too so they're worth keeping.
+        for (int k = 0; k < numSnails; k++) if (coinSnails[k].active && random(0, 3) == 0) {
+            coinSnails[k].xp += 10; coinSnails[k].age += 40;
+            coinSnails[k].snailLuck = coinSnails[k].snailLuck + 0.05f > 1 ? 1.0f : coinSnails[k].snailLuck + 0.05f;
+        }
     }
 
     // Sell fish (from web dashboard fish-profile sell button or local shop panel).
@@ -1280,6 +1501,12 @@ void telemetryApplyControls() {
         int sc = _ctrlSellFishCount.exchange(0);
         for (int i = 0; i < sc && i < CTRL_SELL_MAX; i++)
             sellFishSlot(_ctrlSellFishIds[i].load());
+    }
+    // Sell snails (web snail-profile sell button).
+    {
+        int sc = _ctrlSellSnailCount.exchange(0);
+        for (int i = 0; i < sc && i < CTRL_SELL_MAX; i++)
+            sellSnailSlot(_ctrlSellSnailIds[i].load());
     }
 }
 
@@ -1367,6 +1594,61 @@ int nearestFlake(const Fish& f) {
     return best;
 }
 
+// Resolve ONE upcoming wander move for a fish, given the current sub-school centroids and
+// the chase state it starts from. This is the only place wander RNG is drawn: the result
+// (a fully-resolved absolute target + its countdown) is queued and shipped in telemetry,
+// so the web replication seeks identical targets rather than rolling its own. Mirrors the
+// retarget block in updateFish() exactly.
+WanderMove computeWanderMove(int fishIdx, Fish& f, bool chasingIn,
+                             float scx, float scy, float scz,
+                             float sc2x, float sc2y, float sc2z,
+                             float sacx, float sacy, float sacz) {
+    WanderMove m;
+    const FishTypeProfile& prof = FISH_PROFILE[(int)f.type < 5 ? (int)f.type : 1];
+    m.chasing = chasingIn;
+    if (f.type == FISH_PAIR) {
+        m.chasing = !chasingIn;
+    }
+    m.wcd = frandr((float)prof.wcdMin, (float)prof.wcdMax) * wanderCadenceMul(fishIdx, f.type);
+
+    if (f.type == FISH_PAIR && f.partner >= 0 && isFishActive(f.partner)) {
+        Fish& partner = fish[f.partner];
+        if (m.chasing) {
+            m.tx = constrain(partner.x + frandr(-40, 40), 30.0f, (float)(SCREEN_W - 30));
+            m.ty = constrain(partner.y + frandr(-30, 30), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+            m.tz = constrain(partner.z + frandr(-0.10f, 0.10f), 0.05f, 0.72f);
+        } else {
+            float fleeX = f.x + (f.x - partner.x) * 1.5f;
+            float fleeY = f.y + (f.y - partner.y) * 1.2f;
+            m.tx = constrain(fleeX + frandr(-60, 60), 30.0f, (float)(SCREEN_W - 30));
+            m.ty = constrain(fleeY + frandr(-40, 40), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+            m.tz = constrain(partner.z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
+        }
+    } else if (f.type == FISH_PAIR) {
+        m.tx = frandr(30.0f, (float)(SCREEN_W - 30));
+        m.ty = frandr((float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+        m.tz = constrain(f.tz + frandr(-0.12f, 0.12f), 0.05f, 0.72f);
+    } else if (f.type == FISH_SCHOOL) {
+        m.tx = constrain(scx + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
+        m.ty = constrain(scy + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+        m.tz = constrain(scz + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
+    } else if (f.type == FISH_SCHOOL2) {
+        m.tx = constrain(sc2x + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
+        m.ty = constrain(sc2y + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+        m.tz = constrain(sc2z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
+    } else if (f.type == FISH_ANGEL) {
+        m.tx = constrain(sacx + frandr(-120, 120), 30.0f, (float)(SCREEN_W - 30));
+        m.ty = constrain(sacy + frandr(-110, 110), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+        m.tz = constrain(sacz + frandr(-0.18f, 0.18f), 0.05f, 0.72f);
+    } else {
+        // Salmon (school size 0) + any solitary type: roam the whole tank independently.
+        m.tx = frandr(30.0f, (float)(SCREEN_W - 30));
+        m.ty = frandr((float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
+        m.tz = constrain(f.tz + frandr(-0.12f, 0.12f), 0.05f, 0.72f);
+    }
+    return m;
+}
+
 void updateFish() {
     // Whole-type centroids — used as the wander-retarget seed below. (Cohesion uses
     // per-sub-school centroids computed inline in the loop, so schools cap correctly.)
@@ -1404,56 +1686,38 @@ void updateFish() {
                 }
             }
         } else {
-            f.wanderCD -= 1.0f;
+            const FishTypeProfile& prof = FISH_PROFILE[(int)f.type < 5 ? (int)f.type : 1];
+            if (f.idleCD > 0) {
+                f.idleCD -= 1.0f;
+                f.wanderCD -= 0.25f;
+            } else {
+                f.wanderCD -= 1.0f;
+            }
+            bool tailChasing = (f.wanderQN > 0) ? f.wanderQ[f.wanderQN - 1].chasing : f.chasing;
+            while (f.wanderQN < WANDER_LOOKAHEAD) {
+                f.wanderQ[f.wanderQN] = computeWanderMove(i, f, tailChasing,
+                                                          scx, scy, scz, sc2x, sc2y, sc2z,
+                                                          sacx, sacy, sacz);
+                tailChasing = f.wanderQ[f.wanderQN].chasing;
+                f.wanderQN++;
+            }
             if (f.wanderCD <= 0.0f) {
-                if (f.type == FISH_PAIR)  { f.chasing = !f.chasing; f.wanderCD = f.chasing ? frandr(30, 70) : frandr(40, 90); }
-                else if (f.type == FISH_ANGEL) { f.wanderCD = frandr(8, 28); }
-                else                           { f.wanderCD = frandr(15, 50); }
-
-                if (f.type == FISH_PAIR && f.partner >= 0 && isFishActive(f.partner)) {
-                    Fish& partner = fish[f.partner];
-                    if (f.chasing) {
-                        f.tx = constrain(partner.x + frandr(-40, 40), 30.0f, (float)(SCREEN_W - 30));
-                        f.ty = constrain(partner.y + frandr(-30, 30), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-                        f.tz = constrain(partner.z + frandr(-0.10f, 0.10f), 0.05f, 0.72f);
-                    } else {
-                        float fleeX = f.x + (f.x - partner.x) * 1.5f;
-                        float fleeY = f.y + (f.y - partner.y) * 1.2f;
-                        f.tx = constrain(fleeX + frandr(-60, 60), 30.0f, (float)(SCREEN_W - 30));
-                        f.ty = constrain(fleeY + frandr(-40, 40), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-                        f.tz = constrain(partner.z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
-                    }
-                } else if (f.type == FISH_PAIR) {
-                    f.tx = frandr(30.0f, (float)(SCREEN_W - 30));
-                    f.ty = frandr((float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-                    f.tz = constrain(f.tz + frandr(-0.12f, 0.12f), 0.05f, 0.72f);
-                } else if (f.type == FISH_SCHOOL) {
-                    f.tx = constrain(scx + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
-                    f.ty = constrain(scy + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-                    f.tz = constrain(scz + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
-                } else if (f.type == FISH_SCHOOL2) {
-                    f.tx = constrain(sc2x + frandr(-160, 160), 30.0f, (float)(SCREEN_W - 30));
-                    f.ty = constrain(sc2y + frandr(-90,   90), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-                    f.tz = constrain(sc2z + frandr(-0.15f, 0.15f), 0.05f, 0.72f);
-                } else if (f.type == FISH_ANGEL) {
-                    f.tx = constrain(sacx + frandr(-120, 120), 30.0f, (float)(SCREEN_W - 30));
-                    f.ty = constrain(sacy + frandr(-110, 110), (float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-                    f.tz = constrain(sacz + frandr(-0.18f, 0.18f), 0.05f, 0.72f);
-                } else {
-                    // Salmon (school size 0) + any solitary type: roam the whole tank
-                    // independently — no group centroid, so they don't shoal.
-                    f.tx = frandr(30.0f, (float)(SCREEN_W - 30));
-                    f.ty = frandr((float)(TANK_TOP + 20), (float)(SCREEN_H - 80));
-                    f.tz = constrain(f.tz + frandr(-0.12f, 0.12f), 0.05f, 0.72f);
-                }
+                WanderMove m = f.wanderQ[0];
+                for (uint8_t q = 1; q < f.wanderQN; q++) f.wanderQ[q - 1] = f.wanderQ[q];
+                f.wanderQN--;
+                f.tx = m.tx; f.ty = m.ty; f.tz = m.tz; f.chasing = m.chasing; f.wanderCD = m.wcd;
+                if (random(0, 1000) < (int)(prof.idleChance * 1000.0f))
+                    f.idleCD = frandr((float)prof.idleMin, (float)prof.idleMax) * wanderCadenceMul(i, f.type);
             }
 
-            float seekStr = (f.type == FISH_PAIR && f.chasing) ? 0.018f
-                          : (f.type == FISH_ANGEL)             ? 0.020f
-                          :                                      0.012f;
-            ax += (f.tx - f.x) * seekStr;
-            ay += (f.ty - f.y) * seekStr;
-            az += (f.tz - f.z) * 0.010f;
+            if (f.idleCD <= 0) {
+                float seekStr = (f.type == FISH_PAIR && f.chasing) ? 0.018f
+                              : (f.type == FISH_ANGEL)             ? 0.020f
+                              :                                      0.012f;
+                seekStr *= prof.seekMul;
+                ax += (f.tx - f.x) * seekStr;
+                ay += (f.ty - f.y) * seekStr;
+                az += (f.tz - f.z) * 0.010f;
 
             if (typeSchools(f.type)) {                 // cohere to this fish's sub-school only
                 // Partition the type's slots into schools of FISH_SCHOOL_SIZE; a fish coheres to
@@ -1486,6 +1750,9 @@ void updateFish() {
                     if (d2 < 60.0f * 60.0f && d2 > 0.01f) { float inv = 7.0f / d2; ax += dx * inv; ay += dy * inv; }
                 }
             }
+            } else {
+                f.vx *= 0.90f; f.vy *= 0.90f;
+            }
         }
 
         ax += boundAccel(f.x,  30,             SCREEN_W - 30);
@@ -1493,6 +1760,7 @@ void updateFish() {
         az += boundAccel(f.z,  0.0f,     0.75f, 0.08f);
 
         float maxV  = f.goingForFood ? 8.0f : (f.type == FISH_PAIR && f.chasing) ? 7.0f : (f.type == FISH_ANGEL) ? 7.0f : 5.5f;
+        if (!f.goingForFood) maxV *= fishSpeedMul(i, f.type);
         float maxVz = 0.015f;
         f.vx = constrain(f.vx + ax, -maxV,       maxV);
         f.vy = constrain(f.vy + ay, -maxV * 0.5f, maxV * 0.5f);
@@ -1953,8 +2221,109 @@ void drawCartButton() {
 #define SP_W     780
 #define SP_H     (SCREEN_H - TANK_TOP - 4)
 #define SP_MID   (SP_X + SP_W / 2)
-#define SP_ROW_H 40
-#define SP_ROWS  9   // visible fish rows per page
+#define SP_LEFT_W ((SP_MID - SP_X) - 8)
+#define SP_ROW_H 56
+#define SP_ROWS  6   // rich fish cards (preview + stats) per page
+
+static void formatFishAgeStr(const Fish& f, char* buf, size_t n) {
+    if (gameMode != MODE_CAREER) { snprintf(buf, n, "Adult"); return; }
+    int s = (int)(f.age / 20.0f + 0.5f);   // device frames @20fps → seconds
+    if (s < 60)       snprintf(buf, n, "%ds", s);
+    else if (s < 3600) snprintf(buf, n, "%dm", s / 60);
+    else               snprintf(buf, n, "%dh%02dm", s / 3600, (s / 60) % 60);
+}
+
+// Miniature fish glyph for the sell list — same ASCII art as drawFish(), centred in a box.
+static void drawFishSellPreview(int idx, int boxX, int boxY, int boxW, int boxH) {
+    if (!isFishActive(idx)) return;
+    const Fish& f = fish[idx];
+    canvas.fillRect(boxX, boxY, boxW, boxH, 0x0A1220UL);
+    canvas.drawRect(boxX, boxY, boxW, boxH, 0x224466UL);
+    int cx = boxX + boxW / 2;
+    int cy = boxY + boxH / 2 + 2;
+    uint32_t col = fishColor(idx);
+    int ts = fishTS(f);
+    if (ts > 2) ts = 2;
+    canvas.setTextSize(ts);
+    canvas.setTextColor(col);
+    int chars = (f.type == FISH_PAIR) ? 5 : 3;
+    int hw = (chars * canvas.charW * ts) / 2;
+    if (f.type == FISH_PAIR) {
+        canvas.setCursor(cx - hw, cy - 4 * ts);
+        canvas.print("><(o>");
+    } else if (f.type == FISH_ANGEL) {
+        canvas.setTextSize(1);
+        canvas.setCursor(cx - 3, cy - 4 * ts - 6);
+        canvas.print("\\");
+        canvas.setTextSize(ts);
+        canvas.setCursor(cx - hw, cy - 4 * ts);
+        canvas.print("><>");
+        canvas.setTextSize(1);
+        canvas.setCursor(cx - 3, cy + 4 * ts);
+        canvas.print("/");
+    } else {
+        canvas.setCursor(cx - hw, cy - 4 * ts);
+        canvas.print("><>");
+    }
+    if (fishIsShiny((uint32_t)idx)) {
+        canvas.setTextSize(1);
+        canvas.setTextColor(0xFFFFAAUL);
+        canvas.setCursor(boxX + 2, boxY + 2);
+        canvas.print("*");
+    }
+}
+
+static void drawSellFishRow(int idx, int ry) {
+    const Fish& f = fish[idx];
+    static const char* tNames[5] = { "Clownfish", "Guppy", "Piranha", "Angel", "Salmon" };
+    int t = (int)f.type < 5 ? (int)f.type : 0;
+    int sv = fishSellValue(idx);
+    int btnY = ry + (SP_ROW_H - 28) / 2;
+
+    canvas.fillRect(SP_X + 4, ry, SP_LEFT_W, SP_ROW_H - 2, 0x0C1528UL);
+    canvas.drawFastHLine(SP_X + 4, ry + SP_ROW_H - 2, SP_LEFT_W, 0x1A2844UL);
+
+    drawFishSellPreview(idx, SP_X + 8, ry + 5, 50, SP_ROW_H - 12);
+
+    char name[TELEMETRY_NAME_LEN];
+    telemetryGetFishName(idx, name, sizeof(name));
+    char title[TELEMETRY_NAME_LEN + 12];
+    if (name[0]) snprintf(title, sizeof(title), "%s", name);
+    else         snprintf(title, sizeof(title), "%s #%d", tNames[t], idx);
+
+    canvas.setTextSize(1);
+    canvas.setTextColor(0xE8F4FFUL);
+    canvas.setCursor(SP_X + 64, ry + 6);
+    canvas.print(title);
+
+    char ageBuf[12];
+    formatFishAgeStr(f, ageBuf, sizeof(ageBuf));
+    int sizePct = (int)(fishScale(f) * 100.0f + 0.5f);
+    int qualPct = (int)(f.fishLuck * 100.0f + 0.5f);
+    char meta[56];
+    snprintf(meta, sizeof(meta), "%s  %s  %d%%", tNames[t], ageBuf, sizePct);
+    canvas.setTextColor(0x88AACCUL);
+    canvas.setCursor(SP_X + 64, ry + 18);
+    canvas.print(meta);
+
+    char detail[32];
+    snprintf(detail, sizeof(detail), "Q %d%%  XP %d", qualPct, (int)f.xp);
+    canvas.setTextColor(0x667788UL);
+    canvas.setCursor(SP_X + 64, ry + 30);
+    canvas.print(detail);
+
+    char valBuf[12];
+    snprintf(valBuf, sizeof(valBuf), "%dc", sv);
+    canvas.setTextColor(0xFFD23FUL);
+    canvas.setCursor(SP_X + 248, ry + 8);
+    canvas.print(valBuf);
+
+    canvas.fillRect(SP_X + 270, btnY, 52, 28, 0x3A1800UL);
+    canvas.drawRect(SP_X + 270, btnY, 52, 28, 0xD9A441UL);
+    canvas.setTextColor(0xFFD23FUL);
+    canvas.setCursor(SP_X + 279, btnY + 10);
+    canvas.print("SELL");
+}
 
 void drawShopPanel() {
     if (!shopOpen) return;
@@ -1978,21 +2347,10 @@ void drawShopPanel() {
     int pages = (nActive + SP_ROWS - 1) / SP_ROWS;
     if (shopSellPage >= pages) shopSellPage = pages > 0 ? pages - 1 : 0;
     int start = shopSellPage * SP_ROWS;
-    static const char* tNames[5] = { "CLOWN","GUPPY","PIRANHA","ANGEL","SALMON" };
     for (int r = 0; r < SP_ROWS && (start + r) < nActive; r++) {
         int idx = activeFish[start + r];
-        const Fish& f = fish[idx];
         int ry = SP_Y + 28 + r * SP_ROW_H;
-        int sv = fishSellValue(idx);
-        char line[40];
-        snprintf(line, sizeof(line), "#%-2d %s  %dc", idx, tNames[(int)f.type < 5 ? (int)f.type : 0], sv);
-        canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
-        canvas.setCursor(SP_X + 8, ry + 4); canvas.print(line);
-        // SELL button
-        canvas.fillRect(SP_X + 270, ry, 52, 28, 0x3A1800UL);
-        canvas.drawRect(SP_X + 270, ry, 52, 28, 0xD9A441UL);
-        canvas.setTextColor(0xFFD23FUL);
-        canvas.setCursor(SP_X + 279, ry + 10); canvas.print("SELL");
+        drawSellFishRow(idx, ry);
     }
     // Page navigation (prev/next) if needed
     if (pages > 1) {
@@ -2101,35 +2459,39 @@ void drawMenu() {
     }
     canvas.drawFastHLine(MENU_X + 8, MENU_Y + 34, MENU_W - 16, 0x2244AAUL);
 
-    const char* labels[5] = { "CLOWNFISH", "GUPPY", "PIRANHA", "ANGELFISH", "SALMON" };
-    int counts[5]         = { numPair, numSchool, numSchool2, numAngel, numSalmon };
-    int maxes[5]          = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL, MAX_SALMON };
-    for (int row = 0; row < 5; row++) {
-        int ry = MENU_Y + 45 + row * 58;
-        canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
-        canvas.setCursor(MENU_X + 10, ry + 11); canvas.print(labels[row]);
-        bool canRm = !career && counts[row] > 0;   // remove: creative only
-        canvas.fillRect(MENU_X + 148, ry, 30, 30, canRm ? 0x1A3355UL : 0x0C1A2AUL);
-        canvas.drawRect(MENU_X + 148, ry, 30, 30, canRm ? 0x4488CCUL : 0x223344UL);
-        canvas.setTextSize(2); canvas.setTextColor(canRm ? 0xFFFFFFUL : 0x334455UL);
-        canvas.setCursor(MENU_X + 157, ry + 7); canvas.print("-");
-        char buf[4]; snprintf(buf, sizeof(buf), "%d", counts[row]);
-        canvas.setTextSize(2); canvas.setTextColor(0xFFEE88UL);
-        canvas.setCursor(MENU_X + 184, ry + 7); canvas.print(buf);
-        bool atCap  = counts[row] >= maxes[row];
-        bool canAdd = career ? (!atCap && gameCoins >= FISH_PRICE[row]) : !atCap;
-        canvas.fillRect(MENU_X + 210, ry, 30, 30, canAdd ? (career ? 0x3A2E0AUL : 0x1A3355UL) : 0x0C1A2AUL);
-        canvas.drawRect(MENU_X + 210, ry, 30, 30, canAdd ? (career ? 0xFFD23FUL : 0x4488CCUL) : 0x223344UL);
-        canvas.setTextSize(2); canvas.setTextColor(canAdd ? 0xFFFFFFUL : 0x334455UL);
-        canvas.setCursor(MENU_X + 217, ry + 7); canvas.print("+");
-        if (career) {                               // price tag beside the buy button
-            char pbuf[6]; snprintf(pbuf, sizeof(pbuf), "%d", FISH_PRICE[row]);
-            canvas.setTextSize(1); canvas.setTextColor(canAdd ? 0xFFD23FUL : 0x556677UL);
-            canvas.setCursor(MENU_X + 244, ry + 11); canvas.print(pbuf);
+    int yWeather, yTime, yBright, yTelem;
+    menuRowYs(career, yWeather, yTime, yBright, yTelem);
+
+    if (career) {
+        canvas.setTextSize(1);
+        canvas.setTextColor(0x8899AAUL);
+        canvas.setCursor(MENU_X + 10, MENU_Y + 52);
+        canvas.print("FISH: use shop cart");
+    } else {
+        const char* labels[5] = { "CLOWNFISH", "GUPPY", "PIRANHA", "ANGELFISH", "SALMON" };
+        int counts[5]         = { numPair, numSchool, numSchool2, numAngel, numSalmon };
+        int maxes[5]          = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL, MAX_SALMON };
+        for (int row = 0; row < 5; row++) {
+            int ry = MENU_Y + 45 + row * 58;
+            canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
+            canvas.setCursor(MENU_X + 10, ry + 11); canvas.print(labels[row]);
+            bool canRm = counts[row] > 0;
+            canvas.fillRect(MENU_X + 148, ry, 30, 30, canRm ? 0x1A3355UL : 0x0C1A2AUL);
+            canvas.drawRect(MENU_X + 148, ry, 30, 30, canRm ? 0x4488CCUL : 0x223344UL);
+            canvas.setTextSize(2); canvas.setTextColor(canRm ? 0xFFFFFFUL : 0x334455UL);
+            canvas.setCursor(MENU_X + 157, ry + 7); canvas.print("-");
+            char buf[4]; snprintf(buf, sizeof(buf), "%d", counts[row]);
+            canvas.setTextSize(2); canvas.setTextColor(0xFFEE88UL);
+            canvas.setCursor(MENU_X + 184, ry + 7); canvas.print(buf);
+            bool canAdd = counts[row] < maxes[row];
+            canvas.fillRect(MENU_X + 210, ry, 30, 30, canAdd ? 0x1A3355UL : 0x0C1A2AUL);
+            canvas.drawRect(MENU_X + 210, ry, 30, 30, canAdd ? 0x4488CCUL : 0x223344UL);
+            canvas.setTextSize(2); canvas.setTextColor(canAdd ? 0xFFFFFFUL : 0x334455UL);
+            canvas.setCursor(MENU_X + 217, ry + 7); canvas.print("+");
         }
     }
     {
-        int ry5 = MENU_Y + 45 + 5 * 58;
+        int ry5 = yTime;
         canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
         canvas.setCursor(MENU_X + 10, ry5 + 11); canvas.print("TIME");
         canvas.fillRect(MENU_X + 110, ry5, 30, 30, 0x1A3355UL);
@@ -2147,7 +2509,7 @@ void drawMenu() {
         canvas.setCursor(MENU_X + 224, ry5 + 7); canvas.print(">");
     }
     {
-        int ry4 = MENU_Y + 45 + 4 * 58;
+        int ry4 = yWeather;
         canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
         canvas.setCursor(MENU_X + 10, ry4 + 11); canvas.print("WEATHER");
         canvas.fillRect(MENU_X + 110, ry4, 30, 30, 0x1A3355UL);
@@ -2167,9 +2529,10 @@ void drawMenu() {
         canvas.setTextSize(2); canvas.setTextColor(0xFFFFFFUL);
         canvas.setCursor(MENU_X + 224, ry4 + 7); canvas.print(">");
     }
-    // Telemetry publish toggle (compact row beneath the time row).
+    drawBrightnessSlider(yBright);
+    // Telemetry publish toggle (compact row beneath brightness).
     {
-        int ryT = MENU_Y + 45 + 5 * 58 + 38;
+        int ryT = yTelem;
         canvas.setTextSize(1); canvas.setTextColor(0xAADDFFUL);
         canvas.setCursor(MENU_X + 10, ryT + 9); canvas.print("TELEMETRY");
 
@@ -2260,6 +2623,67 @@ void drawTelemetryStatus() {
     canvas.setCursor(x, y + 18); canvas.print(line);
 }
 
+// Geometry for the prompt dialog — shared between the renderer and the click hit-test
+// (promptDialogHitTest uses the same layout). Centered on an 800×480 screen.
+#define PD_W      560
+#define PD_H      200
+#define PD_X      ((SCREEN_W - PD_W) / 2)
+#define PD_Y      ((SCREEN_H - PD_H) / 2)
+#define PD_BTN_W  150
+#define PD_BTN_H  44
+#define PD_BTN_Y  (PD_Y + PD_H - PD_BTN_H - 20)
+#define PD_BTN_GAP 12
+#define PD_BTN_X0 (PD_X + 20)
+
+// Resolve a tap/click to a prompt option index (or -1). Uses the same PD_* layout as
+// the renderer, so the buttons drawn are exactly the buttons that respond.
+static int promptDialogHitTest(int mx, int my) {
+    int n = promptServerOptionCount();
+    if (n <= 0) return -1;
+    if (my < PD_BTN_Y || my >= PD_BTN_Y + PD_BTN_H) return -1;
+    for (int i = 0; i < n; i++) {
+        int btnX = PD_BTN_X0 + i * (PD_BTN_W + PD_BTN_GAP);
+        if (mx >= btnX && mx < btnX + PD_BTN_W) return i;
+    }
+    return -1;
+}
+
+// Render the prompt dialog if active. Mirrors the drawProfileModal style (opaque box,
+// single-arg setTextColor — the Pi canvas has no text background colour).
+static void drawPromptDialog() {
+    if (!promptServerIsActive()) return;
+
+    // Snapshot the shared state under lock, then render from the copy.
+    PromptState state;
+    {
+        std::lock_guard<std::mutex> lock(gPromptMutex);
+        state = gPromptState;
+    }
+
+    // Dim the tank behind the dialog by tiling a dark band over the dialog region
+    // (fillRect is opaque, so this is a solid panel rather than a translucent scrim).
+    canvas.fillRect(PD_X,     PD_Y,     PD_W,     PD_H,     0x141821UL);
+    canvas.drawRect(PD_X,     PD_Y,     PD_W,     PD_H,     0x5FB0FFUL);
+    canvas.drawRect(PD_X + 1, PD_Y + 1, PD_W - 2, PD_H - 2, 0x21304AUL);
+
+    // Title + question
+    canvas.setTextSize(2); canvas.setTextColor(0x9FD0FFUL);
+    canvas.setCursor(PD_X + 20, PD_Y + 14); canvas.print("CLAUDE CODE");
+    canvas.setTextSize(1); canvas.setTextColor(0xE8F0FFUL);
+    canvas.setCursor(PD_X + 20, PD_Y + 50); canvas.print(state.question.c_str());
+
+    // Option buttons (laid out left-to-right; selected one highlighted green)
+    for (size_t i = 0; i < state.options.size(); i++) {
+        int btnX = PD_BTN_X0 + (int)i * (PD_BTN_W + PD_BTN_GAP);
+        bool sel = ((int)i == state.selectedIdx);
+        canvas.fillRect(btnX, PD_BTN_Y, PD_BTN_W, PD_BTN_H, sel ? 0x115522UL : 0x2A2F3AUL);
+        canvas.drawRect(btnX, PD_BTN_Y, PD_BTN_W, PD_BTN_H, sel ? 0x33CC66UL : 0x556070UL);
+        canvas.setTextColor(sel ? 0xCCFFDDUL : 0xC8D2E0UL);
+        canvas.setCursor(btnX + 12, PD_BTN_Y + 15);
+        canvas.print(state.options[i].c_str());
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  loop  (called each iteration from main)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2298,8 +2722,9 @@ void loop() {
                 int start = shopSellPage * SP_ROWS;
                 for (int r = 0; r < SP_ROWS && (start + r) < nActive; r++) {
                     int ry = SP_Y + 28 + r * SP_ROW_H;
+                    int btnY = ry + (SP_ROW_H - 28) / 2;
                     if (tx >= (uint16_t)(SP_X + 270) && tx < (uint16_t)(SP_X + 322) &&
-                        ty >= (uint16_t)ry            && ty < (uint16_t)(ry + 28)) {
+                        ty >= (uint16_t)btnY          && ty < (uint16_t)(btnY + 28)) {
                         sellFishSlot(activeFish[start + r]);
                         break;
                     }
@@ -2359,30 +2784,26 @@ void loop() {
                     }
                 }
             }
-            const FishType rowType[5] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
-            for (int row = 0; row < 5; row++) {
-                int ry = MENU_Y + 45 + row * 58;
-                if (tx >= (uint16_t)(MENU_X + 148) && tx < (uint16_t)(MENU_X + 178) &&
-                    ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
-                    if (gameMode != MODE_CAREER) removeFish(rowType[row]);  // creative only
-                    break;
-                }
-                if (tx >= (uint16_t)(MENU_X + 210) && tx < (uint16_t)(MENU_X + 240) &&
-                    ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
-                    if (gameMode == MODE_CAREER) {            // buy with coins (guard the cap)
-                        int cnt[5] = { numPair, numSchool, numSchool2, numAngel, numSalmon };
-                        int mx[5]  = { MAX_PAIR, MAX_SCHOOL, MAX_SCHOOL2, MAX_ANGEL, MAX_SALMON };
-                        if (cnt[row] < mx[row] && gameCoins >= FISH_PRICE[row]) {
-                            gameCoins -= FISH_PRICE[row]; addFish(rowType[row]);
-                        }
-                    } else {
-                        addFish(rowType[row]);               // creative: free
+            if (gameMode != MODE_CAREER) {
+                const FishType rowType[5] = { FISH_PAIR, FISH_SCHOOL, FISH_SCHOOL2, FISH_ANGEL, FISH_SALMON };
+                for (int row = 0; row < 5; row++) {
+                    int ry = MENU_Y + 45 + row * 58;
+                    if (tx >= (uint16_t)(MENU_X + 148) && tx < (uint16_t)(MENU_X + 178) &&
+                        ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
+                        removeFish(rowType[row]);
+                        break;
                     }
-                    break;
+                    if (tx >= (uint16_t)(MENU_X + 210) && tx < (uint16_t)(MENU_X + 240) &&
+                        ty >= (uint16_t)ry              && ty < (uint16_t)(ry + 30)) {
+                        addFish(rowType[row]);
+                        break;
+                    }
                 }
             }
+            int yWeather, yTime, yBright, yTelem;
+            menuRowYs(gameMode == MODE_CAREER, yWeather, yTime, yBright, yTelem);
             {
-                int ry5 = MENU_Y + 45 + 5 * 58;
+                int ry5 = yTime;
                 if ((tx >= (uint16_t)(MENU_X + 110) && tx < (uint16_t)(MENU_X + 140) &&
                      ty >= (uint16_t)ry5             && ty < (uint16_t)(ry5 + 30)) ||
                     (tx >= (uint16_t)(MENU_X + 218) && tx < (uint16_t)(MENU_X + 248) &&
@@ -2390,7 +2811,7 @@ void loop() {
                     currentTimeMode = (currentTimeMode == TIME_REAL) ? TIME_FAST : TIME_REAL;
             }
             {
-                int ry4 = MENU_Y + 45 + 4 * 58;
+                int ry4 = yWeather;
                 if (tx >= (uint16_t)(MENU_X + 110) && tx < (uint16_t)(MENU_X + 140) &&
                     ty >= (uint16_t)ry4             && ty < (uint16_t)(ry4 + 30)) {
                     weatherOverrideIdx--;
@@ -2407,7 +2828,7 @@ void loop() {
                 }
             }
             {
-                int ryT = MENU_Y + 45 + 5 * 58 + 38;
+                int ryT = yTelem;
                 if (tx >= (uint16_t)(MENU_X + 148) && tx < (uint16_t)(MENU_X + 230) &&
                     ty >= (uint16_t)ryT             && ty < (uint16_t)(ryT + 28)) {
                     telemetryEnabled = !telemetryEnabled;
@@ -2427,6 +2848,14 @@ void loop() {
             }
         }
     }
+    if (menuOpen && touched) {
+        int yWeather, yTime, yBright, yTelem;
+        menuRowYs(gameMode == MODE_CAREER, yWeather, yTime, yBright, yTelem);
+        (void)yWeather; (void)yTime; (void)yTelem;
+        if (ty >= (uint16_t)yBright && ty < (uint16_t)(yBright + 28) &&
+            tx >= (uint16_t)BRIGHT_SL_X && tx < (uint16_t)(BRIGHT_SL_X + BRIGHT_SL_W))
+            setDisplayBrightness(brightnessFromTouchX(tx));
+    }
     lastTouched = touched;
 
     uint32_t now = millis();
@@ -2442,6 +2871,7 @@ void loop() {
     updateWeatherEffects();
     telemetryUpdate();
     telemetryProcessFlags();   // act on server directives (rebuild / re-check)
+    localStatePersist();       // mirror tank to disk for offline restore (rate-limited)
     telemetryApplyControls();  // apply dashboard weather/time/fish/feed directives
     telemetryApplyAquariumSwitch(); // honor a !SWITCHAQ reassignment (re-bootstrap new tank)
     updateBoat();
@@ -2482,6 +2912,7 @@ void loop() {
     drawMenu();
     drawShopPanel();
     drawProfileModal();
+    drawPromptDialog();  // Render prompt dialog if active (drawn on top, supports click + keyboard)
     canvas.pushSprite(0, 0);
 }
 
@@ -2509,6 +2940,12 @@ int main(int /*argc*/, char* /*argv*/[]) {
                         display._touched = true;
                         display._touchX  = ev.button.x;
                         display._touchY  = ev.button.y;
+                        // A click on the prompt dialog commits that option (and swallows
+                        // the tap so it doesn't also drop food / hit tank controls).
+                        if (promptServerIsActive()) {
+                            int opt = promptDialogHitTest(ev.button.x, ev.button.y);
+                            if (opt >= 0) promptServerCommit(opt);
+                        }
                     }
                     break;
                 case SDL_MOUSEBUTTONUP:
@@ -2522,11 +2959,16 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     }
                     break;
                 // Native Pi touchscreen events
-                case SDL_FINGERDOWN:
+                case SDL_FINGERDOWN: {
                     display._touched = true;
                     display._touchX  = (int)(ev.tfinger.x * SCREEN_W);
                     display._touchY  = (int)(ev.tfinger.y * SCREEN_H);
+                    if (promptServerIsActive()) {
+                        int opt = promptDialogHitTest(display._touchX, display._touchY);
+                        if (opt >= 0) promptServerCommit(opt);
+                    }
                     break;
+                }
                 case SDL_FINGERMOTION:
                     display._touchX = (int)(ev.tfinger.x * SCREEN_W);
                     display._touchY = (int)(ev.tfinger.y * SCREEN_H);
@@ -2535,6 +2977,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
                     display._touched = false;
                     break;
                 case SDL_KEYDOWN:
+                    promptServerHandleKey(ev.key.keysym.sym);  // arrow keys / enter for prompts
                     if (ev.key.keysym.sym == SDLK_ESCAPE)
                         _appRunning = 0;
                     else if (ev.key.keysym.sym == SDLK_SPACE)

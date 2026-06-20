@@ -114,6 +114,7 @@ static int telemetrySrvPair = 0, telemetrySrvSchool = 0,
 // weather + time globals are all in scope).
 static std::atomic<int> _ctrlWeatherReq{-2};      // -2 none, -1 auto, 0..6 condition
 static std::atomic<int> _ctrlTimeReq{-1};         // -1 none, 0 REAL, 1 FAST
+static std::atomic<int> _ctrlBrightnessReq{-1};   // -1 none, 0..255 backlight level
 static std::atomic<int> _ctrlFeedReq{0};          // pending food drops
 static std::atomic<int> _ctrlFishAddReq[5];       // pending adds per fish type 0..4
 static std::atomic<int> _ctrlFishDelReq[5];       // pending removes per fish type 0..4
@@ -128,6 +129,8 @@ static std::atomic<int> _ctrlCatchCount{0};
 #define CTRL_SELL_MAX 16
 static std::atomic<int> _ctrlSellFishIds[CTRL_SELL_MAX];    // fish slot indices to sell
 static std::atomic<int> _ctrlSellFishCount{0};
+static std::atomic<int> _ctrlSellSnailIds[CTRL_SELL_MAX];   // snail slot indices to sell
+static std::atomic<int> _ctrlSellSnailCount{0};
 
 // Parse the control directives out of a POST response body into the atomics above.
 // Each command type appears at most once per response (the server collapses them),
@@ -144,6 +147,7 @@ static void _telemetryParseControls(const char* body) {
     }
     if ((d = strstr(body, "!WEATHER:")) != nullptr) _ctrlWeatherReq.store(atoi(d + 9));
     if ((d = strstr(body, "!TIME:"))    != nullptr) _ctrlTimeReq.store(atoi(d + 6));
+    if ((d = strstr(body, "!BRIGHTNESS:")) != nullptr) _ctrlBrightnessReq.store(atoi(d + 12));
     if ((d = strstr(body, "!FEED:"))    != nullptr) _ctrlFeedReq.fetch_add(atoi(d + 6));
     if ((d = strstr(body, "!MODE:"))     != nullptr) _ctrlModeReq.store(atoi(d + 6));
     if ((d = strstr(body, "!BUYFOOD:"))  != nullptr) _ctrlBuyFoodReq.fetch_add(atoi(d + 9));
@@ -180,6 +184,20 @@ static void _telemetryParseControls(const char* body) {
             if (cnt >= CTRL_SELL_MAX) break;
             _ctrlSellFishIds[cnt].store(atoi(p));
             _ctrlSellFishCount.store(cnt + 1);
+            const char* c = strchr(p, ',');
+            if (!c || (nl && c > nl)) break;
+            p = c + 1;
+        }
+    }
+    // !SELLSNAIL:<slot,slot,…> — append snail slot indices to sell (drained on main thread).
+    if ((d = strstr(body, "!SELLSNAIL:")) != nullptr) {
+        const char* p = d + 11;
+        const char* nl = strchr(p, '\n');
+        while (*p && p != nl) {
+            int cnt = _ctrlSellSnailCount.load();
+            if (cnt >= CTRL_SELL_MAX) break;
+            _ctrlSellSnailIds[cnt].store(atoi(p));
+            _ctrlSellSnailCount.store(cnt + 1);
             const char* c = strchr(p, ',');
             if (!c || (nl && c > nl)) break;
             p = c + 1;
@@ -255,13 +273,13 @@ static std::string _buildTelemetryJson() {
     snprintf(tmp, sizeof(tmp),
         "{\"aquarium_id\":\"%s\",\"device_id\":\"%s\",\"platform\":\"pi\",\"fw_version\":\"%s\","
         "\"uptime_ms\":%u,\"tick\":%d,\"frame_ms\":%d,"
-        "\"screen\":{\"w\":%d,\"h\":%d,\"tank_top\":%d},"
+        "\"screen\":{\"w\":%d,\"h\":%d,\"tank_top\":%d,\"brightness\":%d},"
         "\"weather\":{\"condition\":%d,\"name\":\"%s\",\"override\":%s},"
         "\"time\":{\"day_progress\":%.4f,\"mode\":\"%s\"},"
         "\"counts\":{\"pair\":%d,\"school\":%d,\"school2\":%d,\"angel\":%d,\"salmon\":%d},",
         activeAquariumId, TELEMETRY_DEVICE_ID, FIRMWARE_VERSION,
         (unsigned)millis(), (int)tick, FRAME_MS,
-        SCREEN_W, SCREEN_H, TANK_TOP,
+        SCREEN_W, SCREEN_H, TANK_TOP, (int)displayBrightness,
         wc, _weatherName(wc), (weatherOverrideIdx >= 0) ? "true" : "false",
         getDayProgress(), (currentTimeMode == TIME_FAST) ? "FAST" : "REAL",
         numPair, numSchool, numSchool2, numAngel, numSalmon);
@@ -276,14 +294,14 @@ static std::string _buildTelemetryJson() {
         snprintf(tmp, sizeof(tmp),
             "%s{\"id\":%d,\"x\":%.1f,\"y\":%.1f,\"z\":%.3f,"
             "\"vx\":%.2f,\"vy\":%.2f,\"vz\":%.4f,"
-            "\"tx\":%.1f,\"ty\":%.1f,\"tz\":%.3f,\"wander_cd\":%d,"
+            "\"tx\":%.1f,\"ty\":%.1f,\"tz\":%.3f,\"wander_cd\":%.2f,\"idle_cd\":%.2f,"
             "\"type\":%d,\"facing_right\":%s,"
             "\"color\":%u,\"going_for_food\":%s,\"chasing\":%s,"
-            "\"age\":%d,\"scale\":%.3f,\"xp\":%d,\"fish_luck\":%.3f}",
+            "\"age\":%d,\"scale\":%.3f,\"xp\":%d,\"fish_luck\":%.3f,\"wander_q\":[",
             first ? "" : ",", i,
             f.x, f.y, f.z,
             f.vx, f.vy, f.vz,
-            f.tx, f.ty, f.tz, (int)f.wanderCD,
+            f.tx, f.ty, f.tz, f.wanderCD, f.idleCD,
             (int)f.type,
             f.facingRight ? "true" : "false",
             (unsigned)fishColor(i),
@@ -291,6 +309,14 @@ static std::string _buildTelemetryJson() {
             f.chasing ? "true" : "false",
             (int)f.age, fishScale(f), (int)f.xp, f.fishLuck);
         j += tmp;
+        // Upcoming wander targets the web should seek next: [wcd, tx, ty, tz, chasing].
+        for (uint8_t q = 0; q < f.wanderQN; q++) {
+            WanderMove& m = f.wanderQ[q];
+            snprintf(tmp, sizeof(tmp), "%s[%.2f,%.1f,%.1f,%.3f,%d]",
+                q ? "," : "", m.wcd, m.tx, m.ty, m.tz, m.chasing ? 1 : 0);
+            j += tmp;
+        }
+        j += "]}";
         first = false;
     }
     j += "],";
@@ -310,12 +336,14 @@ static std::string _buildTelemetryJson() {
 
     // Snail / starfish / boat
     snprintf(tmp, sizeof(tmp),
-        "\"snail\":{\"x\":%d,\"facing_right\":%s},"
-        "\"starfish\":{\"x\":%d,\"facing_right\":%s},"
-        "\"boat\":{\"active\":%s,\"x\":%d},",
-        (int)snail.x, snail.facingRight ? "true" : "false",
-        (int)starfish.x, starfish.facingRight ? "true" : "false",
-        boat.active ? "true" : "false", (int)boat.x);
+        "\"snail\":{\"x\":%d,\"spd\":%.3f,\"vx\":%.3f,\"facing_right\":%s},"
+        "\"starfish\":{\"x\":%d,\"spd\":%.3f,\"vx\":%.3f,\"facing_right\":%s},"
+        "\"boat\":{\"active\":%s,\"x\":%d,\"vx\":%.3f},",
+        (int)snail.x, snail.spd, snail.facingRight ? snail.spd : -snail.spd,
+        snail.facingRight ? "true" : "false",
+        (int)starfish.x, starfish.spd, starfish.facingRight ? starfish.spd : -starfish.spd,
+        starfish.facingRight ? "true" : "false",
+        boat.active ? "true" : "false", (int)boat.x, boat.active ? -0.5f : 0.0f);
     j += tmp;
 
     // Plant layout (near-static decor)
@@ -383,9 +411,17 @@ static std::string _buildTelemetryJson() {
     first = true;
     for (int i = 0; i < numSnails; i++) {
         if (!coinSnails[i].active) continue;
-        snprintf(tmp, sizeof(tmp), "%s{\"x\":%.1f,\"spd\":%.3f,\"facing_right\":%s}",
-            first ? "" : ",", coinSnails[i].x, coinSnails[i].spd,
-            coinSnails[i].facingRight ? "true" : "false");
+        // "id" is the slot index (active snails are contiguous) — the web echoes it back
+        // in !SELLSNAIL, matching the fish convention.
+        snprintf(tmp, sizeof(tmp),
+            "%s{\"id\":%d,\"type\":%d,\"x\":%.1f,\"spd\":%.3f,\"vx\":%.3f,\"facing_right\":%s,"
+            "\"age\":%d,\"scale\":%.3f,\"stage\":%d,\"xp\":%d,\"snail_luck\":%.3f,"
+            "\"stamina\":%d,\"asleep\":%s}",
+            first ? "" : ",", i, coinSnails[i].type,
+            coinSnails[i].x, coinSnails[i].spd, coinSnails[i].lastVx, coinSnails[i].facingRight ? "true" : "false",
+            (int)coinSnails[i].age, snailScaleOf(coinSnails[i].age), snailStage(coinSnails[i].age),
+            coinSnails[i].xp, coinSnails[i].snailLuck,
+            (int)coinSnails[i].stamina, coinSnails[i].asleep ? "true" : "false");
         j += tmp; first = false;
     }
     j += "]}";
@@ -605,8 +641,8 @@ static void _applyBootstrap(const char* json) {
         }
         // Null-terminate a local copy of this fish object
         size_t objLen = (size_t)(end - p);
-        if (objLen >= 512) { p = end; continue; }
-        char obj[512]; memcpy(obj, p, objLen); obj[objLen] = '\0';
+        if (objLen >= 768) { p = end; continue; }   // headroom for the wander_q array
+        char obj[768]; memcpy(obj, p, objLen); obj[objLen] = '\0';
 
         int id = -1;
         if (!_jGetInt(obj, "id", &id) || id < 0 || id >= MAX_FISH || !isFishActive(id)) {
@@ -621,7 +657,8 @@ static void _applyBootstrap(const char* json) {
         if (_jGetFloat(obj, "vy",      &fv)) f.vy       = fv;
         if (_jGetInt(obj, "tx",        &iv)) f.tx       = (float)iv;
         if (_jGetInt(obj, "ty",        &iv)) f.ty       = (float)iv;
-        if (_jGetInt(obj, "wander_cd", &iv)) f.wanderCD = (float)iv;
+        if (_jGetFloat(obj, "wander_cd", &fv)) f.wanderCD = fv;
+        if (_jGetFloat(obj, "idle_cd", &fv)) f.idleCD = fv;
         if (_jGetBool(obj, "chasing",  &bv)) f.chasing  = bv;
         if (_jGetInt(obj, "age",       &iv)) f.age      = (float)iv;
         if (_jGetInt(obj, "xp",        &iv)) f.xp       = iv;
@@ -736,11 +773,17 @@ static void _applyServerProfile(const char* json) {
         char sobjs[MAX_SNAILS][256];
         int nc = _parseObjArray(snp, sobjs, MAX_SNAILS);
         for (int i = 0; i < nc && numSnails < MAX_SNAILS; i++) {
-            int x; float spd; bool fr;
+            int x, iv; float fv; bool fr;
             CoinSnail& s = coinSnails[numSnails];
+            s.type        = 0;
             s.x           = _jGetInt(sobjs[i], "x", &x)              ? (float)x : frandr(80, SCREEN_W - 80);
-            s.spd         = _jGetFloat(sobjs[i], "spd", &spd)        ? spd      : frandr(1.5f, 2.5f);
+            s.spd         = _jGetFloat(sobjs[i], "spd", &fv)         ? fv       : SNAIL_BASE_SPD;
             s.facingRight = _jGetBool(sobjs[i], "facing_right", &fr) ? fr       : true;
+            s.age         = _jGetInt(sobjs[i], "age", &iv)           ? (float)iv : 0.0f;
+            s.xp          = _jGetInt(sobjs[i], "xp", &iv)            ? iv        : 0;
+            s.snailLuck   = _jGetFloat(sobjs[i], "snail_luck", &fv)  ? fv        : 0.0f;
+            s.stamina     = _jGetFloat(sobjs[i], "stamina", &fv)     ? fv        : SNAIL_STAMINA_MAX;
+            s.asleep      = false;
             s.active      = true;
             numSnails++;
         }
@@ -761,6 +804,56 @@ static void telemetryBootstrap() {
         _applyServerProfile(_bootstrapJson);
     else
         printf("Telemetry: no saved profile on server (keeping local tank)\n");
+}
+
+// ── Local state persistence (offline-safe restore) ───────────────────────────
+// The server is the source of truth when reachable, but the Pi also mirrors its
+// tank to a local file every LOCAL_SAVE_INTERVAL_MS. On boot, if the server has
+// no profile to restore (offline, telemetry off, or never synced), the tank is
+// rebuilt from this file so a power cycle can't wipe career progress.
+#ifndef LOCAL_STATE_PATH
+#define LOCAL_STATE_PATH "aquarium-state.json"
+#endif
+#ifndef LOCAL_SAVE_INTERVAL_MS
+#define LOCAL_SAVE_INTERVAL_MS 30000   // 30 s
+#endif
+static uint32_t _lastLocalSaveMs = 0;
+
+// Restore the tank from the last local snapshot. Returns true if applied.
+static bool localStateLoad() {
+    FILE* f = fopen(LOCAL_STATE_PATH, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz >= (long)sizeof(_bootstrapJson)) { fclose(f); return false; }
+    size_t n = fread(_bootstrapJson, 1, (size_t)sz, f);
+    fclose(f);
+    _bootstrapJson[n] = '\0';
+    if (!strstr(_bootstrapJson, "\"exists\":true")) return false;
+    _applyServerProfile(_bootstrapJson);   // sets telemetryProfileLoaded
+    printf("LocalState: tank restored from local save (%s)\n", LOCAL_STATE_PATH);
+    return true;
+}
+
+// Mirror the current tank to disk, rate-limited. Safe to call every loop().
+// Writes a temp file then renames it over the live save (atomic on POSIX), so a
+// crash/power loss mid-write can't corrupt the restorable copy. Reuses the
+// telemetry snapshot, injecting the "exists":true flag the restore path keys on.
+static void localStatePersist() {
+    uint32_t now = millis();
+    if (now - _lastLocalSaveMs < (uint32_t)LOCAL_SAVE_INTERVAL_MS) return;
+    _lastLocalSaveMs = now;
+    std::string json = _buildTelemetryJson();          // "{...}"
+    if (json.size() < 2 || json[0] != '{') return;
+    std::string out = "{\"exists\":true," + json.substr(1);
+    std::string tmp = std::string(LOCAL_STATE_PATH) + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) return;
+    fwrite(out.data(), 1, out.size(), f);
+    fflush(f);
+    fclose(f);
+    rename(tmp.c_str(), LOCAL_STATE_PATH);             // atomic replace
 }
 
 // Apply a pending !SWITCHAQ: point this device at a new aquarium and load its state.
@@ -853,8 +946,10 @@ static void telemetryInit() {
     if (telemetryEnabled && TELEMETRY_HOST[0] != '\0')
         printf("Telemetry: enabled → %s/api/telemetry as '%s' every %d ms\n",
                TELEMETRY_HOST, TELEMETRY_AQUARIUM_ID, TELEMETRY_INTERVAL_MS);
-    // Restore last-known state from the server before the render loop starts.
+    // Server is the source of truth when reachable; otherwise fall back to the
+    // last local snapshot so an offline reboot keeps the player's tank.
     telemetryBootstrap();
+    if (!telemetryProfileLoaded) localStateLoad();
 }
 
 // Call once per loop(); rate-limited internally by TELEMETRY_INTERVAL_MS.

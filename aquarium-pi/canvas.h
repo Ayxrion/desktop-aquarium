@@ -8,6 +8,11 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#ifdef __linux__
+#include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 static inline void _colRGB(uint32_t c, uint8_t& r, uint8_t& g, uint8_t& b) {
     r = (c >> 16) & 0xFF;
@@ -22,6 +27,56 @@ public:
     SDL_Renderer* renderer = nullptr;
     bool     _touched = false;
     int      _touchX  = 0, _touchY = 0;
+    int      _brightness = 255;
+#ifdef __linux__
+    char     _blBrightnessPath[128] = {};
+    int      _blMax = 255;
+    bool     _blProbed = false;
+
+    // Discover /sys/class/backlight once, on first brightness change (not during init).
+    void _probeBacklight() {
+        if (_blProbed) return;
+        _blProbed = true;
+        const char* force = getenv("AQUARIUM_BRIGHTNESS_SYSFS");
+        if (force && force[0] == '0') return;
+
+        DIR* dir = opendir("/sys/class/backlight");
+        if (!dir) return;
+        struct dirent* ent;
+        while ((ent = readdir(dir)) != nullptr) {
+            if (ent->d_name[0] == '.') continue;
+            char base[96];
+            snprintf(base, sizeof(base), "/sys/class/backlight/%s", ent->d_name);
+            snprintf(_blBrightnessPath, sizeof(_blBrightnessPath), "%s/brightness", base);
+            char maxPath[112];
+            snprintf(maxPath, sizeof(maxPath), "%s/max_brightness", base);
+            int mfd = open(maxPath, O_RDONLY);
+            if (mfd >= 0) {
+                char mbuf[16] = {};
+                if (read(mfd, mbuf, sizeof(mbuf) - 1) > 0)
+                    _blMax = atoi(mbuf);
+                close(mfd);
+            }
+            if (_blMax < 1) _blMax = 255;
+            break;
+        }
+        closedir(dir);
+    }
+
+    void _writeSysfsBrightness(int b) {
+        _probeBacklight();
+        if (!_blBrightnessPath[0]) return;
+        int scaled = (b * _blMax + 127) / 255;
+        if (scaled < 1) scaled = 1;
+        if (scaled > _blMax) scaled = _blMax;
+        int fd = open(_blBrightnessPath, O_WRONLY);
+        if (fd < 0) return;
+        char buf[12];
+        int n = snprintf(buf, sizeof(buf), "%d", scaled);
+        if (n > 0) write(fd, buf, (size_t)n);
+        close(fd);
+    }
+#endif
 
     bool init() {
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) < 0) {
@@ -53,8 +108,18 @@ public:
 
     int  width()  const { return 800; }
     int  height() const { return 480; }
-    void setRotation(int)    {}
-    void setBrightness(int)  {}
+    void setRotation(int) {}
+    int  brightness() const { return _brightness; }
+    void setBrightness(int b) {
+        if (b < 10) b = 10;
+        if (b > 255) b = 255;
+        _brightness = b;
+        // Do not call SDL_SetWindowBrightness — on Raspberry Pi SDL builds it can
+        // trap with SIGILL. Hardware backlight is optional via sysfs below.
+#ifdef __linux__
+        _writeSysfsBrightness(b);
+#endif
+    }
 
     void fillScreen(uint32_t col) {
         uint8_t r, g, b; _colRGB(col, r, g, b);

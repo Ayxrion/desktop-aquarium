@@ -14,6 +14,44 @@ const FISH_COUNT_KEYS = ['pair', 'school', 'school2', 'angel', 'salmon'];
 // realize their size-2 schooling via mate-pairing; Guppy/Piranha use centroid sub-schools;
 // Angel keeps its own loose grouping; Salmon are solitary.
 const FISH_SCHOOL_SIZE = [2, 6, 4, 0, 0];
+// Per-species movement temperament (mirrors device FISH_PROFILE).
+const FISH_PROFILE = [
+  { seek: 0.82, maxV: 0.72, idleChance: 0.14, idleMin: 25, idleMax: 55, wcdMin: 35, wcdMax: 95 },
+  { seek: 0.68, maxV: 0.60, idleChance: 0.28, idleMin: 45, idleMax: 130, wcdMin: 28, wcdMax: 75 },
+  { seek: 0.92, maxV: 0.85, idleChance: 0.10, idleMin: 20, idleMax: 50, wcdMin: 14, wcdMax: 48 },
+  { seek: 0.78, maxV: 0.75, idleChance: 0.18, idleMin: 30, idleMax: 85, wcdMin: 12, wcdMax: 38 },
+  { seek: 0.72, maxV: 0.68, idleChance: 0.22, idleMin: 35, idleMax: 95, wcdMin: 32, wcdMax: 85 },
+];
+function fishSubSchool(id, type, subOrder) {
+  const sz = FISH_SCHOOL_SIZE[type] || 0;
+  return sz >= 2 ? Math.floor((subOrder[type] || 0) / sz) : 0;
+}
+function fishSpeedMul(id, type, sub) {
+  const p = FISH_PROFILE[type] || FISH_PROFILE[1];
+  if (type === 1 || type === 2 || type === 3) {
+    const school = 0.93 + (hash32(type * 7919 + sub * 104729) % 15) / 100;
+    const personal = 0.96 + (hash32(id) % 9) / 100;
+    return p.maxV * school * personal;
+  }
+  return p.maxV * (0.88 + (hash32(id ^ 0x55) % 24) / 100);
+}
+function wanderCadenceMul(id, type, sub) {
+  if (type === 1 || type === 2 || type === 3) {
+    const school = 0.93 + (hash32(type * 7919 + sub * 104729) % 15) / 100;
+    const personal = 0.96 + (hash32(id) % 9) / 100;
+    return school * personal;
+  }
+  return 0.88 + (hash32(id ^ 0xab) % 24) / 100;
+}
+function extrapolatePatrolMover(m, vx, ahead, lo, hi) {
+  let x = m.x, v = vx;
+  for (let i = 0; i < ahead; i++) {
+    x += v;
+    if (x > hi) { x = hi; v = -Math.abs(v); }
+    if (x < lo) { x = lo; v = Math.abs(v); }
+  }
+  return { ...m, x, facing_right: v >= 0 };
+}
 const TANK_TOP = 72;
 const SCREEN_W = 800;
 const SCREEN_H = 480;
@@ -83,9 +121,14 @@ function rarityOf(f) {
   return r;
 }
 
-// Final display colour for a fish — type primary tinted by luck, inverted if
-// shiny. Overrides the raw telemetry colour so the tank is themed by type+luck.
+// Final display colour for a fish. The DEVICE is authoritative: every source
+// (aquarium-pi, aquarium ESP, sim.js) computes the colour from type+luck+shiny with
+// identical maths and sends the result in telemetry as `color`, so we render that
+// verbatim — recomputing it here only re-derives the same value and risks rounding/
+// input drift that shows up as a colour mismatch against the panel. The type+luck
+// fallback covers anything that arrives without a colour (older payloads, etc.).
 function fishColorInt(f) {
+  if (typeof f.color === 'number' && f.color >= 0) return f.color & 0xffffff;
   const type = f.type || 0;
   const base = FISH_PRIMARY[type] != null ? FISH_PRIMARY[type] : 0x33D17A;
   let c = lerpColorInt(base, LUCK_TINT_COLOR, fishLuck(f) * LUCK_TINT_STRENGTH);
@@ -95,249 +138,311 @@ function fishColorInt(f) {
 function fishColorHex(f) { return hex(fishColorInt(f)); }
 function fishName(f) { return f.name || `${FISH_TYPE_NAMES[f.type] || 'Fish'} #${f.id}`; }
 
-// ─── Physics simulation (mirrors device updateFish, aquarium.ino / main.cpp) ──
-const _DAMP  = 0.85;
-const _DAMPZ = 0.88;
-const SAND_Y = SCREEN_H - 20;   // floor coins rest on (matches device SAND_Y)
-const COIN_GRAV = 0.1;          // coin sink acceleration (px/frame²) — matches device
-const COIN_MAX_VY = 1.4;        // terminal sink speed (px/frame) — matches device
-const COIN_REST_FRAMES = 480;   // frames a landed coin sits before vanishing (~24s)
+// ─── Client-side prediction (real-time, in lockstep with the device) ──────────
+// The device (sim.js / aquarium-pi / aquarium ESP) stamps every snapshot with a
+// monotonic `tick` (its frame counter) and `frame_ms`. To run ALONGSIDE the panel in
+// real time — not a telemetry interval behind — we forward-simulate the device's OWN
+// fish physics from the latest snapshot up to the live edge (its current tick,
+// estimated from the snapshot cadence). That physics is deterministic and matches the
+// device exactly: the device now precomputes its upcoming wander targets and ships them
+// per fish (wander_q), so when a countdown expires we seek the SAME target it will, with
+// no random divergence. (If we ever predict past the precomputed queue we fall back to a
+// local roll, reconciled at the next snapshot.) Each snapshot is authoritative: we reseed
+// let the tiny prediction error decay away smoothly (errById) so corrections are
+// invisible — real time, no lag, no rubber-banding. The live clock also phases every
+// decorative animation, so the whole scene stays locked to the device.
 
-// Smooth motion for the non-fish movers (boat, snail, starfish, flakes). Their
-// telemetry carries no velocity, so we dead-reckon: derive each one's velocity
-// from the observed delta between the last two snapshots and extrapolate that
-// forward every frame, the same way the fish are smoothed.
-let _sceneVel = { snail: 0, starfish: 0, boat: 0 }; // px per ms
-const FLAKE_FALL_PXF = 0.7;                          // avg device fall (px/frame)
+let tickRate = 0.02;        // device ticks per local ms (EMA); 0.02 ≈ timescale 1
+let devClock = null;        // live-edge estimate of the device's CURRENT tick
+let lastSnap = null;        // most recent authoritative snapshot (display fields, non-fish movers)
+let prevSnap = null;        // the one before it (for non-fish mover velocity)
+let _lastSnapArrival = 0;
+let _needReseed = false;    // a new snapshot arrived → reseed prediction next frame
+let pred = null;            // { tick, fish:[working physics state] }, advanced each frame
+const errById = new Map();  // fish id → {ex,ey,ez} decaying prediction error (visual smoothing)
+let _frameCarry = 0;        // fractional device-frame remainder (smooth 60 fps sub-stepping)
+let _moverVel = { boat: 0, snail: 0, starfish: 0 }; // px per device-frame
+const ERR_DECAY = 0.80;     // error multiplier per device-frame (~150 ms half-life)
+const ERR_MAX = 160;        // clamp pathological corrections (px)
+const ERR_CORR_MAX_V = 3.0; // max px/device-frame a correction may move a fish — large
+                            // gaps glide to the corrected spot at swim speed, never zoom
 
-// Observed velocity (px/ms) between two snapshot positions. Returns 0 for
-// teleports/wraps (implausibly large deltas, e.g. the boat relaunching from the
-// far edge) so we don't fling objects. The cap (0.15 px/ms ≈ 150 px/s) is well
-// above any real mover — boat drift, snail/starfish crawl — but well below a
-// full-width wrap (~800 px/s).
-function _obsVel(a, b, dt) {
-  if (!a || !b || typeof a.x !== 'number' || typeof b.x !== 'number') return 0;
-  const v = (b.x - a.x) / dt;
-  return Math.abs(v) > 0.15 ? 0 : v;
+// Ease one error component toward zero. Exponential decay keeps small corrections
+// snappy, but the per-frame travel is capped (maxStep) so a large error after a long
+// telemetry gap glides smoothly instead of snapping the fish across the tank.
+function reconcileErr(e, k, maxStep) {
+  let next = e * k;
+  if (Math.abs(e - next) > maxStep) next = e - Math.sign(e) * maxStep;
+  return next;
 }
 
-function _bound(v, lo, hi, k) {
+// A snapshot's position on the device timeline. Every current source emits `tick`;
+// the fallback derives a monotonic tick from the best available clock.
+function snapTick(s) {
+  if (s && typeof s.tick === 'number') return s.tick;
+  const fm = (s && s.frame_ms) || 50;
+  const ms = (s && (s.uptime_ms != null ? s.uptime_ms : s._lastSeenMs)) || Date.now();
+  return ms / fm;
+}
+
+// Reset prediction (selection change, or a device reboot/tank switch that rewinds tick).
+function resetInterp() {
+  lastSnap = prevSnap = pred = null;
+  devClock = null; _needReseed = false; _frameCarry = 0; _lastSnapArrival = 0;
+  errById.clear();
+}
+
+// Boundary spring acceleration (device boundAccel / app boundary springs).
+function boundA(v, lo, hi, k) {
   if (v < lo) return (lo - v) * k;
   if (v > hi) return (hi - v) * k;
   return 0;
 }
 
-// Single-fish approximation used only for blend-from captures (≤250ms window).
-// Does NOT include schooling forces — good enough for a visual blend start.
-function _extrapolateFish(f, elapsedMs, frameMs) {
-  const fm  = frameMs || 50;
-  const n   = Math.round(Math.min(elapsedMs, 2000) / fm);
-  if (n === 0) return f;
-  const type = f.type || 0;
-  const chasing = f.chasing && type === 0;
-  const seek = chasing ? 0.018 : (type === 3 ? 0.020 : 0.012);
-  const maxV = f.going_for_food ? 8.0 : (chasing || type === 3) ? 7.0 : 5.5;
-  const wcd  = typeof f.wander_cd === 'number' ? f.wander_cd : n;
-  const tx = f.tx ?? f.x, ty = f.ty ?? f.y;
-  let x = f.x, y = f.y, z = f.z || 0;
-  let vx = f.vx || 0, vy = f.vy || 0, vz = f.vz || 0;
-  for (let i = 0; i < n; i++) {
-    const seeking = f.going_for_food || i < wcd;
-    let ax = (seeking ? (tx - x) * seek : 0) + _bound(x, 30, SCREEN_W - 30, 0.30);
-    let ay = (seeking ? (ty - y) * seek : 0) + _bound(y, TANK_TOP + 20, SCREEN_H - 80, 0.30);
-    let az = _bound(z, 0.0, 0.75, 0.08);
-    vx = Math.max(-maxV,      Math.min(maxV,      vx + ax)) * _DAMP;
-    vy = Math.max(-maxV*0.5,  Math.min(maxV*0.5,  vy + ay)) * _DAMP;
-    vz = Math.max(-0.015,     Math.min(0.015,     vz + az)) * _DAMPZ;
-    x  = Math.max(5,          Math.min(SCREEN_W - 5,  x + vx));
-    y  = Math.max(TANK_TOP+5, Math.min(SCREEN_H - 60, y + vy));
-    z  = Math.max(0,          Math.min(0.78,           z + vz));
+// One whole device-frame of the joint fish physics — a faithful port of the device
+// (sim.js stepPhysics / firmware updateFish): sub-school centroids, cohesion, pairwise
+// separation, target seeking, boundary springs, damping, AND wander retargeting — so
+// the fish keep roaming during long gaps between telemetry instead of gliding to a
+// stale target and stopping. Retargets drain the device-supplied wander_q so we pick the
+// same targets the device does; any residual float-rounding drift is eased onto the
+// authoritative truth on the next snapshot by the error-decay reconciliation (errById).
+function stepFishOnce(fish) {
+  const cent = {}; const order = [0, 0, 0, 0, 0];
+  for (const f of fish) {
+    const sz = FISH_SCHOOL_SIZE[f.type] || 0;
+    f._sub = sz >= 2 ? Math.floor(order[f.type] / sz) : 0;
+    order[f.type]++;
+    const k = f.type + ':' + f._sub;
+    const c = cent[k] || (cent[k] = { x: 0, y: 0, z: 0, n: 0 });
+    c.x += f.x; c.y += f.y; c.z += f.z; c.n++;
   }
-  return { ...f, x: Math.round(x), y: Math.round(y), z,
-           facing_right: Math.abs(vx) > 0.4 ? vx > 0 : f.facing_right };
+  for (const k in cent) { const c = cent[k]; c.x /= c.n; c.y /= c.n; c.z /= c.n; }
+  for (const f of fish) {
+    const t = f.type;
+    const prof = FISH_PROFILE[t] || FISH_PROFILE[1];
+    if (f.icd > 0) {
+      f.icd--;
+      if (f.wcd > 0) f.wcd -= 0.25;
+    } else if (f.wcd > 0) {
+      f.wcd--;
+    } else if (f.wq && f.wq.length) {
+      const mv = f.wq.shift();
+      f.tx = mv.tx; f.ty = mv.ty; f.tz = mv.tz; f.chasing = mv.chasing; f.wcd = mv.wcd;
+      if (Math.random() < prof.idleChance)
+        f.icd = (prof.idleMin + Math.random() * (prof.idleMax - prof.idleMin)) * wanderCadenceMul(f.id, t, f._sub);
+    } else {
+      if (t === 0) {
+        f.chasing = !f.chasing;
+        f.wcd = (prof.wcdMin + Math.random() * (prof.wcdMax - prof.wcdMin)) * wanderCadenceMul(f.id, t, f._sub);
+      } else if (t === 3) { f.wcd = (prof.wcdMin + Math.random() * (prof.wcdMax - prof.wcdMin)) * wanderCadenceMul(f.id, t, f._sub); }
+      else { f.wcd = (prof.wcdMin + Math.random() * (prof.wcdMax - prof.wcdMin)) * wanderCadenceMul(f.id, t, f._sub); }
+      if (t === 4) {
+        f.tx = 30 + Math.random() * (SCREEN_W - 60);
+        f.ty = (TANK_TOP + 20) + Math.random() * (SCREEN_H - 80 - (TANK_TOP + 20));
+      } else {
+        const cg = cent[t + ':' + f._sub];
+        const spread = t === 3 ? 120 : t === 0 ? 0 : 160;
+        f.tx = clamp(cg.x + (Math.random() * 2 - 1) * spread, 30, SCREEN_W - 30);
+        f.ty = clamp(cg.y + (Math.random() * 2 - 1) * (t === 3 ? 110 : 90), TANK_TOP + 20, SCREEN_H - 80);
+      }
+    }
+    if (f.icd > 0) {
+      f.vx *= 0.90; f.vy *= 0.90; f.vz *= 0.92;
+      let iax = boundA(f.x, 30, SCREEN_W - 30, 0.30);
+      let iay = boundA(f.y, TANK_TOP + 20, SCREEN_H - 80, 0.30);
+      let iaz = boundA(f.z, 0.0, 0.75, 0.08);
+      f.vx = Math.max(-1.2, Math.min(1.2, f.vx)) * 0.88;
+      f.vy = Math.max(-0.6, Math.min(0.6, f.vy)) * 0.88;
+      f.vz = Math.max(-0.008, Math.min(0.008, f.vz + iaz)) * 0.90;
+      f.x = Math.max(5, Math.min(SCREEN_W - 5, f.x + f.vx + iax * 0.1));
+      f.y = Math.max(TANK_TOP + 5, Math.min(SCREEN_H - 60, f.y + f.vy + iay * 0.1));
+      f.z = Math.max(0, Math.min(0.78, f.z + f.vz));
+      continue;
+    }
+    const chasing = f.chasing && t === 0;
+    const seekStr = (chasing ? 0.018 : (t === 3 ? 0.020 : 0.012)) * prof.seek;
+    const maxV = (f.going_for_food ? 8.0 : (chasing || t === 3) ? 7.0 : 5.5) * fishSpeedMul(f.id, t, f._sub);
+    let ax = (f.tx - f.x) * seekStr;
+    let ay = (f.ty - f.y) * seekStr;
+    let az = (f.tz - f.z) * 0.010;
+    const grp = cent[t + ':' + f._sub];
+    if (t === 1 || t === 2) { ax += (grp.x - f.x) * 0.010; ay += (grp.y - f.y) * 0.007; az += (grp.z - f.z) * 0.007; }
+    else if (t === 3)       { ax += (grp.x - f.x) * 0.012; ay += (grp.y - f.y) * 0.010; az += (grp.z - f.z) * 0.008; }
+    const sepR2 = t === 3 ? 60 * 60 : 80 * 80, sepK = t === 3 ? 7 : 8;
+    if (t === 1 || t === 2 || t === 3) {
+      for (const o of fish) {
+        if (o === f || o.type !== t || o._sub !== f._sub) continue;
+        const dx = f.x - o.x, dy = f.y - o.y, d2 = dx * dx + dy * dy;
+        if (d2 < sepR2 && d2 > 0.01) { const inv = sepK / d2; ax += dx * inv; ay += dy * inv; }
+      }
+    }
+    ax += boundA(f.x, 30, SCREEN_W - 30, 0.30);
+    ay += boundA(f.y, TANK_TOP + 20, SCREEN_H - 80, 0.30);
+    az += boundA(f.z, 0.0, 0.75, 0.08);
+    f.vx = Math.max(-maxV, Math.min(maxV, f.vx + ax)) * 0.85;
+    f.vy = Math.max(-maxV * 0.5, Math.min(maxV * 0.5, f.vy + ay)) * 0.85;
+    f.vz = Math.max(-0.015, Math.min(0.015, f.vz + az)) * 0.88;
+    f.x = Math.max(5, Math.min(SCREEN_W - 5, f.x + f.vx));
+    f.y = Math.max(TANK_TOP + 5, Math.min(SCREEN_H - 60, f.y + f.vy));
+    f.z = Math.max(0, Math.min(0.78, f.z + f.vz));
+    if (Math.abs(f.vx) > 0.4) f.facing_right = f.vx > 0;
+  }
 }
+function stepFishN(fish, n) { for (let i = 0; i < n; i++) stepFishOnce(fish); }
 
-// Joint simulation: all fish stepped together each frame so school centroids
-// and pairwise separation forces update correctly — matching device updateFish().
-function _extrapolateSnapshot(snap, elapsedMs) {
-  if (!snap) return snap;
-  const fm = snap.frame_ms || 50;
-  const e  = Math.min(Math.max(elapsedMs, 0), 2000);
-  const n  = Math.round(e / fm);
-  const hasFish = Array.isArray(snap.fish) && snap.fish.length > 0;
-
-  let fishOut = snap.fish;
-  if (hasFish && n > 0) {
-  // Working copies of mutable state
-  const st = snap.fish.map((f) => ({
+// Working physics copy of a snapshot's fish (only the fields the stepper mutates).
+function makePredFish(snap) {
+  return (snap.fish || []).map((f) => ({
     id: f.id, type: f.type || 0,
     x: f.x, y: f.y, z: f.z || 0,
     vx: f.vx || 0, vy: f.vy || 0, vz: f.vz || 0,
-    tx: f.tx ?? f.x, ty: f.ty ?? f.y,
-    wcd: typeof f.wander_cd === 'number' ? f.wander_cd : n,
+    tx: f.tx != null ? f.tx : f.x, ty: f.ty != null ? f.ty : f.y,
+    tz: typeof f.tz === 'number' ? f.tz : (f.z || 0),
+    wcd: typeof f.wander_cd === 'number' ? f.wander_cd : 30,
+    icd: typeof f.idle_cd === 'number' ? f.idle_cd : 0,
+    // Upcoming wander targets the device precomputed: [wcd, tx, ty, tz, chasing]. We pop
+    // these instead of rolling our own random target, so we seek exactly what the device
+    // will — eliminating the only prediction divergence between snapshots.
+    wq: Array.isArray(f.wander_q)
+      ? f.wander_q.map((a) => ({ wcd: a[0], tx: a[1], ty: a[2], tz: a[3], chasing: !!a[4] }))
+      : [],
     chasing: !!f.chasing, going_for_food: !!f.going_for_food,
     facing_right: f.facing_right,
   }));
+}
 
-  for (let frame = 0; frame < n; frame++) {
-    // Recompute sub-school centroids each frame. Schooling types split into schools of
-    // at most FISH_SCHOOL_SIZE[t]; each fish gets `_sub` = its school index and coheres to
-    // that school's centroid (so beyond the cap, fish form a separate school). Non-schooling
-    // types (size 0, e.g. Angel/Salmon) collapse to one group (_sub 0).
-    const cent = {};                 // key `${type}:${sub}` -> {x,y,z,n}
-    const order = [0, 0, 0, 0, 0];
-    for (const f of st) {
-      const sz = FISH_SCHOOL_SIZE[f.type] || 0;
-      f._sub = sz >= 2 ? Math.floor(order[f.type] / sz) : 0;
-      order[f.type]++;
-      const k = f.type + ':' + f._sub;
-      const c = cent[k] || (cent[k] = { x: 0, y: 0, z: 0, n: 0 });
-      c.x += f.x; c.y += f.y; c.z += f.z; c.n++;
+// Reseed prediction from a freshly arrived authoritative snapshot, aligned to the live
+// edge (devNow). Capture the currently-shown offset as a decaying error so the visual
+// stays put and eases onto the corrected trajectory — no snap.
+function reseedPrediction(snap, devNow) {
+  const auth = makePredFish(snap);
+  stepFishN(auth, Math.max(0, Math.round(devNow - snapTick(snap))));
+  if (pred && pred.fish.length) {
+    stepFishN(pred.fish, Math.max(0, Math.round(devNow - pred.tick)));
+    const oldById = new Map(pred.fish.map((f) => [f.id, f]));
+    for (const a of auth) {
+      const p = oldById.get(a.id);
+      if (!p) { errById.delete(a.id); continue; }
+      const e = errById.get(a.id) || { ex: 0, ey: 0, ez: 0 };
+      errById.set(a.id, {
+        ex: clamp((p.x + e.ex) - a.x, -ERR_MAX, ERR_MAX),
+        ey: clamp((p.y + e.ey) - a.y, -ERR_MAX, ERR_MAX),
+        ez: clamp((p.z + e.ez) - a.z, -1, 1),
+      });
     }
-    for (const k in cent) { const c = cent[k]; c.x /= c.n; c.y /= c.n; c.z /= c.n; }
+  } else {
+    errById.clear();
+  }
+  const ids = new Set(auth.map((a) => a.id));
+  for (const id of [...errById.keys()]) if (!ids.has(id)) errById.delete(id);
+  pred = { tick: devNow, fish: auth };
+}
 
-    for (const f of st) {
-      const t = f.type;
-      const chasing = f.chasing && t === 0;
-      const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
-      const maxV    = f.going_for_food ? 8.0 : (chasing || t === 3) ? 7.0 : 5.5;
+// Velocity (px/device-frame) of a slow mover between the last two snapshots; 0 for
+// teleports/wraps so it never flings across the tank.
+function moverVel(a, b) {
+  if (!a || !b || typeof a.x !== 'number' || typeof b.x !== 'number') return 0;
+  const dt = snapTick(b) - snapTick(a);
+  if (dt <= 0) return 0;
+  const v = (b.x - a.x) / dt;
+  return Math.abs(v) > 8 ? 0 : v;
+}
 
-      // Always seek the last-known target. The device keeps seeking (tx,ty,tz)
-      // every frame in its wander branch; it only swaps to a fresh *random*
-      // target when wander_cd expires — which we can't predict — so holding the
-      // last target is far closer than the old "stop seeking" behaviour.
-      let ax = (f.tx - f.x) * seekStr;
-      let ay = (f.ty - f.y) * seekStr;
-      let az = (f.tz - f.z) * 0.010;
-
-      // Cohesion toward this fish's sub-school centroid — Guppy/Piranha shoal in schools
-      // capped at FISH_SCHOOL_SIZE (beyond it, a new school forms); Angel keeps one loose group.
-      const grp = cent[t + ':' + f._sub];
-      if (t === 1 || t === 2) {
-        ax += (grp.x - f.x) * 0.010;
-        ay += (grp.y - f.y) * 0.007;
-        az += (grp.z - f.z) * 0.007;
-      } else if (t === 3) {
-        ax += (grp.x - f.x) * 0.012;
-        ay += (grp.y - f.y) * 0.010;
-        az += (grp.z - f.z) * 0.008;
-      }
-
-      // Pairwise separation within the same sub-school.
-      const sepR2 = (t === 3) ? 60 * 60 : 80 * 80;
-      const sepK  = (t === 3) ? 7 : 8;
-      if (t === 1 || t === 2 || t === 3) {
-        for (const o of st) {
-          if (o === f || o.type !== t || o._sub !== f._sub) continue;
-          const dx = f.x - o.x, dy = f.y - o.y;
-          const d2 = dx * dx + dy * dy;
-          if (d2 < sepR2 && d2 > 0.01) { const inv = sepK / d2; ax += dx * inv; ay += dy * inv; }
-        }
-      }
-
-      // Boundary springs (x, y, z)
-      ax += _bound(f.x, 30, SCREEN_W - 30, 0.30);
-      ay += _bound(f.y, TANK_TOP + 20, SCREEN_H - 80, 0.30);
-      az += _bound(f.z, 0.0, 0.75, 0.08);
-
-      f.vx = Math.max(-maxV,     Math.min(maxV,     f.vx + ax)) * _DAMP;
-      f.vy = Math.max(-maxV*0.5, Math.min(maxV*0.5, f.vy + ay)) * _DAMP;
-      f.vz = Math.max(-0.015,    Math.min(0.015,    f.vz + az)) * _DAMPZ;
-      f.x  = Math.max(5,         Math.min(SCREEN_W - 5,  f.x + f.vx));
-      f.y  = Math.max(TANK_TOP+5,Math.min(SCREEN_H - 60, f.y + f.vy));
-      f.z  = Math.max(0,         Math.min(0.78,          f.z + f.vz));
-      if (Math.abs(f.vx) > 0.4) f.facing_right = f.vx > 0;
+// Ingest a freshly received snapshot: calibrate the live clock, stash it (+ the prior
+// one for mover velocity), and flag a reseed for the next frame. Dedupes stale/equal
+// ticks and restarts on a backward jump (reboot / tank switch).
+function acceptSnapshot(snap) {
+  const tick = snapTick(snap);
+  const arrival = Date.now();
+  if (lastSnap) {
+    const last = snapTick(lastSnap);
+    if (tick <= last) {
+      if (tick < last - 5) resetInterp(); // reboot / switch → fresh
+      else return;                        // duplicate / stale
+    } else {
+      const inst = (tick - last) / Math.max(1, arrival - _lastSnapArrival);
+      tickRate = clamp(tickRate * 0.8 + inst * 0.2, 0.002, 0.5);
     }
   }
+  prevSnap = lastSnap;
+  lastSnap = snap;
+  _lastSnapArrival = arrival;
+  if (prevSnap) {
+    _moverVel = {
+      boat: (prevSnap.boat && snap.boat && prevSnap.boat.active && snap.boat.active)
+            ? moverVel(prevSnap.boat, snap.boat) : 0,
+      snail: moverVel(prevSnap.snail, snap.snail),
+      starfish: moverVel(prevSnap.starfish, snap.starfish),
+    };
+  }
+  // Discipline the live-edge clock toward the new observation (absorbs latency jitter
+  // and clock skew). It ends ~one network-latency behind the device's true tick — the
+  // best achievable, far tighter than an interpolation interval.
+  if (devClock == null || Math.abs(tick - devClock) > 80) devClock = tick;
+  else devClock += (tick - devClock) * 0.2;
+  _needReseed = true;
+}
 
-  fishOut = snap.fish.map((orig, i) => ({
-    ...orig,
-    x: st[i].x, y: st[i].y, z: st[i].z,
-    vx: st[i].vx, vy: st[i].vy, vz: st[i].vz,
-    facing_right: st[i].facing_right,
-  }));
+// Build the render snapshot at the live edge: predicted fish (with smoothed error)
+// plus non-fish movers extrapolated forward by their observed velocity.
+function buildRenderSnap(devNow) {
+  const base = lastSnap;
+  if (!base) return null;
+  const ahead = Math.max(0, devNow - snapTick(base));
+  const out = { ...base };
+
+  if (pred) {
+    const dispById = new Map((base.fish || []).map((f) => [f.id, f]));
+    out.fish = pred.fish.map((f) => {
+      const e = errById.get(f.id) || { ex: 0, ey: 0, ez: 0 };
+      const disp = dispById.get(f.id) || {};
+      return {
+        ...disp, id: f.id, type: f.type,
+        x: f.x + f.vx * _frameCarry + e.ex,
+        y: f.y + f.vy * _frameCarry + e.ey,
+        z: clamp(f.z + e.ez, 0, 0.85),
+        vx: f.vx, vy: f.vy, facing_right: f.facing_right,
+      };
+    });
   }
 
-  const out = { ...snap, fish: fishOut };
-  _predictCareerMovers(out, snap, n);
-
-  // Dead-reckon the non-fish decorative movers from their observed velocity.
-  if (snap.snail && typeof snap.snail.x === 'number')
-    out.snail = { ...snap.snail, x: snap.snail.x + _sceneVel.snail * e };
-  if (snap.starfish && typeof snap.starfish.x === 'number')
-    out.starfish = { ...snap.starfish, x: snap.starfish.x + _sceneVel.starfish * e };
-  if (snap.boat && typeof snap.boat.x === 'number')
-    out.boat = { ...snap.boat, x: snap.boat.x + _sceneVel.boat * e };
-  if (Array.isArray(snap.flakes)) {
-    const frames = e / fm;
-    out.flakes = snap.flakes.map((fl, i) => ({
-      ...fl,
-      x: fl.x + Math.sin(animTick * 0.03 + i * 0.9) * 0.5,
-      y: Math.min(SCREEN_H - 4, fl.y + FLAKE_FALL_PXF * frames),
-    }));
+  if (base.boat && typeof base.boat.x === 'number') {
+    const vx = base.boat.active ? (typeof base.boat.vx === 'number' ? base.boat.vx : -0.5) : 0;
+    out.boat = { ...base.boat, x: base.boat.x + vx * ahead };
   }
+  if (base.snail && typeof base.snail.x === 'number') {
+    const vx = typeof base.snail.vx === 'number' ? base.snail.vx
+      : (base.snail.facing_right ? (base.snail.spd || 0.18) : -(base.snail.spd || 0.18));
+    out.snail = extrapolatePatrolMover(base.snail, vx, ahead, 55, SCREEN_W - 55);
+  }
+  if (base.starfish && typeof base.starfish.x === 'number') {
+    const vx = typeof base.starfish.vx === 'number' ? base.starfish.vx
+      : (base.starfish.facing_right ? (base.starfish.spd || 0.15) : -(base.starfish.spd || 0.15));
+    out.starfish = extrapolatePatrolMover(base.starfish, vx, ahead, 40, SCREEN_W - 40);
+  }
+  if (Array.isArray(base.snails)) {
+    out.snails = base.snails.map((sn) => {
+      if (sn.asleep) return { ...sn };
+      const vx = typeof sn.vx === 'number' ? sn.vx
+        : (sn.facing_right ? (sn.spd || 0.28) : -(sn.spd || 0.28));
+      return extrapolatePatrolMover(sn, vx, ahead, 55, SCREEN_W - 55);
+    });
+  }
+  if (Array.isArray(base.wanderers))
+    out.wanderers = base.wanderers.map((w) => ({ ...w, x: w.x + (w.vx || 0) * ahead }));
+  if (Array.isArray(base.loot))
+    out.loot = base.loot.map((it) => ({ ...it, y: it.y + (it.vy || 0) * ahead }));
+  if (Array.isArray(base.flakes))
+    out.flakes = base.flakes.map((fl) => ({ ...fl, y: Math.min(SCREEN_H - 4, fl.y + 0.7 * ahead) }));
   return out;
 }
 
-// Career loot/wanderers/collector-snails move deterministically on the device,
-// so we can step them forward exactly (no blend needed). Mirrors updateCareer():
-//   coins:     vy += 0.2 (cap 2.8), sink to SAND_Y, then ttl counts down
-//   wanderers: x += vx,  y += sin((tick+f)*0.05 + bob) * 0.6
-//   snails:    patrol at spd, bouncing between x=55 and x=SCREEN_W-55
-function _predictCareerMovers(out, snap, n) {
-  if (n <= 0) return;
-  const baseTick = typeof snap.tick === 'number' ? snap.tick : 0;
-
-  if (Array.isArray(snap.loot)) {
-    out.loot = snap.loot.map((it) => {
-      let y = it.y, vy = it.vy || 0;
-      let landed = !!it.landed;
-      let ttl = typeof it.ttl === 'number' ? it.ttl : 9999;
-      const isCoin = it.kind === 'coin';
-      for (let f = 0; f < n; f++) {
-        if (isCoin && !landed) {
-          vy = Math.min(vy + COIN_GRAV, COIN_MAX_VY);
-          y += vy;
-          if (y >= SAND_Y) { y = SAND_Y; landed = true; ttl = COIN_REST_FRAMES; }
-        } else {
-          ttl -= 1;
-        }
-      }
-      return { ...it, y, vy, landed, ttl };
-    }).filter((it) => it.ttl > 0);
-  }
-
-  if (Array.isArray(snap.wanderers)) {
-    out.wanderers = snap.wanderers.map((w) => {
-      let x = w.x, y = w.y;
-      const vx = w.vx || 0, bob = w.bob || 0;
-      for (let f = 0; f < n; f++) {
-        x += vx;
-        y += Math.sin((baseTick + f) * 0.05 + bob) * 0.6;
-      }
-      return { ...w, x, y };
-    }).filter((w) => w.x > -40 && w.x < SCREEN_W + 40);
-  }
-
-  if (Array.isArray(snap.snails)) {
-    out.snails = snap.snails.map((s) => {
-      let x = s.x;
-      let dir = s.facing_right ? 1 : -1;
-      const spd = s.spd || 0;
-      for (let f = 0; f < n; f++) {
-        x += dir * spd;
-        if (x > SCREEN_W - 55) { x = SCREEN_W - 55; dir = -1; }
-        if (x < 55)            { x = 55;            dir = 1; }
-      }
-      return { ...s, x, facing_right: dir > 0 };
-    });
-  }
-}
-
 // ─── Faithful scene renderer (mirrors device aquarium.ino / main.cpp) ─────────
-// Decorative animations (sway, water, bubbles, smoke) are driven by animTick,
-// expressed in device "tick" units (one per 50ms) so the device's sin() phase
-// constants port over unchanged. Updated once per rAF frame in _rafDraw.
+// Decorative animations (sway, water, bubbles, smoke) are driven by animTick, which
+// _rafDraw sets to the playhead — i.e. the actual device `tick` being rendered. The
+// device's own sway is phased off the same `tick` with the same sin() constants, so
+// they port over unchanged AND track the device's timescale (faster tick → faster
+// sway) instead of wall-clock. One clock for positions and decoration alike.
 let animTick = 0;
 
 // Bumpy sand bed: three layered sine waves, same as the device terrainY[].
@@ -363,6 +468,15 @@ function fishSellValue(f) {
     + Math.round(fishLuck(f) * 15)
     + Math.min(Math.floor((f.xp || 0) / 100), 8)
     + (isShiny(f) ? 12 : 0);
+}
+
+// Snail sand-bed species — quality/size/value mirror the device (sim.js snailSellValue).
+const SNAIL_BASE_SELL = 8;
+function snailLuck(s) { return clamp(typeof s.snail_luck === 'number' ? s.snail_luck : 0, 0, 1); }
+function snailGrowth(s) { return typeof s.scale === 'number' ? clamp(s.scale, 0.3, 1) : 1; }
+function snailSellValue(s) {
+  return SNAIL_BASE_SELL + Math.round(SNAIL_BASE_SELL * snailGrowth(s))
+    + Math.round(snailLuck(s) * 15) + Math.min(Math.floor((s.xp || 0) / 100), 8);
 }
 
 // Fish text size / half-width (device units) — drives shadow + glyph scale.
@@ -799,11 +913,16 @@ function drawFlake(f) {
 function drawSnail(sn, collector = false) {
   const bx = Math.round(sn.x), by = terrainY[clamp(bx, 0, SCREEN_W - 1)];
   const d = sn.facing_right ? 1 : -1;
-  // Coin-collector snails wear an emerald "helper" shell so they read as a
-  // different, useful critter; pond snails keep the earthy brown shell.
+  // Snail SPECIES (the `snails` array) wear an emerald shell so they read as a distinct,
+  // useful critter; the decorative pond snail keeps the earthy brown shell.
   const BODY  = collector ? 0x8FD89A : 0xDDB060;
   const SHELL = collector ? 0x1F6B47 : 0x7A2E0A;
   const SWIRL = collector ? 0x5FE0A0 : 0xB05020;
+  // Growth: snails hatch small and grow through 3 stages — scale the whole shape about
+  // its footprint (bx,by). Decorative pond snail has no scale field → full size.
+  const s = typeof sn.scale === 'number' ? clamp(sn.scale, 0.3, 1) : 1;
+  ctx.save();
+  ctx.translate(bx, by); ctx.scale(s, s); ctx.translate(-bx, -by);
   fcirc(bx - d * 4, by - 8, 8, SHELL);             // shell
   scirc(bx - d * 3, by - 8, 5, SWIRL);             // swirl
   scirc(bx - d * 2, by - 8, 2, SWIRL);
@@ -814,6 +933,17 @@ function drawSnail(sn, collector = false) {
   seg(bx + d * 12, by - 9, bx + d * 14, by - 15);
   fcirc(bx + d * 6, by - 15, 2, BODY); fcirc(bx + d * 14, by - 15, 2, BODY);
   fcirc(bx + d * 6, by - 15, 1, 0x111111); fcirc(bx + d * 14, by - 15, 1, 0x111111);
+  ctx.restore();
+  // Sleeping snails tuck in and show drifting "z"s above the shell.
+  if (sn.asleep) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(200,220,255,0.85)';
+    ctx.font = '9px monospace';
+    const zx = bx - d * 4, zy = by - 8 - 12 * s;
+    ctx.fillText('z', zx + 2, zy - 2);
+    ctx.fillText('z', zx + 7, zy - 8);
+    ctx.restore();
+  }
 }
 
 function drawStarfish(st) {
@@ -960,7 +1090,7 @@ function drawPulses() {
   ctx.save();
   for (let i = pulses.length - 1; i >= 0; i--) {
     const p = pulses[i];
-    const life = p.kind === 'tap' ? 420 : 620;
+    const life = p.kind === 'tap' ? 420 : p.kind === 'shine' ? 880 : 620;
     const t = (now - p.t0) / life;
     if (t >= 1) { pulses.splice(i, 1); continue; }
     const ease = 1 - (1 - t) * (1 - t);   // ease-out expansion
@@ -971,6 +1101,25 @@ function drawPulses() {
       ctx.lineWidth = 1.5;
       ctx.strokeStyle = rgbaFromHex('#bfe6ff', a * 0.38);
       ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.stroke();
+    } else if (p.kind === 'shine') {
+      const col = p.color || '#ffe566';
+      const r0 = 6 + ease * 16, r1 = 10 + ease * 28;
+      ctx.lineWidth = 2.5;
+      ctx.strokeStyle = rgbaFromHex(col, a);
+      ctx.beginPath(); ctx.arc(p.x, p.y, r1, 0, Math.PI * 2); ctx.stroke();
+      ctx.strokeStyle = rgbaFromHex('#fff8cc', a * 0.85);
+      ctx.beginPath(); ctx.arc(p.x, p.y, r0, 0, Math.PI * 2); ctx.stroke();
+      const spark = 8 + ease * 24;
+      ctx.lineWidth = 2;
+      for (let k = 0; k < 8; k++) {
+        const ang = (k / 8) * Math.PI * 2 + t * 1.2;
+        const c = Math.cos(ang), s = Math.sin(ang);
+        ctx.strokeStyle = rgbaFromHex(col, a * 0.95);
+        ctx.beginPath();
+        ctx.moveTo(p.x + c * spark, p.y + s * spark);
+        ctx.lineTo(p.x + c * (spark + 8), p.y + s * (spark + 8));
+        ctx.stroke();
+      }
     } else {
       const col = p.color || '#ffd23f';
       const r = 8 + ease * 26;
@@ -993,16 +1142,9 @@ function drawPulses() {
   ctx.restore();
 }
 
-// Dead-reckoning blend: when a new snapshot arrives, fish positions snap from the
-// old extrapolation to the new one. We lerp over BLEND_MS to hide the discontinuity.
-const BLEND_MS = 250;
-let _blendFrom = new Map(); // fishId → {x, y} at the moment the new snapshot arrived
-let _blendStartMs = 0;
-// The boat's telemetry is sparse (≤1 Hz) and dead-reckoned between snapshots, so
-// it snaps when a new snapshot lands. Capture its predicted x at that moment and
-// lerp to the new trajectory over BLEND_MS, exactly like the fish. null = no blend
-// (first snapshot, or a relaunch teleport where sliding across would look wrong).
-let _blendBoatFrom = null;
+// Playback timing: the rAF loop's previous wall-clock timestamp (to advance the
+// playhead by real elapsed time × the device's measured tick-rate).
+let _lastRafMs = 0;
 
 const els = {
   list: document.getElementById('aquarium-list'),
@@ -1039,7 +1181,6 @@ const els = {
   hudCoins: document.getElementById('hud-coins'),
   hudShells: document.getElementById('hud-shells'),
   hudFood: document.getElementById('hud-food'),
-  hudSnails: document.getElementById('hud-snails'),
   hudLuck: document.getElementById('hud-luck'),
   hudMeals: document.getElementById('hud-meals'),
   modeSeg: document.getElementById('mode-seg'),
@@ -1290,9 +1431,11 @@ function renderList(items) {
     li.className = (a.aquarium_id === selectedId ? 'active' : '') + (a.stale ? ' stale-row' : '');
     const weather = a.weather ? (WEATHER_NAMES[a.weather.condition] || '?') : '—';
     const title = a.name || a.aquarium_id;
-    // Source badge: a live device drives the tank, otherwise the server web-simulates it.
+    // Source badge: live device, offline device (frozen), or server web sim.
     const src = (a.device && a.device.online)
       ? `<span class="aq-src device" title="Driven by ${escapeHtml(a.device.name)}">📟 ${escapeHtml(a.device.name)}</span>`
+      : (a.device && !a.device.online)
+      ? `<span class="aq-src offline" title="Device offline — showing last snapshot">📟 ${escapeHtml(a.device.name)} (offline)</span>`
       : `<span class="aq-src sim" title="Simulated on the server">🖥 web sim</span>`;
     li.innerHTML = `
       <button class="aq-del" title="Remove this aquarium" aria-label="Remove aquarium">×</button>
@@ -1321,9 +1464,8 @@ function select(id) {
   selectedId = id;
   latestSnapshot = null;
   snapshotReceivedAt = 0;
-  _blendFrom.clear();
-  _blendStartMs = 0;
-  _blendBoatFrom = null;
+  resetInterp();
+  _lastRafMs = 0;
   _plantEmitters = null;
   highlightedFishId = null;
   hoveredKey = null;
@@ -1351,39 +1493,15 @@ function select(id) {
 function applySnapshot(snap) {
   const now = Date.now();
   // _lastSeenMs is when the server received the telemetry POST — the closest
-  // proxy to when the device built the snapshot. Back-dating snapshotReceivedAt
-  // to that point compensates for POST + SSE latency (~50–150 ms on LAN).
+  // proxy to when the device built the snapshot. Used only for the title's
+  // staleness check; playback timing rides the device `tick`, not wall-clock.
   const serverRx = (snap._lastSeenMs && snap._lastSeenMs <= now) ? snap._lastSeenMs : now;
 
-  // Capture each fish's current predicted position before replacing the snapshot,
-  // so we can blend smoothly from there to the new snapshot's trajectory.
-  if (latestSnapshot) {
-    const oldElapsed = Math.max(0, serverRx - snapshotReceivedAt);
-    const prev = _extrapolateSnapshot(latestSnapshot, oldElapsed);
-    _blendFrom.clear();
-    for (const f of (prev.fish || [])) _blendFrom.set(f.id, { x: f.x, y: f.y });
-    _blendStartMs = now;
+  // Push the real device state into the interpolation buffer; the rAF playhead
+  // replays it (interpolated) trailing ~one publish interval behind. No prediction,
+  // so nothing to blend or dead-reckon here.
+  acceptSnapshot(snap);
 
-    // Refresh scene-mover velocities from this snapshot interval (px/ms).
-    const dt = Math.max(1, oldElapsed);
-    _sceneVel = {
-      snail: _obsVel(latestSnapshot.snail, snap.snail, dt),
-      starfish: _obsVel(latestSnapshot.starfish, snap.starfish, dt),
-      boat: (latestSnapshot.boat && snap.boat && latestSnapshot.boat.active && snap.boat.active)
-        ? _obsVel(latestSnapshot.boat, snap.boat, dt) : 0,
-    };
-
-    // Capture the boat's predicted x to blend from. Only when it was (and stays)
-    // active and the new position is close to the prediction — a large gap means
-    // a relaunch from the far edge, where sliding across the tank looks worse than
-    // a clean snap.
-    _blendBoatFrom = null;
-    if (prev.boat && snap.boat && prev.boat.active && snap.boat.active &&
-        typeof prev.boat.x === 'number' && typeof snap.boat.x === 'number' &&
-        Math.abs(prev.boat.x - snap.boat.x) < 120) {
-      _blendBoatFrom = prev.boat.x;
-    }
-  }
   latestSnapshot = snap;
   snapshotReceivedAt = serverRx;
   // Legend, stats, and title update at telemetry rate (≤1 Hz) — cheap DOM work.
@@ -1505,54 +1623,71 @@ function drawSilhouetteFish(x, y, size) {
 }
 
 // ─── Rendering ───────────────────────────────────────────────────────────────
-// Single 60fps rAF loop: advances decorative animations (EAC, bubbles, sway via
-// animTick), extrapolates fish positions between telemetry frames, and blends
-// out the discontinuity at each snapshot boundary so motion stays smooth.
+// Single 60fps rAF loop driven by ONE live clock (devClock, in device-tick units).
+// Each frame it advances the clock to the live edge, reseeds prediction when a new
+// authoritative snapshot has arrived, steps the device's own fish physics forward to
+// the edge (carrying a sub-frame remainder for smooth 60 fps), decays the small
+// reconciliation error, and draws. The same clock phases the decorative animations
+// (sway/water/smoke via animTick; bubbles/EAC via the per-frame tick delta), so the
+// whole scene runs in lockstep with the panel — real time, no interval of lag.
 // Title/stats/legend update at SSE rate (≤1 Hz) from applySnapshot.
 function _rafDraw() {
   rafId = requestAnimationFrame(_rafDraw);
   const now = Date.now();
-  const prevTick = animTick;
-  animTick = now / 50;            // device "tick" units (one per frame at 50ms)
-  // Device-frames elapsed since the last rAF. Clamp so a backgrounded tab (large
-  // gap) doesn't teleport the local sims when it resumes. All local animations are
-  // advanced by this so they run at the device's 20fps cadence, not the browser's.
-  const dframes = prevTick ? clamp(animTick - prevTick, 0, 5) : 1;
-  tickEac(dframes);
-  tickBubbles(dframes);
-  eacBright = latestSnapshot
-    ? dayTint(latestSnapshot.time && latestSnapshot.time.day_progress)
-    : 0.5;
-  if (!latestSnapshot) return;
+  const dtMs = _lastRafMs ? clamp(now - _lastRafMs, 0, 250) : 16;
+  _lastRafMs = now;
+  if (!lastSnap) return;
 
-  const elapsed = now - snapshotReceivedAt;
-  const ext = _extrapolateSnapshot(latestSnapshot, elapsed);
+  // Device offline → pause the simulation: hold the last frame (freeze fish, movers,
+  // and decor) without advancing the clock or stepping physics, until telemetry
+  // resumes. A fresh snapshot (device back) clears _stale and the loop resumes below.
+  if (latestSnapshot && latestSnapshot._stale) {
+    const held = buildRenderSnap(devClock != null ? devClock : snapTick(lastSnap));
+    if (held) { drawTank(held); drawPausedOverlay(); }
+    return;
+  }
 
-  const blendAge = _blendStartMs ? now - _blendStartMs : BLEND_MS;
-  if (blendAge >= BLEND_MS) { drawTank(ext); return; }
+  // Advance the live-edge clock; reseed from the freshest snapshot if one just landed.
+  if (devClock == null) devClock = snapTick(lastSnap);
+  devClock += dtMs * tickRate;
+  if (_needReseed) { reseedPrediction(lastSnap, devClock); _needReseed = false; }
 
-  // Smooth-step blend from the positions captured when this snapshot arrived.
-  const r = blendAge / BLEND_MS;
-  const sFac = r * r * (3 - 2 * r);
-  const fish = ext.fish.map((f) => {
-    const prev = _blendFrom.get(f.id);
-    if (!prev) return f;
-    return { ...f, x: prev.x + (f.x - prev.x) * sFac, y: prev.y + (f.y - prev.y) * sFac };
-  });
-  let boat = ext.boat;
-  if (boat && _blendBoatFrom != null)
-    boat = { ...boat, x: _blendBoatFrom + (boat.x - _blendBoatFrom) * sFac };
-  drawTank({ ...ext, fish, boat });
+  const df = Math.max(0, dtMs * tickRate); // device-frames elapsed this rAF
+  if (pred) {
+    // Step the prediction forward to the live edge in whole device-frames; keep the
+    // sub-frame remainder to render smooth 60 fps between physics frames.
+    let whole = Math.floor(devClock - pred.tick);
+    if (whole > 0) { whole = Math.min(whole, 6); stepFishN(pred.fish, whole); pred.tick += whole; }
+    _frameCarry = clamp(devClock - pred.tick, 0, 1.2);
+    // Ease the reconciliation error toward zero. Velocity-capped so a big correction
+    // after a long telemetry gap glides at swim speed instead of zooming across.
+    const k = Math.pow(ERR_DECAY, df);
+    const maxStep = ERR_CORR_MAX_V * df;
+    for (const [id, e] of errById) {
+      e.ex = reconcileErr(e.ex, k, maxStep);
+      e.ey = reconcileErr(e.ey, k, maxStep);
+      e.ez *= k;
+      if (Math.abs(e.ex) < 0.05 && Math.abs(e.ey) < 0.05 && Math.abs(e.ez) < 0.001) errById.delete(id);
+    }
+  }
+
+  animTick = devClock;            // decorative phase rides the same live clock
+  tickEac(df);
+  tickBubbles(df);
+  eacBright = dayTint(lastSnap.time && lastSnap.time.day_progress);
+
+  const frame = buildRenderSnap(devClock);
+  if (frame) drawTank(frame);
 }
 
-// Full re-render (called on highlight toggle, etc.) — extrapolates fish to now.
+// Full re-render (highlight/hover toggles, etc.) — rebuilds at the current live edge.
 function render() {
-  if (!latestSnapshot) return;
-  const elapsed = Date.now() - snapshotReceivedAt;
-  const snap = _extrapolateSnapshot(latestSnapshot, elapsed);
-  drawTitle(snap);
-  drawTank(snap);
-  drawStats(snap);
+  if (!lastSnap) return;
+  const frame = buildRenderSnap(devClock != null ? devClock : snapTick(lastSnap));
+  if (!frame) return;
+  drawTitle(frame);
+  drawTank(frame);
+  drawStats(frame);
   renderLegend(latestSnapshot); // legend uses raw snapshot (names/ages, not positions)
 }
 
@@ -1922,7 +2057,6 @@ function renderGame(snap) {
   els.hudCoins.innerHTML = '<span class="ci"></span> ' + (g.coins || 0);
   els.hudShells.textContent = '🐚 ' + (g.shells || 0);
   els.hudFood.textContent = '🍤 ' + (g.food || 0);
-  els.hudSnails.textContent = '🐌 ' + ((snap.snails && snap.snails.length) || 0);
   els.hudLuck.textContent = '🍀 ' + Math.round((g.luck || 0) * 100) + '%';
   // Meals fed today (target 3). Turns into a pulsing warning while the fish are hungry.
   const meals = g.meals || 3, fed = g.fed || 0, hungry = g.hungry === 1 || g.hungry === true;
@@ -1931,7 +2065,7 @@ function renderGame(snap) {
   els.hudMeals.title = hungry
     ? 'Fish are hungry — feed them! (3 meals/day keeps them healthy)'
     : 'Meals fed today' + (g.overfed ? ` · overfed ${g.overfed}× (hurts quality)` : '');
-  for (const el of [els.hudCoins, els.hudShells, els.hudFood, els.hudSnails, els.hudLuck, els.hudMeals])
+  for (const el of [els.hudCoins, els.hudShells, els.hudFood, els.hudLuck, els.hudMeals])
     el.style.display = career ? '' : 'none';
 
   for (const b of els.modeSeg.querySelectorAll('button'))
@@ -2135,9 +2269,22 @@ function fishTooltipHTML(f) {
 }
 function snailTooltipHTML(t) {
   const collector = t.role === 'collector';
-  return ttTitle(collector ? 'Collector Snail' : 'Pond Snail',
-                 collector ? '#5fd75f' : '#b9c6d4', false) +
-    `<div class="tt-sub">${collector ? 'Gathers coins from the sand' : 'A peaceful tank cleaner'}</div>` +
+  if (!collector) {
+    return ttTitle('Pond Snail', '#b9c6d4', false) +
+      `<div class="tt-sub">A peaceful tank cleaner</div>` +
+      `<div class="tt-action">Click to view profile</div>`;
+  }
+  const s = t.ref || {};
+  const q = Math.round(snailLuck(s) * 100), size = Math.round(snailGrowth(s) * 100);
+  const stage = (typeof s.stage === 'number' ? s.stage : 2) + 1;
+  return ttTitle(s.asleep ? 'Snail 💤' : 'Snail', '#5fd75f', false) +
+    `<div class="tt-sub" style="color:#5fd75f">Sand-bed species · stage ${stage}/3${s.asleep ? ' · asleep' : ''}</div>` +
+    `<div class="tt-bar"><div class="tt-bar-fill" style="width:${q}%;background:#5fd75f"></div></div>` +
+    `<div class="tt-stats">` +
+      ttStat('🍀', 'Quality', q + '%') +
+      ttStat('📐', 'Size', size + '%') +
+      (typeof s.xp === 'number' ? ttStat('⭐', 'XP', s.xp) : '') +
+    `</div>` +
     `<div class="tt-action">Click to view profile</div>`;
 }
 function lootTooltipHTML(it) {
@@ -2217,6 +2364,15 @@ async function sellFish(fishId) {
   closeProfile();
   await sendControl({ type: 'sell', fishId }, `Sold ${fishName(f)} for ${val} coins`, { label: 'Sell fish' });
 }
+async function sellSnail(snailId) {
+  const snap = latestSnapshot;
+  const s = snap && snap.snails && snap.snails.find((x) => x.id === snailId);
+  if (!s) return;
+  const val = snailSellValue(s);
+  if (!(await confirmDialog('Sell snail?', `Sell this snail for ${val} coins?`, { okLabel: 'Sell' }))) return;
+  closeProfile();
+  await sendControl({ type: 'sell', snailId }, `Sold a snail for ${val} coins`, { label: 'Sell snail' });
+}
 function pfStat(label, val) {
   return `<div class="pf-stat"><div class="pf-stat-l">${label}</div>` +
          `<div class="pf-stat-v">${escapeHtml(String(val))}</div></div>`;
@@ -2277,17 +2433,50 @@ function _wireProfileRename(input, fishId) {
 }
 function snailProfileHTML(ent) {
   const collector = ent.role === 'collector';
-  return `
+  const s = ent.ref;
+  // The decorative pond snail (role 'wild') stays a simple critter card. The snail SPECIES
+  // (collector) gets the full fish-style stat grid + a sell button in career.
+  if (!collector) {
+    return `
     <div class="pf-head">
       <div class="pf-chip" style="--chip:#ddb060"></div>
       <div class="pf-head-text">
-        <div class="pf-name-static">${collector ? 'Collector Snail' : 'Pond Snail'}</div>
-        <div class="pf-rarity" style="color:${collector ? '#5fd75f' : '#b9c6d4'}">${collector ? 'Uncommon · Helper' : 'Common · Critter'}</div>
+        <div class="pf-name-static">Pond Snail</div>
+        <div class="pf-rarity" style="color:#b9c6d4">Common · Critter</div>
       </div>
     </div>
-    <div class="pf-desc">${collector
-      ? 'Patrols the sea floor and automatically scoops up coins that fall near it, banking them straight to your tank.'
-      : 'A gentle bottom-dweller that ambles along the substrate, grazing as it goes.'}</div>`;
+    <div class="pf-desc">A gentle bottom-dweller that ambles along the substrate, grazing as it goes.</div>`;
+  }
+  const q = Math.round(snailLuck(s) * 100);
+  const size = Math.round(snailGrowth(s) * 100);
+  const stage = (typeof s.stage === 'number' ? s.stage : 2) + 1;   // 1..3 for display
+  const staMax = 40 + 180 * snailLuck(s);
+  const stamina = Math.round(((s.stamina != null ? s.stamina : staMax) / staMax) * 100);
+  const inCareer = latestSnapshot && latestSnapshot.game && latestSnapshot.game.mode === 'career';
+  const sellVal = inCareer ? snailSellValue(s) : 0;
+  return `
+    <div class="pf-head">
+      <div class="pf-chip" style="--chip:#5fe0a0"></div>
+      <div class="pf-head-text">
+        <div class="pf-name-static">Snail${s.asleep ? ' 💤' : ''}</div>
+        <div class="pf-rarity" style="color:#5fd75f">Sand-bed species · stage ${stage}/3</div>
+      </div>
+    </div>
+    <div class="pf-bar"><div class="pf-bar-fill" style="width:${q}%;background:#5fd75f"></div></div>
+    <div class="pf-grid">
+      ${pfStat('Quality', q + '%')}
+      ${pfStat('Size', size + '%')}
+      ${pfStat('Stage', stage + '/3')}
+      ${pfStat('XP', s.xp != null ? s.xp : '—')}
+      ${pfStat('Stamina', stamina + '%')}
+      ${pfStat('State', s.asleep ? 'Asleep 💤' : 'Foraging')}
+    </div>
+    <div class="pf-desc">Patrols the sea floor and scoops up coins that fall near it. Grows through three stages, sleeps at night, and sprints after coins while it has stamina.</div>
+    ${inCareer ? `<div class="pf-sell-row">
+      <button type="button" class="pf-sell-btn" data-snail-id="${s.id}">
+        Sell for ${sellVal} <span class="ci"></span>
+      </button>
+    </div>` : ''}`;
 }
 function renderProfile() {
   if (!profileKey) return;
@@ -2302,6 +2491,9 @@ function renderProfile() {
     if (input) _wireProfileRename(input, ent.ref.id);
     const sellBtn = els.profileBody.querySelector('.pf-sell-btn');
     if (sellBtn) sellBtn.addEventListener('click', () => sellFish(ent.ref.id));
+  } else if (ent.kind === 'snail') {
+    const sellBtn = els.profileBody.querySelector('.pf-sell-btn');
+    if (sellBtn) sellBtn.addEventListener('click', () => sellSnail(ent.ref.id));
   }
 }
 els.profileClose.addEventListener('click', closeProfile);
@@ -2316,6 +2508,22 @@ function drawTitle(s) {
     .join(' · ');
   const stale = s._stale || Date.now() - snapshotReceivedAt > 8000;
   els.viewDot.className = 'dot ' + (stale ? 'stale' : 'live');
+}
+
+// Dim banner drawn over the held frame while the device is offline, so a frozen
+// tank reads as "paused, waiting to reconnect" rather than broken.
+function drawPausedOverlay() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(8,16,28,0.45)';
+  ctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#cfe8ff';
+  ctx.font = 'bold 22px system-ui, -apple-system, sans-serif';
+  ctx.fillText('Device offline — simulation paused', SCREEN_W / 2, SCREEN_H / 2 - 4);
+  ctx.fillStyle = '#9bb8d6';
+  ctx.font = '14px system-ui, -apple-system, sans-serif';
+  ctx.fillText('Holding last frame until the device reconnects', SCREEN_W / 2, SCREEN_H / 2 + 22);
+  ctx.restore();
 }
 
 function dayTint(progress) {

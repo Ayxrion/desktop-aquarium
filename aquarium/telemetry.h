@@ -20,6 +20,7 @@
 
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <LittleFS.h>
 #include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
@@ -60,7 +61,7 @@ static uint32_t _lastTelemetryMs = 0;
 // Worst case ~45 fish (~110 chars each) + plants + header ≈ 6 KB; 12 KB is safe.
 // Written by the loop thread (build) only while the worker is idle; read by the
 // worker only while busy — see _telemetryBusy below — so no lock is needed.
-static char _telemetryBuf[20480];
+static char _telemetryBuf[28672];   // headroom for per-fish wander_q lookahead arrays
 static int  _telemetryBufLen = 0;
 
 // ── Runtime state ─────────────────────────────────────────────────────────────
@@ -99,6 +100,7 @@ static int telemetrySrvPair = 0, telemetrySrvSchool = 0,
 // dropFood()/addFish()/the weather + time globals are all in scope).
 static std::atomic<int> _ctrlWeatherReq{-2};      // -2 none, -1 auto, 0..6 condition
 static std::atomic<int> _ctrlTimeReq{-1};         // -1 none, 0 REAL, 1 FAST
+static std::atomic<int> _ctrlBrightnessReq{-1};   // -1 none, 0..255 backlight level
 static std::atomic<int> _ctrlFeedReq{0};          // pending food drops
 static std::atomic<int> _ctrlFishAddReq[5];       // pending adds per fish type 0..4
 static std::atomic<int> _ctrlFishDelReq[5];       // pending removes per fish type 0..4
@@ -113,6 +115,8 @@ static std::atomic<int> _ctrlCatchCount{0};
 #define CTRL_SELL_MAX 16
 static std::atomic<int> _ctrlSellFishIds[CTRL_SELL_MAX];    // fish slot indices to sell
 static std::atomic<int> _ctrlSellFishCount{0};
+static std::atomic<int> _ctrlSellSnailIds[CTRL_SELL_MAX];   // snail slot indices to sell
+static std::atomic<int> _ctrlSellSnailCount{0};
 
 // Parse the control directives out of a POST response body into the atomics above.
 // Each command type appears at most once per response (the server collapses them),
@@ -129,6 +133,7 @@ static void _telemetryParseControls(const char* body) {
     }
     if ((d = strstr(body, "!WEATHER:")) != nullptr) _ctrlWeatherReq.store(atoi(d + 9));
     if ((d = strstr(body, "!TIME:"))    != nullptr) _ctrlTimeReq.store(atoi(d + 6));
+    if ((d = strstr(body, "!BRIGHTNESS:")) != nullptr) _ctrlBrightnessReq.store(atoi(d + 12));
     if ((d = strstr(body, "!FEED:"))    != nullptr) _ctrlFeedReq.fetch_add(atoi(d + 6));
     if ((d = strstr(body, "!MODE:"))     != nullptr) _ctrlModeReq.store(atoi(d + 6));
     if ((d = strstr(body, "!BUYFOOD:"))  != nullptr) _ctrlBuyFoodReq.fetch_add(atoi(d + 9));
@@ -163,6 +168,20 @@ static void _telemetryParseControls(const char* body) {
             if (cnt >= CTRL_SELL_MAX) break;
             _ctrlSellFishIds[cnt].store(atoi(p));
             _ctrlSellFishCount.store(cnt + 1);
+            const char* c = strchr(p, ',');
+            if (!c || (nl && c > nl)) break;
+            p = c + 1;
+        }
+    }
+    // !SELLSNAIL:<slot,slot,…> — append snail slot indices to sell (drained on main thread).
+    if ((d = strstr(body, "!SELLSNAIL:")) != nullptr) {
+        const char* p = d + 11;
+        const char* nl = strchr(p, '\n');
+        while (*p && p != nl) {
+            int cnt = _ctrlSellSnailCount.load();
+            if (cnt >= CTRL_SELL_MAX) break;
+            _ctrlSellSnailIds[cnt].store(atoi(p));
+            _ctrlSellSnailCount.store(cnt + 1);
             const char* c = strchr(p, ',');
             if (!c || (nl && c > nl)) break;
             p = c + 1;
@@ -245,13 +264,13 @@ static int _buildTelemetryJson() {
     o = _tAppend(o,
         "{\"aquarium_id\":\"%s\",\"device_id\":\"%s\",\"platform\":\"esp32\",\"fw_version\":\"%s\","
         "\"uptime_ms\":%lu,\"tick\":%d,\"frame_ms\":%d,"
-        "\"screen\":{\"w\":%d,\"h\":%d,\"tank_top\":%d},"
+        "\"screen\":{\"w\":%d,\"h\":%d,\"tank_top\":%d,\"brightness\":%d},"
         "\"weather\":{\"condition\":%d,\"name\":\"%s\",\"override\":%s},"
         "\"time\":{\"day_progress\":%.4f,\"mode\":\"%s\"},"
         "\"counts\":{\"pair\":%d,\"school\":%d,\"school2\":%d,\"angel\":%d,\"salmon\":%d},",
         activeAquariumId, TELEMETRY_DEVICE_ID, FIRMWARE_VERSION,
         (unsigned long)millis(), (int)tick, FRAME_MS,
-        SCREEN_W, SCREEN_H, TANK_TOP,
+        SCREEN_W, SCREEN_H, TANK_TOP, (int)displayBrightness,
         wc, _telemetryWeatherName(wc), (weatherOverrideIdx >= 0) ? "true" : "false",
         getDayProgress(), (currentTimeMode == TIME_FAST) ? "FAST" : "REAL",
         numPair, numSchool, numSchool2, numAngel, numSalmon);
@@ -265,20 +284,27 @@ static int _buildTelemetryJson() {
         o = _tAppend(o,
             "%s{\"id\":%d,\"x\":%.1f,\"y\":%.1f,\"z\":%.3f,"
             "\"vx\":%.2f,\"vy\":%.2f,\"vz\":%.4f,"
-            "\"tx\":%.1f,\"ty\":%.1f,\"tz\":%.3f,\"wander_cd\":%d,"
+            "\"tx\":%.1f,\"ty\":%.1f,\"tz\":%.3f,\"wander_cd\":%.2f,\"idle_cd\":%.2f,"
             "\"type\":%d,\"facing_right\":%s,"
             "\"color\":%u,\"going_for_food\":%s,\"chasing\":%s,"
-            "\"age\":%d,\"scale\":%.3f,\"xp\":%d,\"fish_luck\":%.3f}",
+            "\"age\":%d,\"scale\":%.3f,\"xp\":%d,\"fish_luck\":%.3f,\"wander_q\":[",
             first ? "" : ",", i,
             f.x, f.y, f.z,
             f.vx, f.vy, f.vz,
-            f.tx, f.ty, f.tz, (int)f.wanderCD,
+            f.tx, f.ty, f.tz, f.wanderCD, f.idleCD,
             (int)f.type,
             f.facingRight ? "true" : "false",
             (unsigned)fishColor(i),
             f.goingForFood ? "true" : "false",
             f.chasing ? "true" : "false",
             (int)f.age, fishScale(f), (int)f.xp, f.fishLuck);
+        // Upcoming wander targets the web should seek next: [wcd, tx, ty, tz, chasing].
+        for (uint8_t q = 0; q < f.wanderQN; q++) {
+            WanderMove& m = f.wanderQ[q];
+            o = _tAppend(o, "%s[%.2f,%.1f,%.1f,%.3f,%d]",
+                q ? "," : "", m.wcd, m.tx, m.ty, m.tz, m.chasing ? 1 : 0);
+        }
+        o = _tAppend(o, "]}");
         first = false;
     }
     o = _tAppend(o, "],");
@@ -295,14 +321,16 @@ static int _buildTelemetryJson() {
     }
     o = _tAppend(o, "],");
 
-    // Snail / starfish / boat
+    // Snail / starfish / boat — include signed vx so the web can extrapolate smoothly.
     o = _tAppend(o,
-        "\"snail\":{\"x\":%d,\"facing_right\":%s},"
-        "\"starfish\":{\"x\":%d,\"facing_right\":%s},"
-        "\"boat\":{\"active\":%s,\"x\":%d},",
-        (int)snail.x, snail.facingRight ? "true" : "false",
-        (int)starfish.x, starfish.facingRight ? "true" : "false",
-        boat.active ? "true" : "false", (int)boat.x);
+        "\"snail\":{\"x\":%d,\"spd\":%.3f,\"vx\":%.3f,\"facing_right\":%s},"
+        "\"starfish\":{\"x\":%d,\"spd\":%.3f,\"vx\":%.3f,\"facing_right\":%s},"
+        "\"boat\":{\"active\":%s,\"x\":%d,\"vx\":%.3f},",
+        (int)snail.x, snail.spd, snail.facingRight ? snail.spd : -snail.spd,
+        snail.facingRight ? "true" : "false",
+        (int)starfish.x, starfish.spd, starfish.facingRight ? starfish.spd : -starfish.spd,
+        starfish.facingRight ? "true" : "false",
+        boat.active ? "true" : "false", (int)boat.x, boat.active ? -0.5f : 0.0f);
 
     // Plant layout (near-static decor)
     o = _tAppend(o, "\"plants\":{\"bg\":[");
@@ -359,9 +387,17 @@ static int _buildTelemetryJson() {
     bool firstS = true;
     for (int i = 0; i < numSnails; i++) {
         if (!coinSnails[i].active) continue;
-        o = _tAppend(o, "%s{\"x\":%.1f,\"spd\":%.3f,\"facing_right\":%s}",
-            firstS ? "" : ",", coinSnails[i].x, coinSnails[i].spd,
-            coinSnails[i].facingRight ? "true" : "false");
+        // "id" is the slot index (active snails are contiguous) — the web echoes it back
+        // in !SELLSNAIL, matching the fish convention.
+        o = _tAppend(o,
+            "%s{\"id\":%d,\"type\":%d,\"x\":%.1f,\"spd\":%.3f,\"vx\":%.3f,\"facing_right\":%s,"
+            "\"age\":%d,\"scale\":%.3f,\"stage\":%d,\"xp\":%d,\"snail_luck\":%.3f,"
+            "\"stamina\":%d,\"asleep\":%s}",
+            firstS ? "" : ",", i, coinSnails[i].type,
+            coinSnails[i].x, coinSnails[i].spd, coinSnails[i].lastVx, coinSnails[i].facingRight ? "true" : "false",
+            (int)coinSnails[i].age, snailScaleOf(coinSnails[i].age), snailStage(coinSnails[i].age),
+            coinSnails[i].xp, coinSnails[i].snailLuck,
+            (int)coinSnails[i].stamina, coinSnails[i].asleep ? "true" : "false");
         firstS = false;
     }
     o = _tAppend(o, "]}");
@@ -535,9 +571,15 @@ static void _applyServerProfileDoc(DynamicJsonDocument& doc) {
     for (JsonObject s : doc["snails"].as<JsonArray>()) {
         if (numSnails >= MAX_SNAILS) break;
         CoinSnail& cs = coinSnails[numSnails];
+        cs.type        = 0;
         cs.x           = s["x"]            | (float)(SCREEN_W / 2);
-        cs.spd         = s["spd"]          | 2.0f;
+        cs.spd         = s["spd"]          | SNAIL_BASE_SPD;
         cs.facingRight = s["facing_right"] | true;
+        cs.age         = (float)(int)(s["age"]  | 0);
+        cs.xp          = s["xp"]           | 0;
+        cs.snailLuck   = s["snail_luck"]   | 0.0f;
+        cs.stamina     = s["stamina"]      | SNAIL_STAMINA_MAX;
+        cs.asleep      = false;
         cs.active      = true;
         numSnails++;
     }
@@ -553,6 +595,7 @@ static void _applyServerProfileDoc(DynamicJsonDocument& doc) {
         f.tx       = jf["tx"]        | f.x;
         f.ty       = jf["ty"]        | f.y;
         f.wanderCD = jf["wander_cd"] | f.wanderCD;
+        f.idleCD   = jf["idle_cd"]   | 0.0f;
         f.chasing  = jf["chasing"]   | false;
         f.age      = jf["age"]       | f.age;
         f.xp       = jf["xp"]        | f.xp;
@@ -573,7 +616,7 @@ static void _applyServerProfileDoc(DynamicJsonDocument& doc) {
 bool telemetryProfileLoaded = false;
 
 static bool telemetryFetchAndApplyProfile() {
-    DynamicJsonDocument doc(49152);  // 48 KB — MAX_FISH=56 × ~300B/fish ≈ 17 KB JSON; ArduinoJson needs ~2-3× internally
+    DynamicJsonDocument doc(65536);  // 64 KB — MAX_FISH=72 × ~430B/fish (incl. wander_q) ≈ 31 KB JSON; ArduinoJson needs ~2× internally
     if (!_fetchBootstrapDoc(doc) || !doc["exists"].as<bool>()) return false;
     _applyServerProfileDoc(doc);
     telemetryProfileLoaded = true;
@@ -585,6 +628,62 @@ static void telemetryBootstrap() {
     if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
     if (!telemetryFetchAndApplyProfile())
         Serial.println("Telemetry: no saved profile on server (keeping local tank)");
+}
+
+// ── Local state persistence (offline-safe restore) ───────────────────────────
+// The server is the source of truth when reachable, but the device also mirrors
+// its tank to on-board flash (LittleFS) every LOCAL_SAVE_INTERVAL_MS. On boot, if
+// the server has no profile to restore (offline, telemetry off, or never synced),
+// the tank is rebuilt from this file so a power cycle can't wipe career progress.
+#ifndef LOCAL_STATE_PATH
+#define LOCAL_STATE_PATH "/aqstate.json"
+#endif
+#ifndef LOCAL_SAVE_INTERVAL_MS
+#define LOCAL_SAVE_INTERVAL_MS 120000   // 2 min — bounds progress loss while limiting flash wear
+#endif
+static bool     _localFsReady    = false;
+static uint32_t _lastLocalSaveMs = 0;
+
+// Mount the "spiffs" partition (min_spiffs.csv) as LittleFS; format on first use.
+static void localStateInit() {
+    _localFsReady = LittleFS.begin(true);
+    if (!_localFsReady) Serial.println("LocalState: LittleFS mount failed (no offline save)");
+}
+
+// Restore the tank from the last on-flash snapshot. Returns true if applied.
+static bool localStateLoad() {
+    if (!_localFsReady || !LittleFS.exists(LOCAL_STATE_PATH)) return false;
+    File f = LittleFS.open(LOCAL_STATE_PATH, "r");
+    if (!f) return false;
+    DynamicJsonDocument doc(65536);   // same budget as the server bootstrap parse
+    DeserializationError err = deserializeJson(doc, f);
+    f.close();
+    if (err || !doc["exists"].as<bool>()) return false;
+    _applyServerProfileDoc(doc);
+    telemetryProfileLoaded = true;
+    Serial.println("LocalState: tank restored from on-flash save");
+    return true;
+}
+
+// Mirror the current tank to flash, rate-limited. Safe to call every loop().
+// Writes a temp file then renames it over the live save, so a power loss mid-write
+// can't corrupt the restorable copy. Reuses the telemetry snapshot buffer (the
+// "{...}" it builds), injecting the "exists":true flag the restore path keys on.
+static void localStatePersist() {
+    if (!_localFsReady) return;
+    uint32_t now = millis();
+    if (now - _lastLocalSaveMs < (uint32_t)LOCAL_SAVE_INTERVAL_MS) return;
+    if (_telemetryBusy.load()) return;          // snapshot buffer in flight to the server
+    _lastLocalSaveMs = now;
+    _telemetryBufLen = _buildTelemetryJson();   // fills _telemetryBuf with "{...}"
+    if (_telemetryBufLen < 2) return;
+    File f = LittleFS.open(LOCAL_STATE_PATH ".tmp", "w");
+    if (!f) return;
+    f.print("{\"exists\":true,");                                       // restore-path flag
+    f.write((const uint8_t*)_telemetryBuf + 1, _telemetryBufLen - 1);   // skip the leading '{'
+    f.close();
+    LittleFS.remove(LOCAL_STATE_PATH);
+    LittleFS.rename(LOCAL_STATE_PATH ".tmp", LOCAL_STATE_PATH);
 }
 
 // Apply a pending !SWITCHAQ reassignment: point at the new aquarium + load its state.
@@ -601,7 +700,7 @@ static void telemetryApplyAquariumSwitch() {
 // Runtime re-enable: compare local profile to the server's; prompt if different.
 static void telemetryReenableCheck() {
     if (!telemetryEnabled || TELEMETRY_HOST[0] == '\0') return;
-    DynamicJsonDocument doc(49152);  // 48 KB — MAX_FISH=56 × ~300B/fish ≈ 17 KB JSON; ArduinoJson needs ~2-3× internally
+    DynamicJsonDocument doc(65536);  // 64 KB — MAX_FISH=72 × ~430B/fish (incl. wander_q) ≈ 31 KB JSON; ArduinoJson needs ~2× internally
     if (!_fetchBootstrapDoc(doc) || !doc["exists"].as<bool>()) return;
     const char* ss = doc["profile_sig"] | "";
     if (_localProfileSig() == String(ss)) return; // matches → no conflict
@@ -649,6 +748,7 @@ static void telemetryProcessFlags() {
 }
 
 static void telemetryInit() {
+    localStateInit();   // mount flash before any save/restore
     if (!_telemetryTaskHandle) {
         // Core 0; the Arduino loop runs on core 1. 8 KB stack covers plain-HTTP
         // HTTPClient (the 12 KB body lives in the static buffer, not the stack).
@@ -658,8 +758,10 @@ static void telemetryInit() {
     if (telemetryEnabled && TELEMETRY_HOST[0] != '\0')
         Serial.printf("Telemetry: enabled -> %s as '%s' every %d ms\n",
                       TELEMETRY_HOST, TELEMETRY_AQUARIUM_ID, TELEMETRY_INTERVAL_MS);
-    // Restore last-known state from the server before the render loop starts.
+    // Server is the source of truth when reachable; otherwise fall back to the
+    // last on-flash snapshot so an offline reboot keeps the player's tank.
     telemetryBootstrap();
+    if (!telemetryProfileLoaded) localStateLoad();
 }
 
 // Call once per loop(); rate-limited internally by TELEMETRY_INTERVAL_MS.

@@ -104,6 +104,7 @@ main {
   max-width: 140px; overflow: hidden; text-overflow: ellipsis;
 }
 .aq-src.device { background: #1f6b4733; color: #7ee0a8; border: 1px solid #2e8a5f55; }
+.aq-src.offline { background: #5a403333; color: #d4a574; border: 1px solid #8a604455; }
 .aq-src.sim    { background: #2a456f55; color: #9fc2ff; border: 1px solid #3a6abf55; }
 .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
 .dot.live { background: var(--live); box-shadow: 0 0 6px var(--live); }

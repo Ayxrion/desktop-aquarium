@@ -33,6 +33,7 @@ function freshPending() {
     buyFood: 0,                // !BUYFOOD:<count>
     buySnail: 0,               // !BUYSNAIL:<count>  coin-collector snail
     sellFish: [],              // !SELLFISH:<id,id,…>  sell fish by slot id (device removes + credits coins)
+    sellSnail: [],             // !SELLSNAIL:<id,id,…>  sell snail by id (device removes + credits coins)
     switchAq: null,            // !SWITCHAQ:<id>  tell a physical device to load a different aquarium
   };
 }
@@ -63,7 +64,10 @@ function _bound(v, lo, hi, k) {
 function _extrapolateSnapshot(snapshot, elapsedMs) {
   if (!snapshot) return snapshot;
   const fm = snapshot.frame_ms || 50;
-  const n  = Math.round(Math.min(Math.max(elapsedMs, 0), 3000) / fm);
+  // Predict forward up to 30s (was 3s). The old 3s cap froze the tank between sparse
+  // device posts; fish should keep swimming via wander retargeting (below) until fresh
+  // telemetry — or the tank goes stale — arrives.
+  const n  = Math.round(Math.min(Math.max(elapsedMs, 0), 30000) / fm);
   if (n === 0) return snapshot;
 
   const fish = Array.isArray(snapshot.fish) ? snapshot.fish : [];
@@ -74,6 +78,7 @@ function _extrapolateSnapshot(snapshot, elapsedMs) {
       x: f.x, y: f.y, z: f.z || 0,
       vx: f.vx || 0, vy: f.vy || 0, vz: f.vz || 0,
       tx: f.tx ?? f.x, ty: f.ty ?? f.y, tz: typeof f.tz === 'number' ? f.tz : (f.z || 0),
+      wcd: typeof f.wander_cd === 'number' ? f.wander_cd : 30,
       chasing: !!f.chasing, going_for_food: !!f.going_for_food,
     }));
 
@@ -92,11 +97,31 @@ function _extrapolateSnapshot(snapshot, elapsedMs) {
       }
       for (const k in cent) { const c = cent[k]; c.x /= c.n; c.y /= c.n; c.z /= c.n; }
       for (const f of st) {
-        const t = f.type, chasing = f.chasing && t === 0;
+        const t = f.type;
+        // Wander retargeting (mirrors the device + client predictor): when the countdown
+        // expires, choose a fresh target so the fish keep roaming instead of settling on
+        // a stale one. Keeps the REST/poll view alive between sparse device posts.
+        if (f.wcd > 0) {
+          f.wcd--;
+        } else {
+          if (t === 0) {
+            f.chasing = !f.chasing;
+            f.wcd = f.chasing ? 30 + Math.random() * 40 : 40 + Math.random() * 50;
+          } else if (t === 3) { f.wcd = 8 + Math.random() * 20; }
+          else { f.wcd = 15 + Math.random() * 35; }
+          if (t === 4) {
+            f.tx = 30 + Math.random() * (SCREEN_W - 60);
+            f.ty = (TANK_TOP + 20) + Math.random() * (SCREEN_H - 80 - (TANK_TOP + 20));
+          } else {
+            const cg = cent[t + ':' + f._sub];
+            const spread = t === 3 ? 120 : t === 0 ? 0 : 160;
+            f.tx = Math.max(30, Math.min(SCREEN_W - 30, cg.x + (Math.random() * 2 - 1) * spread));
+            f.ty = Math.max(TANK_TOP + 20, Math.min(SCREEN_H - 80, cg.y + (Math.random() * 2 - 1) * (t === 3 ? 110 : 90)));
+          }
+        }
+        const chasing = f.chasing && t === 0;
         const seekStr = chasing ? 0.018 : (t === 3 ? 0.020 : 0.012);
         const maxV    = f.going_for_food ? 8.0 : (chasing || t === 3) ? 7.0 : 5.5;
-        // Always seek the last-known target (device keeps seeking; only the
-        // unpredictable random retarget on wander_cd expiry is skipped).
         let ax = (f.tx - f.x) * seekStr;
         let ay = (f.ty - f.y) * seekStr;
         let az = (f.tz - f.z) * 0.010;
@@ -158,14 +183,43 @@ function _extrapolateSnapshot(snapshot, elapsedMs) {
   }
   if (Array.isArray(snapshot.snails)) {
     out.snails = snapshot.snails.map((s) => {
-      let x = s.x, dir = s.facing_right ? 1 : -1; const spd = s.spd || 0;
+      if (s.asleep) return { ...s };
+      const vx = typeof s.vx === 'number' ? s.vx
+        : (s.facing_right ? (s.spd || 0.28) : -(s.spd || 0.28));
+      let x = s.x;
       for (let f = 0; f < n; f++) {
-        x += dir * spd;
-        if (x > SCREEN_W - 55) { x = SCREEN_W - 55; dir = -1; }
-        if (x < 55)            { x = 55;            dir = 1; }
+        x += vx;
+        if (x > SCREEN_W - 55) x = SCREEN_W - 55;
+        if (x < 55) x = 55;
       }
-      return { ...s, x, facing_right: dir > 0 };
+      return { ...s, x, facing_right: vx >= 0 };
     });
+  }
+  if (snapshot.boat && typeof snapshot.boat.x === 'number') {
+    const vx = snapshot.boat.active ? (typeof snapshot.boat.vx === 'number' ? snapshot.boat.vx : -0.5) : 0;
+    out.boat = { ...snapshot.boat, x: snapshot.boat.x + vx * n };
+  }
+  if (snapshot.snail && typeof snapshot.snail.x === 'number') {
+    const vx = typeof snapshot.snail.vx === 'number' ? snapshot.snail.vx
+      : (snapshot.snail.facing_right ? (snapshot.snail.spd || 0.18) : -(snapshot.snail.spd || 0.18));
+    let x = snapshot.snail.x;
+    for (let f = 0; f < n; f++) {
+      x += vx;
+      if (x > SCREEN_W - 55) x = SCREEN_W - 55;
+      if (x < 55) x = 55;
+    }
+    out.snail = { ...snapshot.snail, x, facing_right: vx >= 0 };
+  }
+  if (snapshot.starfish && typeof snapshot.starfish.x === 'number') {
+    const vx = typeof snapshot.starfish.vx === 'number' ? snapshot.starfish.vx
+      : (snapshot.starfish.facing_right ? (snapshot.starfish.spd || 0.15) : -(snapshot.starfish.spd || 0.15));
+    let x = snapshot.starfish.x;
+    for (let f = 0; f < n; f++) {
+      x += vx;
+      if (x > SCREEN_W - 40) x = SCREEN_W - 40;
+      if (x < 40) x = 40;
+    }
+    out.starfish = { ...snapshot.starfish, x, facing_right: vx >= 0 };
   }
   return out;
 }
@@ -210,9 +264,9 @@ const aquariums = new Map();
 })();
 
 // ── Devices ────────────────────────────────────────────────────────────────────
-// A device is a physical Pi/ESP that self-registers via telemetry. (There are no
-// "virtual" devices any more — any aquarium WITHOUT a live device is run by the
-// server's built-in web simulator; see deviceManager.js.) An aquarium is a standalone
+// A device is a physical Pi/ESP that self-registers via telemetry. Dashboard-created
+// aquariums with no assigned device are run by the server's web simulator
+// (deviceManager.js). Assigned devices keep ownership even when offline.
 // saved tank; a device "plays" at most one aquarium at a time (`aquariumId`).
 /** @type {Map<string, {id,name,kind,aquariumId,createdAt,lastSeenMs}>} */
 const devices = new Map();
@@ -240,6 +294,18 @@ function hasLiveDevice(aquariumId) {
   for (const d of devices.values())
     if (d.aquariumId === aquariumId && !isStale(d.lastSeenMs || 0)) return true;
   return false;
+}
+// True when any device (online or offline) is bound to this aquarium. Offline tanks
+// keep their last snapshot — the server web sim must not take over automatically.
+function hasAssignedDevice(aquariumId) {
+  if (!aquariumId) return false;
+  for (const d of devices.values())
+    if (d.aquariumId === aquariumId) return true;
+  return false;
+}
+// Dashboard-created tanks with no assigned hardware run on the server web sim.
+function shouldWebSimulate(aquariumId) {
+  return !hasAssignedDevice(aquariumId);
 }
 // Device summary (if any) currently bound to an aquarium — live one preferred.
 function deviceForAquarium(aquariumId) {
@@ -414,6 +480,10 @@ function enrich(entry) {
 function enrichExtrapolated(entry) {
   const base = enrich(entry);
   if (!base) return null;
+  // Device offline → freeze on the last real frame instead of dead-reckoning a dead
+  // device forward; the simulation resumes when telemetry returns. (Web-simulated
+  // tanks post ~1 Hz so they're never stale and keep extrapolating normally.)
+  if (base._stale) return base;
   const elapsedMs = now() - entry.lastSeenMs;
   return _extrapolateSnapshot(base, elapsedMs);
 }
@@ -530,6 +600,7 @@ function getNamesText(id) {
   if (p.buyFood > 0) { lines.push(`!BUYFOOD:${p.buyFood}`); p.buyFood = 0; }
   if (p.buySnail > 0) { lines.push(`!BUYSNAIL:${p.buySnail}`); p.buySnail = 0; }
   if (p.sellFish && p.sellFish.length > 0) { lines.push(`!SELLFISH:${p.sellFish.join(',')}`); p.sellFish = []; }
+  if (p.sellSnail && p.sellSnail.length > 0) { lines.push(`!SELLSNAIL:${p.sellSnail.join(',')}`); p.sellSnail = []; }
   // Only nudge the device's on-screen conflict prompt when we're not already
   // telling it to restore (restore resolves the conflict on its own).
   if (!restoreEmitted && entry.conflict) lines.push('!CONFLICT');
@@ -601,6 +672,16 @@ function queueControl(id, cmd) {
       break;
     }
     case 'sell': {
+      // Sells a fish (cmd.fishId) or a snail (cmd.snailId). Both queue an id the device
+      // removes + credits on its next poll; the census changes, so re-adopt afterward.
+      if (cmd.snailId != null) {
+        const snailId = Number(cmd.snailId);
+        if (!Number.isInteger(snailId) || snailId < 0 || snailId > 100000)
+          return { ok: false, error: 'bad_snail_id' };
+        if (!(p.sellSnail || (p.sellSnail = [])).includes(snailId)) p.sellSnail.push(snailId);
+        entry.adoptNext = true;
+        break;
+      }
       const fishId = Number(cmd.fishId);
       if (!Number.isInteger(fishId) || fishId < 0 || fishId > 200)
         return { ok: false, error: 'bad_fish_id' };
@@ -661,7 +742,8 @@ function list() {
       weather: s.weather || null,
       conflict: !!entry.conflict,
       device,                          // { id, name, kind, online } | null
-      simulated: !(device && device.online), // server web-sim drives it when no live device
+      simulated: shouldWebSimulate(id),
+      deviceOffline: !!(device && !device.online),
     });
   }
   out.sort((a, b) => a.aquarium_id.localeCompare(b.aquarium_id));
@@ -780,7 +862,7 @@ module.exports = {
   queueControl, remove, FISH_MAX,
   STALE_MS, MAX_AQUARIUMS,
   // Aquarium lifecycle (dashboard-created tanks, simulated server-side)
-  createAquarium, renameAquarium, aquariumIds, hasLiveDevice,
+  createAquarium, renameAquarium, aquariumIds, hasLiveDevice, hasAssignedDevice, shouldWebSimulate,
   // Device registry (physical hardware that self-registers via telemetry)
   listDevices, getDevice, createDevice, updateDevice, removeDevice,
 };

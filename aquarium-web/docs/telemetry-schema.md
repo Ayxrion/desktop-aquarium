@@ -47,17 +47,40 @@ history) and pushes it to browsers over SSE. Unknown fields are ignored; only
     {
       "id": 3,                    // stable per-device fish slot — used for naming/age
       "x": 120, "y": 210, "z": 0.3,
-      "type": 1,                  // 0 pair,1 school,2 school2,3 angel
+      "vx": 1.2, "vy": -0.4, "vz": 0.0,
+      "tx": 180, "ty": 240, "tz": 0.3,   // current wander target
+      "wander_cd": 12.50,         // FLOAT — frames until the next retarget (fractional)
+      "type": 1,                  // 0 pair,1 school,2 school2,3 angel,4 salmon
       "facing_right": true,
       "color": 65382,             // 0xRRGGBB
       "going_for_food": false,
-      "chasing": false
+      "chasing": false,
+      // Precomputed upcoming wander targets (FIFO, up to 4). Each entry is
+      // [wcd, tx, ty, tz, chasing]. The web replication drains this queue when a fish's
+      // countdown expires so it seeks the EXACT targets this device will, instead of
+      // rolling its own random target and drifting until the next snapshot. The device
+      // commits to these same values, so device + web stay in sync between snapshots.
+      "wander_q": [ [40.0, 360, 230, 0.3, 0], [22.5, 150, 280, 0.3, 0] ]
     }
   ],
 
   "flakes": [ { "x": 400, "y": 300, "color": 16711680 } ],
 
-  "snail":    { "x": 540, "facing_right": true },
+  // Snail SPECIES (sand-bed) — a full career species like fish: grows through 3 stages,
+  // sleeps at night, sprints after coins while stamina lasts, feeds tank luck, sellable.
+  // "id" is the device slot index (echoed back in !SELLSNAIL). Decorative "snail" below
+  // is unrelated ambient decor.
+  "snails": [
+    {
+      "id": 0, "type": 0,              // type 0 = snail (room for more sand-bed species)
+      "x": 300, "spd": 0.28, "facing_right": true,
+      "age": 3600, "scale": 1.0, "stage": 2,   // stage 0..2 (2 = full size); scale per stage
+      "xp": 40, "snail_luck": 0.59,    // quality 0..1 → tank luck + sell value
+      "stamina": 147, "asleep": false  // sprint budget (capacity scales w/ quality); night rest
+    }
+  ],
+
+  "snail":    { "x": 540, "facing_right": true },   // decorative ambient pond snail (not the species)
   "starfish": { "x": 80,  "facing_right": false },
   "boat":     { "active": false, "x": 876 },
 
