@@ -65,80 +65,135 @@
             <button id="mode-confirm-cancel" class="btn-local">Cancel</button>
           </div>
         </div>
-        <div class="tank-row">
-          <div class="tank-col">
-            <div class="tank-wrap">
-              <canvas id="tank" width="800" height="480"></canvas>
-              <button id="legend-toggle" class="legend-toggle" type="button" aria-pressed="false"
-                title="Show or hide the fish list">🐟 Fish list</button>
-              <div id="legend-overlay" class="legend-overlay" hidden>
-                <div class="legend-head">
-                  <h3>Fish</h3>
-                  <span class="hint">click a row to highlight · click a name to rename</span>
-                </div>
-                <div id="legend" class="legend"></div>
-              </div>
-            </div>
-            <div id="stats" class="stats"></div>
-          </div>
-          <aside class="tank-side">
-            <div id="game-panel" class="game-panel" hidden>
-              <div class="hud">
-                <span class="hud-mode" id="hud-mode">Career</span>
-                <span class="hud-item" id="hud-coins" title="Coins"><span class="ci"></span> 0</span>
-                <span class="hud-item" id="hud-shells" title="Shells">🐚 0</span>
-                <span class="hud-item" id="hud-food" title="Fish food">🍤 0</span>
-                <span class="hud-item" id="hud-luck" title="Tank luck">🍀 0%</span>
-                <span class="hud-item" id="hud-meals" title="Meals fed today">🍽️ 0/3</span>
-              </div>
-              <div class="mode-row">
-                <span class="ctrl-label">Mode</span>
-                <div class="seg" id="mode-seg">
-                  <button type="button" data-mode="creative">Creative</button>
-                  <button type="button" data-mode="career">Career</button>
-                </div>
-              </div>
-              <div id="shop" class="shop" hidden>
-                <div class="shop-head">🛒 Shop</div>
-                <div id="shop-fish" class="shop-fish"></div>
-                <button type="button" id="shop-food" class="shop-buy">🍤 Food — 5 <span class="ci"></span></button>
-                <button type="button" id="shop-snail" class="shop-buy">🐌 Snail — 50 <span class="ci"></span></button>
-              </div>
-            </div>
-            <div id="controls" class="controls" hidden>
-              <h3>Controls</h3>
-              <div class="ctrl-group">
-                <label class="ctrl-label" for="ctrl-weather">Weather</label>
-                <select id="ctrl-weather" class="ctrl-select">
-                  <option value="-1">Auto</option>
-                  <option value="0">Sunny</option>
-                  <option value="1">Partly Cloudy</option>
-                  <option value="2">Cloudy</option>
-                  <option value="3">Rainy</option>
-                  <option value="4">Stormy</option>
-                  <option value="5">Snowy</option>
-                  <option value="6">Foggy</option>
-                </select>
-              </div>
-              <div class="ctrl-group ctrl-time-group">
-                <span class="ctrl-label">Timescale <span id="ctrl-time-val" class="ctrl-time-val">1×</span></span>
-                <input type="range" id="ctrl-time" class="ctrl-slider" min="1" max="5" step="1" value="1"
-                  aria-label="Simulation speed (1× real-time to 5× fast)" />
-                <div class="ctrl-ticks" aria-hidden="true">
-                  <span>1×</span><span>2×</span><span>3×</span><span>4×</span><span>5×</span>
-                </div>
-              </div>
-              <div class="ctrl-group" id="ctrl-fish-group">
-                <span class="ctrl-label">Fish</span>
-                <div id="ctrl-fish" class="ctrl-fish"></div>
-              </div>
-              <button type="button" id="ctrl-feed" class="ctrl-feed">🍤 Feed</button>
-              <div id="ctrl-pending" class="ctrl-pending" hidden></div>
-              <div id="ctrl-status" class="ctrl-status" aria-live="polite"></div>
-            </div>
-          </aside>
+
+        <!-- Tab navigation -->
+        <div class="view-tabs">
+          <button class="tab-btn active" data-tab="tank">Tank</button>
+          <button class="tab-btn" data-tab="decorations">Decorations</button>
         </div>
-      </div>
+
+        <!-- ── Tank tab ─────────────────────────────────────────────────── -->
+        <div id="tab-tank" class="tab-pane">
+          <div class="tank-row">
+            <div class="tank-col">
+              <div class="tank-wrap">
+                <canvas id="tank" width="800" height="480"></canvas>
+                <button id="legend-toggle" class="legend-toggle" type="button" aria-pressed="false"
+                  title="Show or hide the fish list">🐟 Fish list</button>
+                <div id="legend-overlay" class="legend-overlay" hidden>
+                  <div class="legend-head">
+                    <h3>Fish</h3>
+                    <span class="hint">click a row to highlight · click a name to rename</span>
+                  </div>
+                  <div id="legend" class="legend"></div>
+                </div>
+              </div>
+              <div id="stats" class="stats"></div>
+            </div>
+            <aside class="tank-side">
+              <div id="game-panel" class="game-panel" hidden>
+                <div class="hud">
+                  <span class="hud-mode" id="hud-mode">Career</span>
+                  <span class="hud-item" id="hud-coins" title="Coins"><span class="ci"></span> 0</span>
+                  <span class="hud-item" id="hud-shells" title="Shells">🐚 0</span>
+                  <span class="hud-item" id="hud-food" title="Fish food">🍤 0</span>
+                  <span class="hud-item" id="hud-luck" title="Tank luck">🍀 0%</span>
+                  <span class="hud-item" id="hud-meals" title="Meals fed today">🍽️ 0/3</span>
+                </div>
+                <div class="mode-row">
+                  <span class="ctrl-label">Mode</span>
+                  <div class="seg" id="mode-seg">
+                    <button type="button" data-mode="creative">Creative</button>
+                    <button type="button" data-mode="career">Career</button>
+                  </div>
+                </div>
+                <div id="shop" class="shop" hidden>
+                  <div class="shop-head">🛒 Shop</div>
+                  <div id="shop-fish" class="shop-fish"></div>
+                  <button type="button" id="shop-food" class="shop-buy">🍤 Food — 5 <span class="ci"></span></button>
+                  <button type="button" id="shop-snail" class="shop-buy">🐌 Snail — 50 <span class="ci"></span></button>
+                </div>
+              </div>
+              <div id="controls" class="controls" hidden>
+                <h3>Controls</h3>
+                <div class="ctrl-group">
+                  <label class="ctrl-label" for="ctrl-weather">Weather</label>
+                  <select id="ctrl-weather" class="ctrl-select">
+                    <option value="-1">Auto</option>
+                    <option value="0">Sunny</option>
+                    <option value="1">Partly Cloudy</option>
+                    <option value="2">Cloudy</option>
+                    <option value="3">Rainy</option>
+                    <option value="4">Stormy</option>
+                    <option value="5">Snowy</option>
+                    <option value="6">Foggy</option>
+                  </select>
+                </div>
+                <div class="ctrl-group ctrl-time-group">
+                  <span class="ctrl-label">Timescale <span id="ctrl-time-val" class="ctrl-time-val">1×</span></span>
+                  <input type="range" id="ctrl-time" class="ctrl-slider" min="1" max="5" step="1" value="1"
+                    aria-label="Simulation speed (1× real-time to 5× fast)" />
+                  <div class="ctrl-ticks" aria-hidden="true">
+                    <span>1×</span><span>2×</span><span>3×</span><span>4×</span><span>5×</span>
+                  </div>
+                </div>
+                <div class="ctrl-group" id="ctrl-fish-group">
+                  <span class="ctrl-label">Fish</span>
+                  <div id="ctrl-fish" class="ctrl-fish"></div>
+                </div>
+                <button type="button" id="ctrl-feed" class="ctrl-feed">🍤 Feed</button>
+                <div id="ctrl-pending" class="ctrl-pending" hidden></div>
+                <div id="ctrl-status" class="ctrl-status" aria-live="polite"></div>
+              </div>
+            </aside>
+          </div>
+        </div>
+
+        <!-- ── Decorations tab ──────────────────────────────────────────── -->
+        <div id="tab-decorations" class="tab-pane" hidden>
+          <div class="decor-layout">
+            <div class="decor-3d-col">
+              <div class="tank3d-wrap">
+                <div class="tank3d-label">3D View <span class="tank3d-hint">hold left click and drag to rotate · click in placement mode to position</span></div>
+                <canvas id="tank3d"></canvas>
+              </div>
+            </div>
+            <aside class="decor-panel">
+              <h3>Decorations</h3>
+              <p id="decor-creative-hint" class="hint" hidden>Creative mode — all decorations are free.</p>
+              <div id="decor-shop">
+                <button type="button" id="decor-buy-castle" class="decor-buy-btn">
+                  🏰 Castle
+                  <span id="decor-castle-price" class="decor-price">30 <span class="ci"></span></span>
+                </button>
+                <button type="button" id="decor-buy-chest" class="decor-buy-btn">
+                  🪙 Treasure Chest
+                  <span id="decor-chest-price" class="decor-price">40 <span class="ci"></span></span>
+                </button>
+                <button type="button" id="decor-buy-anchor" class="decor-buy-btn">
+                  ⚓ Anchor
+                  <span id="decor-anchor-price" class="decor-price">20 <span class="ci"></span></span>
+                </button>
+                <button type="button" id="decor-buy-ship" class="decor-buy-btn">
+                  🚢 Sunken Ship
+                  <span id="decor-ship-price" class="decor-price">60 <span class="ci"></span></span>
+                </button>
+              </div>
+              <div id="decor-placing" class="decor-placing" hidden>
+                <span>Placing <strong id="decor-placing-name"></strong> — click the 3D tank to position it.</span>
+                <button type="button" id="decor-cancel-place" class="decor-cancel">Cancel</button>
+              </div>
+              <p id="decor-hint" class="hint">Select a decoration above, then click inside the 3D tank to place it.</p>
+              <div class="decor-placed-section">
+                <h4>Placed</h4>
+                <div id="decor-list"></div>
+                <p id="decor-list-empty" class="hint">No decorations placed yet.</p>
+              </div>
+            </aside>
+          </div>
+        </div>
+
+      </div><!-- /#view-content -->
     </section>
   </main>
 
@@ -167,6 +222,9 @@
     </form>
   </div>
 
+  <!-- Three.js (UMD build) must come before tank3d.js -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+  <script src="tank3d.js"></script>
   <!-- Relative src so it works under the prefix -->
   <script src="app.js"></script>
 </body>

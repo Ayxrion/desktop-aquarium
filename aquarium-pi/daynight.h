@@ -27,6 +27,6 @@ static float getDayProgress() {
     }
     time_t now = time(nullptr) + static_cast<time_t>(TIMEZONE_OFFSET_HOURS) * 3600;
     struct tm t;
-    gmtime_r(&now, &t);
+    localtime_r(&now, &t);
     return (t.tm_hour * 3600.0f + t.tm_min * 60.0f + t.tm_sec) / 86400.0f;
 }

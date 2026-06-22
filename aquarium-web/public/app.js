@@ -946,6 +946,136 @@ function drawSnail(sn, collector = false) {
   }
 }
 
+// ── Decorations: 2D sprites drawn on the sand ────────────────────────────────
+// All sprites are drawn at (0, 0) after translate to (sx, groundY) + perspective scale.
+function drawCastle2DSprite(bright) {
+  const b = bright;
+  // Left tower (drawn first, behind keep)
+  ctx.fillStyle = shadeN(0x777768, b);
+  ctx.fillRect(-28, -48, 14, 48);
+  for (let i = 0; i < 3; i++) ctx.fillRect(-28 + i * 5, -53, 3, 5);
+  // Right tower
+  ctx.fillRect(14, -48, 14, 48);
+  for (let i = 0; i < 3; i++) ctx.fillRect(14 + i * 5, -53, 3, 5);
+  // Main keep
+  ctx.fillStyle = shadeN(0x9a9a8a, b);
+  ctx.fillRect(-18, -36, 36, 36);
+  for (let i = -2; i <= 2; i++) {
+    if (Math.abs(i) % 2 === 0) ctx.fillRect(i * 7 - 3, -41, 6, 5);
+  }
+  // Gate arch
+  ctx.fillStyle = shadeN(0x111106, b);
+  ctx.fillRect(-6, -28, 12, 28);
+  ctx.beginPath(); ctx.arc(0, -28, 6, Math.PI, 0); ctx.fill();
+  // Dark window slits on towers
+  ctx.fillStyle = shadeN(0x111106, b);
+  ctx.fillRect(-25, -36, 4, 8);
+  ctx.fillRect(21, -36, 4, 8);
+}
+
+function drawTreasureChest2DSprite(bright) {
+  const b = bright;
+  // Lid (slightly open — angled top panel)
+  ctx.fillStyle = shadeN(0x4A2008, b);
+  ctx.beginPath();
+  ctx.moveTo(-13, -20); ctx.lineTo(13, -20);
+  ctx.lineTo(15, -29); ctx.lineTo(-11, -29);
+  ctx.closePath(); ctx.fill();
+  // Gold top trim on lid
+  ctx.fillStyle = shadeN(0xC8941A, b);
+  ctx.fillRect(-14, -21, 28, 2);
+  // Gold glow visible inside the open chest
+  ctx.fillStyle = shadeN(0xFFD700, b);
+  ctx.fillRect(-7, -21, 14, 3);
+  // Body
+  ctx.fillStyle = shadeN(0x7B3810, b);
+  ctx.fillRect(-13, -20, 26, 20);
+  // Gold metal bands
+  ctx.fillStyle = shadeN(0xC8941A, b);
+  ctx.fillRect(-14, -12, 28, 3);
+  ctx.fillRect(-14,  -4, 28, 3);
+  ctx.fillRect(-14, -21, 28, 2);
+  // Lock
+  ctx.fillRect(-3, -16, 6, 6);
+}
+
+function drawAnchor2DSprite(bright) {
+  const b = bright;
+  ctx.save();
+  ctx.rotate(0.26); // lean slightly like it's resting on the sand
+  ctx.strokeStyle = shadeN(0x383848, b);
+  ctx.fillStyle   = shadeN(0x383848, b);
+  // Ring
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(0, -52, 7, 0, Math.PI * 2); ctx.stroke();
+  // Shank
+  ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(0, -45); ctx.lineTo(0, -16); ctx.stroke();
+  // Stock (crossbar near top)
+  ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(-18, -43); ctx.lineTo(18, -43); ctx.stroke();
+  // Crown (small horizontal junction at bottom of shank)
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(-6, -16); ctx.lineTo(6, -16); ctx.stroke();
+  // Left fluke — goes UP and OUT from crown
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(-2, -16); ctx.lineTo(-18, -28); ctx.stroke();
+  ctx.beginPath(); ctx.arc(-18, -28, 5, 0, Math.PI * 2); ctx.fill();
+  // Right fluke — mirrors left
+  ctx.beginPath(); ctx.moveTo(2, -16); ctx.lineTo(18, -28); ctx.stroke();
+  ctx.beginPath(); ctx.arc(18, -28, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+function drawSunkenShip2DSprite(bright) {
+  const b = bright;
+  ctx.save();
+  ctx.rotate(0.18);
+  // Hull
+  ctx.fillStyle = shadeN(0x3D2010, b);
+  ctx.fillRect(-32, -22, 64, 22);
+  // Keel ridge (darker bottom)
+  ctx.fillStyle = shadeN(0x1E0E06, b);
+  ctx.fillRect(-28, -5, 56, 5);
+  // Plank stripes
+  ctx.fillStyle = shadeN(0x2A1208, b);
+  ctx.fillRect(-33, -15, 66, 2);
+  ctx.fillRect(-33,  -8, 66, 2);
+  // Stern cabin
+  ctx.fillStyle = shadeN(0x5C3020, b);
+  ctx.fillRect(-30, -36, 28, 16);
+  // Portholes
+  ctx.fillStyle = shadeN(0x0A1520, b);
+  ctx.beginPath(); ctx.arc(-22, -28, 4, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc( -8, -28, 4, 0, Math.PI * 2); ctx.fill();
+  // Bow (angled point)
+  ctx.fillStyle = shadeN(0x3D2010, b);
+  ctx.beginPath();
+  ctx.moveTo(32, -22); ctx.lineTo(46, -11); ctx.lineTo(32, 0);
+  ctx.closePath(); ctx.fill();
+  // Broken mast
+  ctx.strokeStyle = shadeN(0x6B4525, b);
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(-8, -36); ctx.lineTo(-30, -62); ctx.stroke();
+  ctx.restore();
+}
+
+function drawOneDecoration(d, bright) {
+  const z = d.z || 0;
+  // Use raw d.x (not projX) so 3D placement maps 1:1 to 2D canvas x.
+  const sx = Math.round(clamp(d.x, 0, SCREEN_W - 1));
+  const gndY = terrainY[sx];
+  const sc = 1 - z * 0.30;
+  ctx.save();
+  ctx.translate(sx, gndY);
+  ctx.scale(sc, sc);
+  if      (d.type === 'castle') drawCastle2DSprite(bright);
+  else if (d.type === 'chest')  drawTreasureChest2DSprite(bright);
+  else if (d.type === 'anchor') drawAnchor2DSprite(bright);
+  else if (d.type === 'ship')   drawSunkenShip2DSprite(bright);
+  ctx.restore();
+}
+
 function drawStarfish(st) {
   const bx = Math.round(st.x), by = terrainY[clamp(bx, 0, SCREEN_W - 1)] - 10;
   const rot = Math.sin(animTick * 0.018) * 0.18;
@@ -1206,6 +1336,144 @@ const els = {
   dialogCancel: document.getElementById('dialog-cancel'),
 };
 const ctx = els.canvas.getContext('2d');
+
+// ─── Decoration state (client-side, persisted per aquarium in localStorage) ───
+const DECOR_DEFS = [
+  { type: 'castle', label: '🏰 Castle',        price: 30 },
+  { type: 'chest',  label: '🪙 Treasure Chest', price: 40 },
+  { type: 'anchor', label: '⚓ Anchor',         price: 20 },
+  { type: 'ship',   label: '🚢 Sunken Ship',    price: 60 },
+];
+const DECOR_LABEL = Object.fromEntries(DECOR_DEFS.map((d) => [d.type, d.label]));
+const DECOR_PRICE = Object.fromEntries(DECOR_DEFS.map((d) => [d.type, d.price]));
+
+let _decorState = { decorations: [], nextId: 1 };
+
+function loadDecorState(aquariumId) {
+  try {
+    const raw = localStorage.getItem('decor:' + aquariumId);
+    _decorState = raw ? JSON.parse(raw) : { decorations: [], nextId: 1 };
+  } catch { _decorState = { decorations: [], nextId: 1 }; }
+}
+function saveDecorState(aquariumId) {
+  try { localStorage.setItem('decor:' + aquariumId, JSON.stringify(_decorState)); } catch {}
+}
+function placeDecoration(kind, x2d, z2d) {
+  const d = { id: _decorState.nextId++, type: kind, x: x2d, z: z2d };
+  _decorState.decorations.push(d);
+  saveDecorState(selectedId);
+  if (window.tank3d) window.tank3d.setDecorations(_decorState.decorations);
+  renderDecorPanel(latestSnapshot);
+}
+function removeDecoration(id) {
+  _decorState.decorations = _decorState.decorations.filter((d) => d.id !== id);
+  saveDecorState(selectedId);
+  if (window.tank3d) window.tank3d.setDecorations(_decorState.decorations);
+  renderDecorPanel(latestSnapshot);
+}
+
+// ─── Tab switching ────────────────────────────────────────────────────────────
+let _activeTab = 'tank';
+function switchTab(tab) {
+  _activeTab = tab;
+  document.getElementById('tab-tank').hidden        = tab !== 'tank';
+  document.getElementById('tab-decorations').hidden = tab !== 'decorations';
+  for (const b of document.querySelectorAll('.tab-btn'))
+    b.classList.toggle('active', b.dataset.tab === tab);
+  if (tab === 'decorations' && window.tank3d) window.tank3d._resize();
+}
+document.querySelectorAll('.tab-btn').forEach((b) =>
+  b.addEventListener('click', () => switchTab(b.dataset.tab)));
+
+// ─── Decorations panel ────────────────────────────────────────────────────────
+let _placingKind = null;
+
+const _elDecorPlacing     = document.getElementById('decor-placing');
+const _elDecorPlacingName = document.getElementById('decor-placing-name');
+const _elDecorCancel      = document.getElementById('decor-cancel-place');
+const _elDecorHint        = document.getElementById('decor-hint');
+const _elDecorList        = document.getElementById('decor-list');
+const _elDecorListEmpty   = document.getElementById('decor-list-empty');
+const _elDecorCreative    = document.getElementById('decor-creative-hint');
+
+function enterPlacingMode(kind) {
+  _placingKind = kind;
+  for (const def of DECOR_DEFS) {
+    const btn = document.getElementById('decor-buy-' + def.type);
+    if (btn) btn.classList.toggle('placing', def.type === kind);
+  }
+  _elDecorPlacingName.textContent = DECOR_LABEL[kind] || kind;
+  _elDecorPlacing.hidden = false;
+  _elDecorHint.hidden = true;
+  if (window.tank3d) window.tank3d.startPlacing(kind);
+  if (_activeTab !== 'decorations') switchTab('decorations');
+}
+function cancelPlacingMode() {
+  _placingKind = null;
+  for (const def of DECOR_DEFS) {
+    const btn = document.getElementById('decor-buy-' + def.type);
+    if (btn) btn.classList.remove('placing');
+  }
+  _elDecorPlacing.hidden = true;
+  _elDecorHint.hidden = false;
+  if (window.tank3d) window.tank3d.cancelPlacing();
+}
+
+for (const def of DECOR_DEFS) {
+  const btn = document.getElementById('decor-buy-' + def.type);
+  if (!btn) continue;
+  btn.addEventListener('click', () => {
+    if (_placingKind === def.type) { cancelPlacingMode(); return; }
+    if (_placingKind) cancelPlacingMode();
+    const snap = latestSnapshot;
+    const isCareer = snap && snap.game && snap.game.mode === 'career';
+    const coins = (snap && snap.game && snap.game.coins) || 0;
+    if (isCareer && coins < def.price) {
+      setCtrlStatus(`Need ${def.price} coins for ${def.label}`, 'err');
+      return;
+    }
+    if (isCareer) sendControl({ type: 'buy', what: 'decoration', kind: def.type }, `${def.label} purchased!`);
+    enterPlacingMode(def.type);
+  });
+}
+_elDecorCancel.addEventListener('click', cancelPlacingMode);
+
+function renderDecorPanel(snap) {
+  const isCareer = snap && snap.game && snap.game.mode === 'career';
+  const coins = (snap && snap.game && snap.game.coins) || 0;
+  const hasGame = !!(snap && snap.game);
+
+  if (_elDecorCreative) _elDecorCreative.hidden = !hasGame || isCareer;
+
+  for (const def of DECOR_DEFS) {
+    const btn     = document.getElementById('decor-buy-' + def.type);
+    const priceEl = document.getElementById('decor-' + def.type + '-price');
+    if (priceEl) priceEl.hidden = hasGame && !isCareer;
+    if (btn) {
+      btn.disabled = isCareer && coins < def.price;
+      btn.title = isCareer
+        ? (coins < def.price
+            ? `Need ${def.price} coins (have ${coins})`
+            : `Buy ${def.label} for ${def.price} coins`)
+        : `Place ${def.label} (free in Creative)`;
+    }
+  }
+
+  const decs = _decorState.decorations;
+  if (_elDecorListEmpty) _elDecorListEmpty.hidden = decs.length > 0;
+  if (_elDecorList) {
+    _elDecorList.innerHTML = '';
+    for (const d of decs) {
+      const div = document.createElement('div');
+      div.className = 'decor-item';
+      div.innerHTML =
+        `<span class="decor-item-label">${DECOR_LABEL[d.type] || d.type}</span>` +
+        `<button class="decor-item-del" title="Remove" data-id="${d.id}">×</button>`;
+      div.querySelector('.decor-item-del').addEventListener('click', () => removeDecoration(d.id));
+      _elDecorList.appendChild(div);
+    }
+  }
+}
 
 // Shop prices (coins), mirroring the firmware/mock economy.
 const FISH_PRICE     = [10, 30, 45, 60, 8]; // clownfish, guppy, piranha, angel, salmon (common→cheap)
@@ -1485,6 +1753,9 @@ function select(id) {
   if (els.ctrlPending) els.ctrlPending.hidden = true;
   els.viewEmpty.hidden = true;
   els.viewContent.hidden = false;
+  loadDecorState(id);
+  if (window.tank3d) window.tank3d.setDecorations(_decorState.decorations);
+  renderDecorPanel(null);
   openStream(id);
   setRoute(id);
   refreshList();
@@ -1511,6 +1782,7 @@ function applySnapshot(snap) {
   renderConflict(snap);
   renderControls(snap);
   renderGame(snap);
+  renderDecorPanel(snap);
   if (profileKey) renderProfile();
   resolvePending(snap);
   setConn(true);
@@ -1677,7 +1949,10 @@ function _rafDraw() {
   eacBright = dayTint(lastSnap.time && lastSnap.time.day_progress);
 
   const frame = buildRenderSnap(devClock);
-  if (frame) drawTank(frame);
+  if (frame) {
+    drawTank(frame);
+    if (window.tank3d) window.tank3d.update(frame);
+  }
 }
 
 // Full re-render (highlight/hover toggles, etc.) — rebuilds at the current live edge.
@@ -2557,12 +2832,17 @@ function drawTank(s) {
 
   drawEacZone(bright);             // background traffic silhouettes
 
+  // Depth-sort fish and floor decorations together (back → front) so fish
+  // naturally swim behind decorations that are further from the viewer.
+  const drawables = [];
   if (Array.isArray(s.fish)) {
     drawShadows(s.fish);
-    // Far (deeper) fish first so nearer fish overlap them correctly.
-    const ordered = s.fish.slice().sort((a, b) => (b.z || 0) - (a.z || 0));
-    for (const f of ordered) drawFish(f);
+    for (const f of s.fish) drawables.push({ z: f.z || 0, fn: () => drawFish(f) });
   }
+  for (const d of _decorState.decorations)
+    drawables.push({ z: d.z || 0, fn: () => drawOneDecoration(d, bright) });
+  drawables.sort((a, b) => b.z - a.z);
+  for (const item of drawables) item.fn();
 
   // Foreground plants (seaweed + hornwort) drawn AFTER fish so fish swim behind
   // them, then BEFORE bottom-dwellers so snails/loot are in front of the vegetation.
@@ -2909,3 +3189,12 @@ if (els.newAquarium) els.newAquarium.addEventListener('click', createAquarium);
 refreshList(); // first load honours the hash via renderList's default selection
 setInterval(refreshList, 5000);
 startWatchdog();
+
+// Instantiate the 3D tank viewer now that the DOM and Three.js are both ready.
+if (typeof Tank3D !== 'undefined') {
+  window.tank3d = new Tank3D(document.getElementById('tank3d'));
+  window.tank3d.onPlace = (kind, x2d, z2d) => {
+    cancelPlacingMode();
+    placeDecoration(kind, x2d, z2d);
+  };
+}
