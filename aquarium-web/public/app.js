@@ -1347,29 +1347,34 @@ const DECOR_DEFS = [
 const DECOR_LABEL = Object.fromEntries(DECOR_DEFS.map((d) => [d.type, d.label]));
 const DECOR_PRICE = Object.fromEntries(DECOR_DEFS.map((d) => [d.type, d.price]));
 
+// Decoration state — server is source of truth; nextId is local only for React-style keys.
 let _decorState = { decorations: [], nextId: 1 };
 
-function loadDecorState(aquariumId) {
-  try {
-    const raw = localStorage.getItem('decor:' + aquariumId);
-    _decorState = raw ? JSON.parse(raw) : { decorations: [], nextId: 1 };
-  } catch { _decorState = { decorations: [], nextId: 1 }; }
+function _syncDecorations(decs) {
+  // Rebuild local state from a server-provided array (SSE snapshot or bootstrap).
+  _decorState.decorations = decs.map((d, i) => ({
+    id: i + 1, type: d.type, x: Number(d.x), z: Number(d.z) || 0,
+  }));
+  _decorState.nextId = _decorState.decorations.length + 1;
+  if (window.tank3d) window.tank3d.setDecorations(_decorState.decorations);
+  renderDecorPanel(latestSnapshot);
 }
-function saveDecorState(aquariumId) {
-  try { localStorage.setItem('decor:' + aquariumId, JSON.stringify(_decorState)); } catch {}
+function _pushDecorations() {
+  // Send full decoration list to server (which forwards to device on next telemetry POST).
+  if (selectedId) sendControl({ type: 'setDecorations', decorations: _decorState.decorations });
 }
 function placeDecoration(kind, x2d, z2d) {
   const d = { id: _decorState.nextId++, type: kind, x: x2d, z: z2d };
   _decorState.decorations.push(d);
-  saveDecorState(selectedId);
   if (window.tank3d) window.tank3d.setDecorations(_decorState.decorations);
   renderDecorPanel(latestSnapshot);
+  _pushDecorations();
 }
 function removeDecoration(id) {
   _decorState.decorations = _decorState.decorations.filter((d) => d.id !== id);
-  saveDecorState(selectedId);
   if (window.tank3d) window.tank3d.setDecorations(_decorState.decorations);
   renderDecorPanel(latestSnapshot);
+  _pushDecorations();
 }
 
 // ─── Tab switching ────────────────────────────────────────────────────────────
@@ -1753,8 +1758,8 @@ function select(id) {
   if (els.ctrlPending) els.ctrlPending.hidden = true;
   els.viewEmpty.hidden = true;
   els.viewContent.hidden = false;
-  loadDecorState(id);
-  if (window.tank3d) window.tank3d.setDecorations(_decorState.decorations);
+  _decorState = { decorations: [], nextId: 1 };
+  if (window.tank3d) window.tank3d.setDecorations([]);
   renderDecorPanel(null);
   openStream(id);
   setRoute(id);
@@ -1782,7 +1787,7 @@ function applySnapshot(snap) {
   renderConflict(snap);
   renderControls(snap);
   renderGame(snap);
-  renderDecorPanel(snap);
+  _syncDecorations(snap.decorations || []);
   if (profileKey) renderProfile();
   resolvePending(snap);
   setConn(true);

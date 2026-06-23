@@ -983,6 +983,16 @@ void drawWeatherSky() {
     }
 }
 
+// ─── Decorations ─────────────────────────────────────────────────────────────
+#define MAX_DECORATIONS 16
+enum DecorType : uint8_t { DECOR_CASTLE = 0, DECOR_CHEST = 1, DECOR_ANCHOR = 2, DECOR_SHIP = 3 };
+struct Decoration { DecorType type; uint16_t x; float z; bool active; };
+static Decoration decorations[MAX_DECORATIONS];
+static int numDecorations = 0;
+// Pending decoration update from the telemetry worker (protected by mutex).
+static struct { Decoration items[MAX_DECORATIONS]; int count; bool pending; } _pendingDecor = {};
+static std::mutex _pendingDecorMutex;
+
 // Telemetry publisher — included here (not at the top) because it references the
 // aquarium globals declared above (fish[], fishColor, snail, plants, weather…).
 #include "telemetry.h"
@@ -1508,6 +1518,8 @@ void telemetryApplyControls() {
         for (int i = 0; i < sc && i < CTRL_SELL_MAX; i++)
             sellSnailSlot(_ctrlSellSnailIds[i].load());
     }
+    // Apply decoration updates pushed via !DECORCLR/!DECOR directives.
+    applyPendingDecorations();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2133,6 +2145,91 @@ void drawFish() {
             canvas.print(name);
         }
     }
+}
+
+// Apply pending decoration changes from the telemetry worker (call on main thread).
+static void applyPendingDecorations() {
+    std::lock_guard<std::mutex> lk(_pendingDecorMutex);
+    if (!_pendingDecor.pending) return;
+    numDecorations = _pendingDecor.count;
+    memcpy(decorations, _pendingDecor.items, numDecorations * sizeof(Decoration));
+    _pendingDecor.pending = false;
+}
+
+static void drawOneDecoration(const Decoration& d) {
+    int sx = (int)d.x;
+    int sy = terrainY[sx < 0 ? 0 : (sx >= SCREEN_W ? SCREEN_W - 1 : sx)];
+    float sc = 1.0f - d.z * 0.30f;
+    int s = (int)(sc * 20 + 0.5f);   // base scale unit in px
+
+    switch (d.type) {
+        case DECOR_CASTLE: {
+            // Body
+            canvas.fillRect(sx - s, sy - s * 3, s * 2, s * 3, 0x888898UL);
+            // Battlements (3 merlons)
+            for (int m = -1; m <= 1; m++)
+                canvas.fillRect(sx + m * (s * 2 / 3) - s / 5, sy - s * 3 - s / 2, s * 2 / 5, s / 2, 0x888898UL);
+            // Door arch
+            canvas.fillRect(sx - s / 4, sy - s, s / 2, s, 0x223344UL);
+            canvas.fillCircle(sx, sy - s, s / 4, 0x223344UL);
+            break;
+        }
+        case DECOR_CHEST: {
+            int hw = s + 2, hh = (int)(s * 0.75f);
+            // Body
+            canvas.fillRect(sx - hw, sy - hh, hw * 2, hh, 0x6B3A1FUL);
+            canvas.drawRect(sx - hw, sy - hh, hw * 2, hh, 0x3D1F0AUL);
+            // Lid (slightly wider, rounded top)
+            canvas.fillRect(sx - hw - 1, sy - hh - s / 2, (hw + 1) * 2, s / 2, 0x8B4A25UL);
+            canvas.drawRect(sx - hw - 1, sy - hh - s / 2, (hw + 1) * 2, s / 2, 0x3D1F0AUL);
+            // Lock
+            canvas.fillCircle(sx, sy - hh, s / 4, 0xFFD700UL);
+            // Coins peeking out
+            canvas.fillCircle(sx - s / 3, sy - hh + 2, s / 5, 0xFFD700UL);
+            canvas.fillCircle(sx + s / 3, sy - hh + 2, s / 5, 0xFFD700UL);
+            break;
+        }
+        case DECOR_ANCHOR: {
+            // Ring at top
+            canvas.drawCircle(sx, sy - s * 3 + s / 2, s / 2, 0x888898UL);
+            // Shank (vertical bar)
+            canvas.drawLine(sx, sy - s * 3 + s, sx, sy - s, 0x888898UL);
+            // Crown crossbar
+            canvas.drawLine(sx - s, sy - s, sx + s, sy - s, 0x888898UL);
+            // Flukes angling UP from crown ends
+            canvas.drawLine(sx - s, sy - s, sx - s - s / 2, sy - s - s, 0x888898UL);
+            canvas.drawLine(sx + s, sy - s, sx + s + s / 2, sy - s - s, 0x888898UL);
+            canvas.fillCircle(sx - s - s / 2, sy - s - s, s / 4, 0x888898UL);
+            canvas.fillCircle(sx + s + s / 2, sy - s - s, s / 4, 0x888898UL);
+            break;
+        }
+        case DECOR_SHIP: {
+            int hw2 = (int)(s * 1.8f);
+            // Hull
+            canvas.fillRect(sx - hw2, sy - s, hw2 * 2, s, 0x5C3317UL);
+            canvas.drawRect(sx - hw2, sy - s, hw2 * 2, s, 0x2A1505UL);
+            // Deck
+            canvas.fillRect(sx - hw2 + 2, sy - s - s / 2, (hw2 - 2) * 2, s / 2, 0x7A4420UL);
+            // Broken mast
+            canvas.drawLine(sx - s / 3, sy - s - s / 2, sx - s / 3, sy - s * 3, 0x8B6914UL);
+            canvas.drawLine(sx - s / 3, sy - s * 3, sx + s, sy - s * 2, 0x8B6914UL);
+            // Portholes
+            canvas.fillCircle(sx - s, sy - s / 2, s / 4, 0x1A2A3AUL);
+            canvas.fillCircle(sx + s, sy - s / 2, s / 4, 0x1A2A3AUL);
+            break;
+        }
+    }
+}
+
+void drawDecorations() {
+    // Collect (idx, z) pairs and depth-sort back→front.
+    int order[MAX_DECORATIONS]; int cnt = 0;
+    for (int i = 0; i < numDecorations; i++) if (decorations[i].active) order[cnt++] = i;
+    // Bubble-sort by z descending (draw far ones first, near ones on top).
+    for (int i = 0; i < cnt - 1; i++)
+        for (int j = i + 1; j < cnt; j++)
+            if (decorations[order[j]].z > decorations[order[i]].z) { int t = order[i]; order[i] = order[j]; order[j] = t; }
+    for (int k = 0; k < cnt; k++) drawOneDecoration(decorations[order[k]]);
 }
 
 // Career collectibles: gold coins (mid-water) + sea shells (on sand), tap to grab.
@@ -2892,6 +2989,7 @@ void loop() {
     drawBubbles(false);        // bg bubbles rise behind fg plants and fish
     drawFishShadows();
     drawFish();                // fish in front of bg bubbles, behind fg plants
+    drawDecorations();         // sand decorations depth-sorted with fish
     drawSeaweed();             // fg plants in front of fish
     drawFgHornwort();
     drawBubbles(true);         // fg bubbles in front of fg plants

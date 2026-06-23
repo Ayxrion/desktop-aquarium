@@ -35,6 +35,7 @@ function freshPending() {
     sellFish: [],              // !SELLFISH:<id,id,…>  sell fish by slot id (device removes + credits coins)
     sellSnail: [],             // !SELLSNAIL:<id,id,…>  sell snail by id (device removes + credits coins)
     switchAq: null,            // !SWITCHAQ:<id>  tell a physical device to load a different aquarium
+    decorSync: false,          // !DECORCLR + !DECOR:… — push full decoration list to device
   };
 }
 
@@ -414,6 +415,7 @@ function getOrCreate(id) {
       adoptNext: false,       // a dashboard profile change is in flight; adopt the next
                               //   diverged profile as the baseline instead of flagging it
       pending: freshPending(),// buffered downstream control directives
+      decorations: [],        // placed decorations [{type, x, z}] — server source of truth
     };
     aquariums.set(id, entry);
   }
@@ -472,6 +474,7 @@ function enrich(entry) {
     _lastSeenMs: entry.lastSeenMs,
     _stale: isStale(entry.lastSeenMs),
     _conflict: entry.conflict || null,
+    decorations: entry.decorations || [],
   };
 }
 
@@ -604,6 +607,14 @@ function getNamesText(id) {
   // Only nudge the device's on-screen conflict prompt when we're not already
   // telling it to restore (restore resolves the conflict on its own).
   if (!restoreEmitted && entry.conflict) lines.push('!CONFLICT');
+  // Decoration sync: send full state as !DECORCLR + one !DECOR line per item.
+  if (p.decorSync) {
+    lines.push('!DECORCLR');
+    for (const d of (entry.decorations || [])) {
+      lines.push(`!DECOR:${d.type}:${Math.round(d.x)}:${d.z.toFixed(3)}`);
+    }
+    p.decorSync = false;
+  }
   for (const [fishId, name] of entry.names) lines.push(`${fishId}\t${name}`);
   return lines.join('\n');
 }
@@ -687,6 +698,18 @@ function queueControl(id, cmd) {
         return { ok: false, error: 'bad_fish_id' };
       if (!(p.sellFish || (p.sellFish = [])).includes(fishId)) p.sellFish.push(fishId);
       entry.adoptNext = true;  // census changes after sale
+      break;
+    }
+    case 'setDecorations': {
+      // Replace the full decoration list and push it to the device on next POST.
+      const decs = Array.isArray(cmd.decorations) ? cmd.decorations : [];
+      entry.decorations = decs.map((d) => ({
+        type: String(d.type),
+        x: Number(d.x) || 0,
+        z: Number(d.z) || 0,
+      }));
+      p.decorSync = true;
+      broadcast(entry); // webapp SSE subscribers get the updated decoration list
       break;
     }
     case 'buy': {
@@ -780,6 +803,7 @@ function bootstrap(id) {
     plants: base.plants || null,
     game: base.game || null,   // mode/coins/shells/food/luck — restore career state
     snails: base.snails || null, // purchased coin-collector snails — durable, must survive reboot
+    decorations: entry.decorations || [],
     fish,                      // each fish already carries age/xp/fish_luck via {...f}
   };
 }

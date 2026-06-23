@@ -187,6 +187,35 @@ static void _telemetryParseControls(const char* body) {
             p = c + 1;
         }
     }
+    // !DECORCLR + !DECOR:<type>:<x>:<z> — full decoration list replacement.
+    if (strstr(body, "!DECORCLR") != nullptr) {
+        Decoration tmp[MAX_DECORATIONS]; int cnt = 0;
+        const char* p = body;
+        while (cnt < MAX_DECORATIONS && (p = strstr(p, "!DECOR:")) != nullptr) {
+            p += 7;
+            const char* col1 = strchr(p, ':'); if (!col1) break;
+            const char* col2 = strchr(col1 + 1, ':'); if (!col2) break;
+            const char* nl   = strchr(col2 + 1, '\n');
+            char typeStr[16] = {};
+            size_t tl = (size_t)(col1 - p); if (tl >= sizeof(typeStr)) tl = sizeof(typeStr) - 1;
+            memcpy(typeStr, p, tl); typeStr[tl] = '\0';
+            DecorType dt = DECOR_CASTLE;
+            if      (strcmp(typeStr, "chest")  == 0) dt = DECOR_CHEST;
+            else if (strcmp(typeStr, "anchor") == 0) dt = DECOR_ANCHOR;
+            else if (strcmp(typeStr, "ship")   == 0) dt = DECOR_SHIP;
+            tmp[cnt].type   = dt;
+            tmp[cnt].x      = (uint16_t)atoi(col1 + 1);
+            tmp[cnt].z      = (float)atof(col2 + 1);
+            tmp[cnt].active = true;
+            cnt++;
+            p = nl ? nl + 1 : nullptr;
+            if (!p) break;
+        }
+        std::lock_guard<std::mutex> lk(_pendingDecorMutex);
+        memcpy(_pendingDecor.items, tmp, cnt * sizeof(Decoration));
+        _pendingDecor.count   = cnt;
+        _pendingDecor.pending = true;
+    }
 }
 
 // True when publishing is on but recent posts are failing — drives the failure
@@ -582,6 +611,22 @@ static void _applyServerProfileDoc(DynamicJsonDocument& doc) {
         cs.asleep      = false;
         cs.active      = true;
         numSnails++;
+    }
+
+    // Decoration layout.
+    numDecorations = 0;
+    for (JsonObject jd : doc["decorations"].as<JsonArray>()) {
+        if (numDecorations >= MAX_DECORATIONS) break;
+        const char* typeStr = jd["type"] | "castle";
+        DecorType dt = DECOR_CASTLE;
+        if      (strcmp(typeStr, "chest")  == 0) dt = DECOR_CHEST;
+        else if (strcmp(typeStr, "anchor") == 0) dt = DECOR_ANCHOR;
+        else if (strcmp(typeStr, "ship")   == 0) dt = DECOR_SHIP;
+        decorations[numDecorations].type   = dt;
+        decorations[numDecorations].x      = (uint16_t)(int)(jd["x"] | 0);
+        decorations[numDecorations].z      = jd["z"] | 0.0f;
+        decorations[numDecorations].active = true;
+        numDecorations++;
     }
 
     for (JsonObject jf : doc["fish"].as<JsonArray>()) {

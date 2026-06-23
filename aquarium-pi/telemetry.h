@@ -203,6 +203,35 @@ static void _telemetryParseControls(const char* body) {
             p = c + 1;
         }
     }
+    // !DECORCLR + !DECOR:<type>:<x>:<z> — full decoration list replacement.
+    if (strstr(body, "!DECORCLR") != nullptr) {
+        Decoration tmp[MAX_DECORATIONS]; int cnt = 0;
+        const char* p = body;
+        while (cnt < MAX_DECORATIONS && (p = strstr(p, "!DECOR:")) != nullptr) {
+            p += 7;
+            const char* col1 = strchr(p, ':'); if (!col1) break;
+            const char* col2 = strchr(col1 + 1, ':'); if (!col2) break;
+            const char* nl   = strchr(col2 + 1, '\n');
+            char typeStr[16] = {};
+            size_t tl = (size_t)(col1 - p); if (tl >= sizeof(typeStr)) tl = sizeof(typeStr) - 1;
+            memcpy(typeStr, p, tl); typeStr[tl] = '\0';
+            DecorType dt = DECOR_CASTLE;
+            if      (strcmp(typeStr, "chest")  == 0) dt = DECOR_CHEST;
+            else if (strcmp(typeStr, "anchor") == 0) dt = DECOR_ANCHOR;
+            else if (strcmp(typeStr, "ship")   == 0) dt = DECOR_SHIP;
+            tmp[cnt].type   = dt;
+            tmp[cnt].x      = (uint16_t)atoi(col1 + 1);
+            tmp[cnt].z      = (float)atof(col2 + 1);
+            tmp[cnt].active = true;
+            cnt++;
+            p = nl ? nl + 1 : nullptr;
+            if (!p) break;
+        }
+        std::lock_guard<std::mutex> lk(_pendingDecorMutex);
+        memcpy(_pendingDecor.items, tmp, cnt * sizeof(Decoration));
+        _pendingDecor.count   = cnt;
+        _pendingDecor.pending = true;
+    }
 }
 
 static size_t _telemetryDiscard(void*, size_t sz, size_t n, void*) { return sz * n; }
@@ -789,7 +818,42 @@ static void _applyServerProfile(const char* json) {
         }
     }
 
-    // 3) Overlay the saved fish positions + names.
+    // 3) Decoration layout from the server snapshot.
+    numDecorations = 0;
+    const char* dp = strstr(json, "\"decorations\":");
+    if (dp) {
+        char dobjs[MAX_DECORATIONS][128]; int dnc = 0;
+        const char* arr = strchr(dp, '['); if (arr) {
+            const char* pp = arr + 1;
+            while (dnc < MAX_DECORATIONS) {
+                const char* o = strchr(pp, '{'); const char* end2 = strchr(pp, ']');
+                if (!o || (end2 && o > end2)) break;
+                int dd = 0; const char* e = o;
+                while (*e) { if (*e == '{') dd++; else if (*e == '}') { if (--dd == 0) { e++; break; } } e++; }
+                size_t ol = (size_t)(e - o); if (ol >= 128) ol = 127;
+                memcpy(dobjs[dnc], o, ol); dobjs[dnc][ol] = '\0'; dnc++; pp = e;
+            }
+        }
+        for (int i = 0; i < dnc; i++) {
+            const char* ts; size_t tl;
+            int xv = 0; float zv = 0.0f;
+            DecorType dt = DECOR_CASTLE;
+            if (_jGetStr(dobjs[i], "type", &ts, &tl)) {
+                if      (tl == 5 && strncmp(ts, "chest",  5) == 0) dt = DECOR_CHEST;
+                else if (tl == 6 && strncmp(ts, "anchor", 6) == 0) dt = DECOR_ANCHOR;
+                else if (tl == 4 && strncmp(ts, "ship",   4) == 0) dt = DECOR_SHIP;
+            }
+            _jGetInt(dobjs[i], "x", &xv);
+            _jGetFloat(dobjs[i], "z", &zv);
+            decorations[numDecorations].type   = dt;
+            decorations[numDecorations].x      = (uint16_t)xv;
+            decorations[numDecorations].z      = zv;
+            decorations[numDecorations].active = true;
+            numDecorations++;
+        }
+    }
+
+    // 4) Overlay the saved fish positions + names.
     _applyBootstrap(json);
     telemetryProfileLoaded = true;
     printf("Telemetry: rebuilt tank to server profile (pair %d school %d/%d angel %d)\n",
